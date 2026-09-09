@@ -831,6 +831,79 @@ function OrientationImages({ images, onChange, repo, lookupKey }) {
 /* Product library                                                     */
 /* ------------------------------------------------------------------ */
 
+// Merchandising Styles — alternate dimension sets for how a product can be merchandised beyond
+// a single unit (e.g. a full case is a much bigger footprint than one box). "Unit" is always the
+// product's own base dims; these are the additional, optional styles a product may also have.
+// Matches ProSpace's own merchandising-style set for full parity when importing from it.
+const MERCH_STYLE_DEFS = [
+  { id: "tray", label: "Tray" },
+  { id: "case", label: "Case" },
+  { id: "display", label: "Display" },
+  { id: "alternate", label: "Alternate" },
+  { id: "loose", label: "Loose" },
+  { id: "logStack", label: "Log Stack" },
+];
+const EMPTY_MERCH_STYLE = { w: 1, h: 1, d: 1, numWide: 1, numHigh: 1, numDeep: 1, totalNumber: 1, maxHigh: 0 };
+
+function MerchStylesEditor({ merchStyles, onChange }) {
+  const toggleStyle = (styleId, enabled) => {
+    if (enabled) {
+      onChange({ ...merchStyles, [styleId]: merchStyles[styleId] || { ...EMPTY_MERCH_STYLE } });
+    } else {
+      const next = { ...merchStyles };
+      delete next[styleId];
+      onChange(next);
+    }
+  };
+  const updateStyle = (styleId, patch) => {
+    onChange({ ...merchStyles, [styleId]: { ...merchStyles[styleId], ...patch } });
+  };
+  const numField = (styleId, data, key, label, step) => (
+    <Field label={label}>
+      <input
+        type="number"
+        step={step || "1"}
+        className={inputCls}
+        value={data[key]}
+        onChange={(e) => updateStyle(styleId, { [key]: Number(e.target.value) || 0 })}
+      />
+    </Field>
+  );
+
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-slate-500">
+        Define alternate dimensions for how this product can be merchandised (e.g. a full case is much bigger than a single unit).
+        Leave a style off if this product is never sold or placed that way.
+      </p>
+      {MERCH_STYLE_DEFS.map((style) => {
+        const data = merchStyles[style.id];
+        const enabled = !!data;
+        return (
+          <div key={style.id} className="border border-slate-200 rounded-lg p-3">
+            <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer">
+              <input type="checkbox" checked={enabled} onChange={(e) => toggleStyle(style.id, e.target.checked)} className="accent-amber-500 w-4 h-4" />
+              {style.label}
+            </label>
+            {enabled && (
+              <div className="mt-3 grid grid-cols-4 gap-2">
+                {numField(style.id, data, "w", "Width (in)", "0.1")}
+                {numField(style.id, data, "h", "Height (in)", "0.1")}
+                {numField(style.id, data, "d", "Depth (in)", "0.1")}
+                {numField(style.id, data, "maxHigh", "Max Stack High")}
+                {numField(style.id, data, "numWide", "Units # Wide")}
+                {numField(style.id, data, "numHigh", "Units # High")}
+                {numField(style.id, data, "numDeep", "Units # Deep")}
+                {numField(style.id, data, "totalNumber", "Total Units")}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ProductForm({ schema, initial, primaryKeyField, imageRepo, onSave, onCancel }) {
   const [name, setName] = useState(initial?.name || "");
   const [sku, setSku] = useState(initial?.sku || "");
@@ -839,6 +912,8 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, onSave, onCa
   const [images, setImages] = useState(initial?.images || {});
   const [overhangIn, setOverhangIn] = useState(initial?.overhangIn || 0);
   const [squeezePct, setSqueezePct] = useState(Math.round((initial?.squeezeFactor ?? 1) * 100));
+  const [merchStyles, setMerchStyles] = useState(initial?.merchStyles || {});
+  const [merchStylesOpen, setMerchStylesOpen] = useState(Object.keys(initial?.merchStyles || {}).length > 0);
 
   const lookupKey = getPrimaryKeyValueRaw({ sku, attributes }, schema, imageRepo?.keyField || "upc");
 
@@ -853,6 +928,7 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, onSave, onCa
       images,
       overhangIn: Math.max(0, Number(overhangIn) || 0),
       squeezeFactor: clamp((Number(squeezePct) || 100) / 100, 0.5, 1),
+      merchStyles,
     });
   };
 
@@ -889,6 +965,22 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, onSave, onCa
         <p className="text-[11px] text-slate-400 mt-1">
           Overhang: how far this product can safely hang past the shelf edge before it's flagged as overflow (e.g. a bag of chips). Squeeze: how tightly it packs against neighbors for space calculations — 100% = no compression, doesn't change how it renders.
         </p>
+      </div>
+
+      <div>
+        <button
+          type="button"
+          onClick={() => setMerchStylesOpen((o) => !o)}
+          className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500 hover:text-slate-700"
+        >
+          {merchStylesOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />} Merchandising Styles
+          {Object.keys(merchStyles).length > 0 && <span className="text-[10px] normal-case font-medium text-amber-600">({Object.keys(merchStyles).length} defined)</span>}
+        </button>
+        {merchStylesOpen && (
+          <div className="mt-2">
+            <MerchStylesEditor merchStyles={merchStyles} onChange={setMerchStyles} />
+          </div>
+        )}
       </div>
 
       {schema.length > 0 && (
