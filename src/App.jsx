@@ -914,6 +914,7 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, onSave, onCa
   const [squeezePct, setSqueezePct] = useState(Math.round((initial?.squeezeFactor ?? 1) * 100));
   const [merchStyles, setMerchStyles] = useState(initial?.merchStyles || {});
   const [merchStylesOpen, setMerchStylesOpen] = useState(Object.keys(initial?.merchStyles || {}).length > 0);
+  const [pendingApproval, setPendingApproval] = useState(!!initial?.pendingApproval);
 
   const lookupKey = getPrimaryKeyValueRaw({ sku, attributes }, schema, imageRepo?.keyField || "upc");
 
@@ -929,11 +930,23 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, onSave, onCa
       overhangIn: Math.max(0, Number(overhangIn) || 0),
       squeezeFactor: clamp((Number(squeezePct) || 100) / 100, 0.5, 1),
       merchStyles,
+      pendingApproval,
+      importSource: initial?.importSource,
     });
   };
 
   return (
     <div className="bg-white rounded-lg border border-slate-200 p-5 space-y-4">
+      {pendingApproval && (
+        <div className="flex items-center justify-between gap-3 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+          <p className="text-xs text-amber-700">
+            <span className="font-semibold">Imported from {initial?.importSource || "an external system"} — pending approval.</span> Review the details below, then approve or delete this item.
+          </p>
+          <button className="shrink-0 inline-flex items-center gap-1 rounded-md bg-amber-500 px-2.5 py-1 text-xs font-semibold text-slate-900 hover:bg-amber-400" onClick={() => setPendingApproval(false)}>
+            <Check size={12} /> Approve
+          </button>
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-3">
         <Field label="Product Name">
           <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} autoFocus />
@@ -1421,12 +1434,15 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate
   const [columnWidths, setColumnWidths] = useState({}); // colId -> px; falls back to a default when unset
   const resizingRef = useRef(null);
   const [query, setQuery] = useState("");
+  const [pendingOnly, setPendingOnly] = useState(false);
+  const pendingCount = React.useMemo(() => products.filter((p) => p.pendingApproval).length, [products]);
   // matches against name, SKU, AND every attribute value — not just name — so typing anything
   // that appears anywhere on the product (a size, a vendor, a color) filters it in immediately
   const filteredProducts = React.useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return products;
     return products.filter((p) => {
+      if (pendingOnly && !p.pendingApproval) return false;
+      if (!q) return true;
       if (p.name && p.name.toLowerCase().includes(q)) return true;
       if (p.sku && String(p.sku).toLowerCase().includes(q)) return true;
       if (p.attributes) {
@@ -1437,7 +1453,7 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate
       }
       return false;
     });
-  }, [products, query]);
+  }, [products, query, pendingOnly]);
   const [sortColumn, setSortColumn] = useState(null); // colId, or null = unsorted (creation order)
   const [sortDirection, setSortDirection] = useState("asc");
   const handleColumnSortClick = (colId) => {
@@ -1694,14 +1710,24 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate
         </div>
       )}
       {products.length > 0 && (
-        <div className="relative mb-3 max-w-sm">
-          <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
-          <input
-            className={inputCls + " pl-8"}
-            placeholder="Search name, SKU, or any attribute…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
+        <div className="flex items-center gap-2 mb-3 flex-wrap">
+          <div className="relative max-w-sm flex-1 min-w-[200px]">
+            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              className={inputCls + " pl-8"}
+              placeholder="Search name, SKU, or any attribute…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
+          {pendingCount > 0 && (
+            <button
+              onClick={() => setPendingOnly((v) => !v)}
+              className={`text-xs font-medium rounded-full px-3 py-1.5 border ${pendingOnly ? "bg-amber-500 border-amber-500 text-slate-900" : "border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100"}`}
+            >
+              Pending Approval ({pendingCount})
+            </button>
+          )}
         </div>
       )}
       {products.length === 0 ? (
@@ -1710,7 +1736,7 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate
         </div>
       ) : filteredProducts.length === 0 ? (
         <div className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-8 text-center">
-          No products match "{query}".
+          {pendingOnly ? "No products are pending approval." : `No products match "${query}".`}
         </div>
       ) : viewMode === "list" ? (
         <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
@@ -1781,7 +1807,10 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate
                 )}
               </div>
               <div className="flex-1 min-w-0">
-                <div className="font-semibold text-sm text-slate-800 truncate">{p.name}</div>
+                <div className="font-semibold text-sm text-slate-800 truncate flex items-center gap-1.5">
+                  {p.name}
+                  {p.pendingApproval && <span className="shrink-0 text-[9px] font-bold uppercase tracking-wide bg-amber-100 text-amber-700 border border-amber-300 rounded px-1 py-0.5">Pending</span>}
+                </div>
                 <div className="text-xs text-slate-400 font-mono">{p.sku || "—"}</div>
                 <div className="text-xs text-slate-500 mt-0.5">{p.dims.w}×{p.dims.h}×{p.dims.d} in</div>
                 <div className="flex gap-2 mt-1.5">
@@ -1806,6 +1835,7 @@ function FixtureForm({ schema, initial, onSave, onCancel }) {
   const [type, setType] = useState(initial?.type || FIXTURE_TYPES[0]);
   const [dims, setDims] = useState(initial?.dims || { w: 48, h: 2, d: 18 });
   const [attributes, setAttributes] = useState(initial?.attributes || {});
+  const [pendingApproval, setPendingApproval] = useState(!!initial?.pendingApproval);
 
   const save = () => {
     if (!name.trim()) return;
@@ -1815,11 +1845,23 @@ function FixtureForm({ schema, initial, onSave, onCancel }) {
       type,
       dims: { w: Number(dims.w) || 1, h: Number(dims.h) || 1, d: Number(dims.d) || 1 },
       attributes,
+      pendingApproval,
+      importSource: initial?.importSource,
     });
   };
 
   return (
     <div className="bg-white rounded-lg border border-slate-200 p-5 space-y-4">
+      {pendingApproval && (
+        <div className="flex items-center justify-between gap-3 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+          <p className="text-xs text-amber-700">
+            <span className="font-semibold">Imported from {initial?.importSource || "an external system"} — pending approval.</span> Review the details below, then approve or delete this item.
+          </p>
+          <button className="shrink-0 inline-flex items-center gap-1 rounded-md bg-amber-500 px-2.5 py-1 text-xs font-semibold text-slate-900 hover:bg-amber-400" onClick={() => setPendingApproval(false)}>
+            <Check size={12} /> Approve
+          </button>
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-3">
         <Field label="Fixture Name">
           <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} autoFocus />
@@ -1860,6 +1902,8 @@ function FixtureLibrary({ schema, fixtures, onCreate, onUpdate, onDelete }) {
   const [editing, setEditing] = useState(null);
   const [query, setQuery] = useState("");
   const [viewMode, setViewMode] = useState("grid"); // grid | list
+  const [pendingOnly, setPendingOnly] = useState(false);
+  const pendingCount = fixtures.filter((f) => f.pendingApproval).length;
   if (editing) {
     return (
       <FixtureForm
@@ -1874,7 +1918,11 @@ function FixtureLibrary({ schema, fixtures, onCreate, onUpdate, onDelete }) {
     );
   }
   const q = query.trim().toLowerCase();
-  const filtered = !q ? fixtures : fixtures.filter((f) => (f.name + " " + f.type).toLowerCase().includes(q));
+  const filtered = fixtures.filter((f) => {
+    if (pendingOnly && !f.pendingApproval) return false;
+    if (!q) return true;
+    return (f.name + " " + f.type).toLowerCase().includes(q);
+  });
   return (
     <div>
       <div className="flex items-center justify-between mb-4">
@@ -1902,14 +1950,24 @@ function FixtureLibrary({ schema, fixtures, onCreate, onUpdate, onDelete }) {
       </div>
 
       {fixtures.length > 0 && (
-        <div className="relative mb-3">
-          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-          <input
-            className={inputCls + " pl-9"}
-            placeholder="Search by name or type…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
+        <div className="flex items-center gap-2 mb-3 flex-wrap">
+          <div className="relative flex-1 min-w-[200px]">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              className={inputCls + " pl-9"}
+              placeholder="Search by name or type…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
+          {pendingCount > 0 && (
+            <button
+              onClick={() => setPendingOnly((v) => !v)}
+              className={`text-xs font-medium rounded-full px-3 py-1.5 border ${pendingOnly ? "bg-amber-500 border-amber-500 text-slate-900" : "border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100"}`}
+            >
+              Pending Approval ({pendingCount})
+            </button>
+          )}
         </div>
       )}
 
@@ -1919,7 +1977,7 @@ function FixtureLibrary({ schema, fixtures, onCreate, onUpdate, onDelete }) {
         </div>
       ) : filtered.length === 0 ? (
         <div className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-8 text-center">
-          No fixtures match "{query}".
+          {pendingOnly ? "No fixtures are pending approval." : `No fixtures match "${query}".`}
         </div>
       ) : viewMode === "list" ? (
         <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
@@ -1952,9 +2010,12 @@ function FixtureLibrary({ schema, fixtures, onCreate, onUpdate, onDelete }) {
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           {filtered.map((f) => (
             <div key={f.id} className="bg-white rounded-lg border border-slate-200 p-3">
-              <div className="flex items-center justify-between">
-                <div className="font-semibold text-sm text-slate-800">{f.name}</div>
-                <span className="text-[10px] uppercase tracking-wide bg-slate-100 text-slate-500 rounded px-1.5 py-0.5">{f.type}</span>
+              <div className="flex items-center justify-between gap-1.5">
+                <div className="font-semibold text-sm text-slate-800 truncate flex items-center gap-1.5">
+                  {f.name}
+                  {f.pendingApproval && <span className="shrink-0 text-[9px] font-bold uppercase tracking-wide bg-amber-100 text-amber-700 border border-amber-300 rounded px-1 py-0.5">Pending</span>}
+                </div>
+                <span className="shrink-0 text-[10px] uppercase tracking-wide bg-slate-100 text-slate-500 rounded px-1.5 py-0.5">{f.type}</span>
               </div>
               <div className="text-xs text-slate-500 mt-1">{f.dims.w}×{f.dims.h}×{f.dims.d} in</div>
               <div className="flex gap-2 mt-1.5">
@@ -2485,6 +2546,491 @@ function StoreFeedbackView({ planograms, onResolveIssue, onOpenPlanogram }) {
 }
 
 /* ------------------------------------------------------------------ */
+/* ProSpace (Blue Yonder / JDA) planogram import                        */
+/*                                                                       */
+/* .psa project files are CSV, one row per object (Project/Product/      */
+/* Planogram/Segment/Fixture/Position/...), with the object type as the  */
+/* first column and every other field in a fixed, documented order       */
+/* (see ProSpace_Fields.txt — "Field order in data file"). There are no  */
+/* foreign keys: the hierarchy is entirely positional — a Planogram's    */
+/* Segments/Fixtures/Positions are simply the rows that follow it, until */
+/* the next Planogram row. A project file can contain several            */
+/* "Planogram" objects (ProSpace's way of letting a planner compare      */
+/* e.g. an 8ft vs a 12ft version of the same set) — each is imported as  */
+/* its own independent Tandom planogram, never as versions of each      */
+/* other, since a single-planogram file is just as valid an input.       */
+/*                                                                       */
+/* Two format quirks worth calling out, both confirmed against a real    */
+/* exported file before writing this:                                    */
+/*  - Dimensions are in centimeters whenever Project.Measurement=1       */
+/*    (Metric) and must be converted to inches for Tandom.               */
+/*  - A Segment's own X/Y/Width/etc. fields are unused placeholders      */
+/*    (always 0, or a flat 100) — a segment's REAL width and position    */
+/*    come from summing segment widths in file order, and a Fixture's    */
+/*    own (absolute, planogram-relative) X tells you which segment it    */
+/*    falls into.                                                        */
+/* ------------------------------------------------------------------ */
+
+// RFC4180-ish CSV tokenizer — handles quoted fields, embedded commas, and "" escaped quotes,
+// which a naive split(",") would mangle (product/planogram names can contain commas).
+function parsePSACsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQuotes = false; i++; continue;
+      }
+      field += c; i++; continue;
+    }
+    if (c === '"') { inQuotes = true; i++; continue; }
+    if (c === ",") { row.push(field); field = ""; i++; continue; }
+    if (c === "\r") { i++; continue; }
+    if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; i++; continue; }
+    field += c; i++;
+  }
+  if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+const PSA_CM_PER_IN = 2.54;
+function psaNum(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+function psaConv(v, metric) { const n = psaNum(v); return metric ? n / PSA_CM_PER_IN : n; }
+// field-order idx (0-based, per ProSpace_Fields.txt) -> csv column = idx + 1 (col 0 is the tag)
+function psaField(row, idx) { return row[idx + 1]; }
+
+const PSA_FIXTURE_TYPE_MAP = {
+  "0": "Shelf", "1": "Shelf", "2": "Shelf", "3": "Shelf",
+  "4": "Hook Rail", "5": "Hook Rail", "6": "Hook Rail",
+  "7": "Pegboard", "8": "Pegboard",
+  "9": "Hook Rail", "10": "Divider Bar", "11": "Divider Bar", "12": "Shelf",
+};
+const PSA_MERCH_STYLE_MAP = { "0": "unit", "1": "tray", "2": "case", "3": "display", "4": "alternate", "5": "loose", "6": "logStack" };
+// [face, rotation] for ProSpace's 24-value Position orientation enum (6 faces × 4 rotations)
+const PSA_ORIENTATION_MAP = [
+  ["front", 0], ["front", 90], ["left", 0], ["left", 90], ["top", 0], ["top", 90],
+  ["back", 0], ["back", 90], ["right", 0], ["right", 90], ["bottom", 0], ["bottom", 90],
+  ["front", 180], ["front", 270], ["left", 180], ["left", 270], ["top", 180], ["top", 270],
+  ["back", 180], ["back", 270], ["right", 180], ["right", 270], ["bottom", 180], ["bottom", 270],
+];
+
+// Parses raw .psa text into an intermediate structure, already converted to inches, with the
+// positional Segment/Fixture/Position hierarchy resolved. Does NOT touch Tandom's data model —
+// see mapProSpaceImport for that.
+function parsePSAFile(text) {
+  const rows = parsePSACsv(text).filter((r) => r.length > 1 || (r[0] && r[0].trim()));
+  const warnings = [];
+  let metric = false;
+  const products = [];
+  const planograms = [];
+  let curPlanogram = null;
+  let curSegment = null;
+  let curFixture = null;
+  let segCumWidthCm = 0;
+
+  for (const row of rows) {
+    const tag = (row[0] || "").trim();
+    if (tag === "Project") {
+      metric = psaField(row, 11) === "1";
+      continue;
+    }
+    if (tag === "Product") {
+      const dims = { w: psaConv(psaField(row, 4), metric), h: psaConv(psaField(row, 5), metric), d: psaConv(psaField(row, 6), metric) };
+      // ProSpace uses a degenerate 1×1×1 (cm) placeholder for a merch style that was never
+      // actually defined for this product (as well as genuine 0s) — treat both as "not defined";
+      // only keep a style whose size is real and meaningfully non-trivial.
+      const styleDims = (wIdx, hIdx, dIdx) => {
+        const rawW = psaNum(psaField(row, wIdx)), rawH = psaNum(psaField(row, hIdx)), rawD = psaNum(psaField(row, dIdx));
+        if (rawW <= 0 || rawH <= 0 || rawD <= 0) return null;
+        if (rawW <= 1 && rawH <= 1 && rawD <= 1) return null;
+        return { w: psaConv(rawW, metric), h: psaConv(rawH, metric), d: psaConv(rawD, metric) };
+      };
+      const merchStyles = {};
+      const tray = styleDims(45, 46, 47); if (tray) merchStyles.tray = tray;
+      const kase = styleDims(53, 54, 55); if (kase) merchStyles.case = kase;
+      const display = styleDims(61, 62, 63); if (display) merchStyles.display = display;
+      const alternate = styleDims(69, 70, 71); if (alternate) merchStyles.alternate = alternate;
+      const loose = styleDims(77, 78, 79); if (loose) merchStyles.loose = loose;
+      products.push({
+        upc: (psaField(row, 0) || "").trim(),
+        prospaceId: (psaField(row, 1) || "").trim(),
+        name: (psaField(row, 2) || "").trim() || "(unnamed product)",
+        dims,
+        category: (psaField(row, 12) || "").trim(),
+        merchStyles,
+      });
+      continue;
+    }
+    if (tag === "Planogram") {
+      if (curPlanogram) planograms.push(curPlanogram);
+      curPlanogram = {
+        name: (psaField(row, 0) || "Imported Planogram").trim(),
+        key: (psaField(row, 1) || "").trim(),
+        dims: { w: psaConv(psaField(row, 2), metric), h: psaConv(psaField(row, 3), metric), d: psaConv(psaField(row, 4), metric) },
+        segments: [],
+      };
+      curSegment = null;
+      curFixture = null;
+      segCumWidthCm = 0;
+      continue;
+    }
+    if (tag === "Performance") continue; // not imported — see the import summary's note about this
+    if (tag === "Segment") {
+      if (!curPlanogram) { warnings.push("Found a Segment before any Planogram — skipped."); continue; }
+      const widthCm = psaNum(psaField(row, 3));
+      const seg = {
+        name: (psaField(row, 0) || "").trim() || `Section ${curPlanogram.segments.length + 1}`,
+        width: psaConv(widthCm, metric) || 1,
+        offsetXCm: segCumWidthCm,
+        fixtures: [],
+      };
+      segCumWidthCm += widthCm;
+      curPlanogram.segments.push(seg);
+      curSegment = seg;
+      curFixture = null;
+      continue;
+    }
+    if (tag === "Fixture") {
+      if (!curPlanogram) { warnings.push("Found a Fixture before any Planogram — skipped."); continue; }
+      const xCm = psaNum(psaField(row, 3));
+      // Fixture X is absolute within the whole planogram — find which segment's cm range it
+      // falls in (segments have no reliable X of their own; see file header comment above).
+      let owner = null, acc = 0;
+      for (const s of curPlanogram.segments) {
+        const segWidthCm = s.width * (metric ? PSA_CM_PER_IN : 1);
+        if (xCm >= acc - 0.001 && xCm < acc + segWidthCm - 0.001) { owner = s; break; }
+        acc += segWidthCm;
+      }
+      if (!owner) owner = curSegment || curPlanogram.segments[curPlanogram.segments.length - 1];
+      if (!owner) { warnings.push(`Fixture "${(psaField(row, 1) || "").trim()}" has no owning segment — skipped.`); continue; }
+      const fx = {
+        type: PSA_FIXTURE_TYPE_MAP[psaField(row, 0)] || "Shelf",
+        name: (psaField(row, 1) || "Fixture").trim(),
+        relativeX: psaConv(xCm - owner.offsetXCm, metric),
+        width: psaConv(psaField(row, 4), metric) || 1,
+        y: psaConv(psaField(row, 5), metric) || 0,
+        height: psaConv(psaField(row, 6), metric) || 1,
+        depth: psaConv(psaField(row, 8), metric) || 1,
+        positions: [],
+      };
+      owner.fixtures.push(fx);
+      curFixture = fx;
+      continue;
+    }
+    if (tag === "Position") {
+      if (!curFixture) { warnings.push("Found a Position with no current Fixture — skipped."); continue; }
+      const [face, rot] = PSA_ORIENTATION_MAP[psaNum(psaField(row, 28))] || ["front", 0];
+      curFixture.positions.push({
+        upc: (psaField(row, 0) || "").trim(),
+        x: psaConv(psaField(row, 3), metric),
+        y: psaConv(psaField(row, 5), metric),
+        merchStyle: PSA_MERCH_STYLE_MAP[psaField(row, 12)] || "unit",
+        hFacings: Math.max(1, Math.round(psaNum(psaField(row, 13)) || 1)),
+        orientation: face,
+        rotation: rot,
+      });
+      continue;
+    }
+  }
+  if (curPlanogram) planograms.push(curPlanogram);
+  return { metric, products, planograms, warnings };
+}
+
+function psaDimsClose(a, b, tol) {
+  return Math.abs(a.w - b.w) <= tol && Math.abs(a.h - b.h) <= tol && Math.abs(a.d - b.d) <= tol;
+}
+
+// Maps a parsed .psa structure onto Tandom's data model: matches products/fixtures against the
+// existing library where it reasonably can (by UPC/name for products, by type+dims for
+// fixtures), and creates new ones — flagged pendingApproval — for anything it can't match, per
+// the agreed approach ("add new products and fixtures but flag for approval"). Returns
+// ready-to-create Tandom planogram/product/fixture objects; nothing is written to app state here.
+function mapProSpaceImport(parsed, { existingProducts, existingFixtures, productSchema }) {
+  const warnings = [...parsed.warnings];
+  const schemaPatch = [];
+
+  let upcField = (productSchema || []).find((f) => f.label.trim().toLowerCase() === "upc");
+  if (!upcField) {
+    upcField = { id: uid("f"), label: "UPC", type: "text" };
+    schemaPatch.push(upcField);
+  }
+  const categoryField = (productSchema || []).find((f) => f.label.trim().toLowerCase() === "category");
+
+  const productByUpc = {};
+  const productByName = {};
+  (existingProducts || []).forEach((p) => {
+    const upc = (p.attributes?.[upcField.id] || "").toString().trim().toLowerCase();
+    if (upc) productByUpc[upc] = p;
+    productByName[p.name.trim().toLowerCase()] = p;
+  });
+
+  const newProducts = [];
+  const upcToProductId = {};
+  let matchedProductCount = 0;
+  parsed.products.forEach((pp) => {
+    const upcKey = pp.upc.trim().toLowerCase();
+    const nameKey = pp.name.trim().toLowerCase();
+    const existing = (upcKey && productByUpc[upcKey]) || productByName[nameKey];
+    if (existing) { upcToProductId[pp.upc] = existing.id; matchedProductCount++; return; }
+    const attributes = {};
+    if (pp.upc) attributes[upcField.id] = pp.upc;
+    if (categoryField && pp.category) attributes[categoryField.id] = pp.category;
+    const draft = {
+      id: uid("prod"),
+      name: pp.name,
+      sku: pp.prospaceId || "",
+      dims: pp.dims,
+      attributes,
+      images: {},
+      merchStyles: pp.merchStyles,
+      pendingApproval: true,
+      importSource: "ProSpace",
+    };
+    newProducts.push(draft);
+    upcToProductId[pp.upc] = draft.id;
+  });
+
+  // dedupe new fixtures by type+dims "shape" so e.g. 55 identical shelves become 1 new fixture def
+  const fixtureShapeKey = (type, dims) => `${type}|${dims.w.toFixed(1)}|${dims.h.toFixed(1)}|${dims.d.toFixed(1)}`;
+  const fixtureIdByShape = {};
+  const newFixtures = [];
+  let matchedFixtureCount = 0;
+  const resolveFixtureId = (type, dims) => {
+    const key = fixtureShapeKey(type, dims);
+    if (fixtureIdByShape[key]) return fixtureIdByShape[key];
+    const existing = (existingFixtures || []).find((f) => f.type === type && psaDimsClose(f.dims, dims, 0.35));
+    if (existing) { fixtureIdByShape[key] = existing.id; matchedFixtureCount++; return existing.id; }
+    const draft = {
+      id: uid("fix"),
+      name: `${type} ${dims.w.toFixed(0)}×${dims.h.toFixed(0)}×${dims.d.toFixed(0)}in (ProSpace)`,
+      type,
+      dims,
+      attributes: {},
+      pendingApproval: true,
+      importSource: "ProSpace",
+    };
+    newFixtures.push(draft);
+    fixtureIdByShape[key] = draft.id;
+    return draft.id;
+  };
+
+  let placementCount = 0;
+  let skippedPlacements = 0;
+  const planogramDrafts = parsed.planograms.map((pg) => {
+    const sections = pg.segments.map((seg) => {
+      const fixtures = seg.fixtures.map((fx) => {
+        const fixtureId = resolveFixtureId(fx.type, { w: fx.width, h: fx.height, d: fx.depth });
+        const isPegboard = fx.type === "Pegboard";
+        const placements = [];
+        fx.positions.forEach((pos) => {
+          const productId = upcToProductId[pos.upc];
+          if (!productId) { skippedPlacements++; warnings.push(`A position referencing unknown UPC "${pos.upc}" was skipped.`); return; }
+          const placement = {
+            id: uid("pl"),
+            productId,
+            facings: pos.hFacings || 1,
+            orientation: pos.orientation,
+            rotation: pos.rotation,
+            merchStyle: pos.merchStyle,
+          };
+          if (isPegboard) { placement.pegX = Math.round(pos.x); placement.pegY = Math.round(pos.y); }
+          placements.push(placement);
+          placementCount++;
+        });
+        return { id: uid("fxi"), fixtureId, notchY: Math.max(0, Math.round(fx.y)), xOffset: Math.max(0, Math.round(fx.relativeX)), alignment: "left", placements };
+      });
+      return { id: uid("sec"), name: seg.name, width: Math.round(seg.width) || 1, fixtures };
+    });
+    return {
+      id: uid("pog"),
+      name: pg.name,
+      category: "",
+      eventDate: "",
+      dims: { w: Math.round(pg.dims.w) || 48, h: Math.round(pg.dims.h) || 84, d: Math.round(pg.dims.d) || 20 },
+      base: 0,
+      sections,
+      storeIds: [],
+      status: "wip",
+      masterId: null,
+      versionNumber: 1,
+      importSource: { system: "ProSpace", key: pg.key },
+    };
+  });
+
+  if (parsed.planograms.length === 0) warnings.push("No Planogram objects were found in this file.");
+
+  return {
+    planogramDrafts,
+    newProducts,
+    newFixtures,
+    schemaPatch,
+    warnings,
+    stats: {
+      planogramCount: planogramDrafts.length,
+      matchedProductCount,
+      newProductCount: newProducts.length,
+      matchedFixtureCount,
+      newFixtureCount: newFixtures.length,
+      placementCount,
+      skippedPlacements,
+    },
+  };
+}
+
+function ProSpaceImportModal({ products, fixtures, productSchema, onClose, onImport }) {
+  const [phase, setPhase] = useState("pick"); // pick | reading | error | preview
+  const [error, setError] = useState("");
+  const [result, setResult] = useState(null); // mapProSpaceImport output
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const fileInputRef = useRef(null);
+
+  const handleFile = (file) => {
+    if (!file) return;
+    setPhase("reading");
+    setError("");
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const parsed = parsePSAFile(String(e.target.result || ""));
+        const mapped = mapProSpaceImport(parsed, { existingProducts: products, existingFixtures: fixtures, productSchema });
+        setResult(mapped);
+        setSelectedIds(new Set(mapped.planogramDrafts.map((p) => p.id)));
+        setPhase("preview");
+      } catch (err) {
+        setError("Couldn't parse that file — make sure it's a ProSpace .psa export.");
+        setPhase("error");
+      }
+    };
+    reader.onerror = () => { setError("Couldn't read that file."); setPhase("error"); };
+    reader.readAsText(file, "windows-1252");
+  };
+
+  const toggleSelected = (id) => setSelectedIds((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+
+  const doImport = () => {
+    if (!result) return;
+    const chosen = result.planogramDrafts.filter((p) => selectedIds.has(p.id));
+    if (chosen.length === 0) return;
+    // only carry through new products/fixtures actually referenced by the chosen planograms
+    const usedProductIds = new Set();
+    const usedFixtureIds = new Set();
+    chosen.forEach((pg) => pg.sections.forEach((s) => s.fixtures.forEach((fx) => {
+      usedFixtureIds.add(fx.fixtureId);
+      fx.placements.forEach((pl) => usedProductIds.add(pl.productId));
+    })));
+    const newProducts = result.newProducts.filter((p) => usedProductIds.has(p.id));
+    const newFixtures = result.newFixtures.filter((f) => usedFixtureIds.has(f.id));
+    onImport({ planograms: chosen, newProducts, newFixtures, schemaPatch: result.schemaPatch });
+  };
+
+  return (
+    <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-lg border border-slate-200 shadow-xl w-full max-w-2xl max-h-[85vh] overflow-y-auto p-5 space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="font-bold text-slate-800">Import from ProSpace</h3>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+        </div>
+
+        {phase === "pick" && (
+          <div className="space-y-3">
+            <p className="text-sm text-slate-500">
+              Upload a ProSpace/Blue Yonder <code>.psa</code> project file. Each Planogram it contains is imported as its own,
+              independent Tandom planogram. Dimensions in cm are converted to inches automatically. Products and fixtures are
+              matched against your existing library where possible (by UPC and by dimensions) — anything new is created and
+              flagged <span className="font-semibold text-amber-600">Pending Approval</span> for you to review afterward.
+            </p>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".psa,.txt,.csv"
+              className="hidden"
+              onChange={(e) => handleFile(e.target.files[0])}
+            />
+            <button className={btnPrimary} onClick={() => fileInputRef.current && fileInputRef.current.click()}>
+              <Upload size={14} /> Choose .psa file
+            </button>
+          </div>
+        )}
+
+        {phase === "reading" && (
+          <div className="flex items-center gap-2 text-sm text-slate-500 py-6 justify-center">
+            <RefreshCw size={16} className="animate-spin" /> Reading and parsing file…
+          </div>
+        )}
+
+        {phase === "error" && (
+          <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{error}</div>
+        )}
+
+        {phase === "preview" && result && (
+          <div className="space-y-4">
+            <div className="grid grid-cols-3 gap-2 text-xs">
+              <div className="bg-slate-50 border border-slate-200 rounded-md p-2 text-center">
+                <div className="text-lg font-bold text-slate-800">{result.stats.planogramCount}</div>
+                <div className="text-slate-500">Planogram{result.stats.planogramCount !== 1 ? "s" : ""} found</div>
+              </div>
+              <div className="bg-slate-50 border border-slate-200 rounded-md p-2 text-center">
+                <div className="text-lg font-bold text-slate-800">{result.stats.matchedProductCount}</div>
+                <div className="text-slate-500">Products matched</div>
+              </div>
+              <div className="bg-amber-50 border border-amber-200 rounded-md p-2 text-center">
+                <div className="text-lg font-bold text-amber-700">{result.stats.newProductCount + result.stats.newFixtureCount}</div>
+                <div className="text-amber-700">New items — pending approval</div>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              {result.planogramDrafts.map((pg) => {
+                const fixtureCount = pg.sections.reduce((s, sec) => s + sec.fixtures.length, 0);
+                const placementCount = pg.sections.reduce((s, sec) => s + sec.fixtures.reduce((s2, fx) => s2 + fx.placements.length, 0), 0);
+                return (
+                  <label key={pg.id} className="flex items-start gap-2.5 border border-slate-200 rounded-md p-2.5 cursor-pointer hover:bg-slate-50">
+                    <input type="checkbox" className="mt-0.5" checked={selectedIds.has(pg.id)} onChange={() => toggleSelected(pg.id)} />
+                    <div className="min-w-0">
+                      <div className="font-semibold text-sm text-slate-800">{pg.name}</div>
+                      <div className="text-xs text-slate-500">
+                        {pg.dims.w}×{pg.dims.h}×{pg.dims.d} in · {pg.sections.length} section{pg.sections.length !== 1 ? "s" : ""} · {fixtureCount} fixture{fixtureCount !== 1 ? "s" : ""} · {placementCount} placement{placementCount !== 1 ? "s" : ""}
+                      </div>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+
+            {result.stats.skippedPlacements > 0 && (
+              <div className="text-xs rounded-md px-3 py-2 bg-amber-50 text-amber-700 border border-amber-200">
+                {result.stats.skippedPlacements} position{result.stats.skippedPlacements !== 1 ? "s" : ""} referenced a product not found anywhere in the file and were skipped.
+              </div>
+            )}
+            <div className="text-xs text-slate-400">
+              Note: ProSpace performance/movement data in this file was not imported — bring that in separately via Performance Data upload if needed.
+              Pegboard hole positions are carried over directly and may need minor adjustment.
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+              <button className={btnGhost} onClick={onClose}>Cancel</button>
+              <button className={btnPrimary} disabled={selectedIds.size === 0} onClick={doImport}>
+                <Check size={14} /> Import {selectedIds.size} Planogram{selectedIds.size !== 1 ? "s" : ""}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Planogram list                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -2548,8 +3094,9 @@ function NewPlanogramForm({ existingCategories, onCreate, onCancel }) {
   );
 }
 
-function PlanogramList({ planograms, stores, onCreate, onOpen, onDelete, onAssignStores, onCreateVersion, onCreateVersions }) {
+function PlanogramList({ planograms, stores, products, fixtures, productSchema, onCreate, onOpen, onDelete, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace }) {
   const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [query, setQuery] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("All");
   const [storeFilter, setStoreFilter] = useState("All");
@@ -2643,9 +3190,20 @@ function PlanogramList({ planograms, stores, onCreate, onOpen, onDelete, onAssig
               List
             </button>
           </div>
+          <button className={btnGhost} onClick={() => setImporting(true)}><Upload size={14} /> Import from ProSpace</button>
           <button className={btnPrimary} onClick={() => setCreating(true)}><Plus size={14} /> New Planogram</button>
         </div>
       </div>
+
+      {importing && (
+        <ProSpaceImportModal
+          products={products}
+          fixtures={fixtures}
+          productSchema={productSchema}
+          onClose={() => setImporting(false)}
+          onImport={(payload) => { onImportProSpace(payload); setImporting(false); }}
+        />
+      )}
 
       {planograms.length > 0 && (
         <div className="bg-white border border-slate-200 rounded-lg p-3 mb-4 space-y-3">
@@ -6866,6 +7424,21 @@ function AppContent({ session }) {
     return created;
   };
 
+  // Commits a ProSpace import: adds any schema fields it needed (e.g. a UPC field, if the
+  // product schema didn't already have one), creates the new products/fixtures it flagged for
+  // approval, then creates the imported planogram(s) themselves. Order matters here only in that
+  // everything referenced by a placement/fixture-instance must exist before the planogram does —
+  // in practice all of it already exists as plain objects by this point, so this is just three
+  // batched state updates rather than one-at-a-time creates.
+  const importProSpaceResults = ({ planograms: pgDrafts, newProducts, newFixtures, schemaPatch }) => {
+    if (schemaPatch && schemaPatch.length > 0) {
+      updateProductSchema([...productSchema, ...schemaPatch]);
+    }
+    newProducts.forEach((p) => createProduct(p));
+    newFixtures.forEach((f) => createFixture(f));
+    pgDrafts.forEach((p) => createPlanogram(p));
+  };
+
   // Promotes a planogram to Live, and — since Live is meant to represent the one current layout
   // for a given space — retires any OTHER Live member of the same version family to Historical
   // in the same step. This is the concrete trigger for "Historical = replaced by a newer
@@ -7175,12 +7748,16 @@ function AppContent({ session }) {
           <PlanogramList
             planograms={planograms}
             stores={stores}
+            products={products}
+            fixtures={fixtures}
+            productSchema={productSchema}
             onCreate={createPlanogram}
             onOpen={setActivePlanogramId}
             onDelete={deletePlanogramEntity}
             onAssignStores={assignStoresToPlanogram}
             onCreateVersion={(source) => { const v = createPlanogramVersion(source); setActivePlanogramId(v.id); }}
             onCreateVersions={createPlanogramVersionsBulk}
+            onImportProSpace={importProSpaceResults}
           />
         ) : tab === "products" ? (
           <ProductLibrary
