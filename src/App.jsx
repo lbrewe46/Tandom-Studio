@@ -2856,6 +2856,22 @@ function PlanogramList({ planograms, stores, onCreate, onOpen, onDelete, onAssig
 /* Planogram editor — the graphical gondola builder                    */
 /* ------------------------------------------------------------------ */
 
+// Merchandising style support: a placement can be sold/displayed as something other than a
+// single "Unit" (e.g. a full Tray or Case), which usually has very different dimensions than
+// the base product. This resolves the dimensions that should actually drive layout/rendering
+// for a given placement — falling back to the product's own base dims when the placement is
+// "unit" (or an unset/no-longer-defined style), so nothing here ever throws on stale data.
+function getEffectiveDims(product, placement) {
+  const style = placement?.merchStyle;
+  const styleData = style && style !== "unit" ? product?.merchStyles?.[style] : null;
+  if (!styleData) return product.dims;
+  return {
+    w: styleData.w || product.dims.w,
+    h: styleData.h || product.dims.h,
+    d: styleData.d || product.dims.d,
+  };
+}
+
 function layoutFixtureBoxes(fixtureInst, fixtureDef, products) {
   const widthIn = fixtureDef ? fixtureDef.dims.w : 24;
   const alignment = fixtureInst.alignment || "left"; // "left" | "right" | "spread"
@@ -2869,12 +2885,13 @@ function layoutFixtureBoxes(fixtureInst, fixtureDef, products) {
   (fixtureInst.placements || []).forEach((pl) => {
     const prod = products.find((p) => p.id === pl.productId);
     if (!prod) return;
+    const effectiveDims = getEffectiveDims(prod, pl);
     const rotated = pl.rotation === 90 || pl.rotation === 270;
-    const nominalW = (rotated ? prod.dims.h : prod.dims.w) || 1;
+    const nominalW = (rotated ? effectiveDims.h : effectiveDims.w) || 1;
     const squeeze = prod.squeezeFactor ?? 1;
     const w = nominalW * squeeze;
     const overhangIn = prod.overhangIn || 0;
-    for (let i = 0; i < (pl.facings || 1); i++) items.push({ placement: pl, product: prod, wIn: w, overhangIn });
+    for (let i = 0; i < (pl.facings || 1); i++) items.push({ placement: pl, product: prod, wIn: w, overhangIn, effectiveDims });
   });
 
   const totalContentWidth = items.reduce((s, it) => s + it.wIn, 0);
@@ -2884,21 +2901,21 @@ function layoutFixtureBoxes(fixtureInst, fixtureDef, products) {
   if (alignment === "right") {
     let cursor = Math.max(0, widthIn - totalContentWidth);
     items.forEach((it) => {
-      boxes.push({ placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: isOverflow(cursor, it) });
+      boxes.push({ placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: isOverflow(cursor, it), effectiveDims: it.effectiveDims });
       cursor += it.wIn;
     });
   } else if (alignment === "spread" && items.length > 1 && totalContentWidth < widthIn) {
     const gap = (widthIn - totalContentWidth) / (items.length - 1);
     let cursor = 0;
     items.forEach((it) => {
-      boxes.push({ placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: isOverflow(cursor, it) });
+      boxes.push({ placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: isOverflow(cursor, it), effectiveDims: it.effectiveDims });
       cursor += it.wIn + gap;
     });
   } else {
     // left (default), and also the fallback when "spread" has nothing to spread (0-1 items, or content already overflows)
     let cursor = 0;
     items.forEach((it) => {
-      boxes.push({ placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: isOverflow(cursor, it) });
+      boxes.push({ placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: isOverflow(cursor, it), effectiveDims: it.effectiveDims });
       cursor += it.wIn;
     });
   }
@@ -2924,8 +2941,9 @@ function layoutPegboardBoxes(fixtureInst, fixtureDef, products) {
   (fixtureInst.placements || []).forEach((pl) => {
     const prod = products.find((p) => p.id === pl.productId);
     if (!prod) return;
+    const effectiveDims = getEffectiveDims(prod, pl);
     const rotated = pl.rotation === 90 || pl.rotation === 270;
-    const nominalW = (rotated ? prod.dims.h : prod.dims.w) || 1;
+    const nominalW = (rotated ? effectiveDims.h : effectiveDims.w) || 1;
     const squeeze = prod.squeezeFactor ?? 1;
     const w = nominalW * squeeze;
     const overhangIn = prod.overhangIn || 0;
@@ -2935,7 +2953,7 @@ function layoutPegboardBoxes(fixtureInst, fixtureDef, products) {
     let cursor = originX;
     for (let i = 0; i < (pl.facings || 1); i++) {
       const overflow = cursor < 0 || cursor + w > widthIn + overhangIn || originY > heightIn || originY < 0;
-      boxes.push({ placement: pl, product: prod, xIn: cursor, wIn: w, pegYIn: originY, overflow });
+      boxes.push({ placement: pl, product: prod, xIn: cursor, wIn: w, pegYIn: originY, overflow, effectiveDims });
       cursor += w;
     }
   });
@@ -2960,16 +2978,17 @@ function derivePegRowColumn(pegX, pegY, panelHeightIn) {
 /* ------------------------------------------------------------------ */
 
 function ReadOnlyProductBox({ box, scale, pegYIn, newProductIds }) {
-  const { placement, product, xIn, wIn } = box;
+  const { placement, product, xIn, wIn, effectiveDims } = box;
+  const dims = effectiveDims || product.dims;
   const rotation = placement.rotation || 0;
   const rotated = rotation === 90 || rotation === 270;
   const footprintWpx = Math.max(wIn * scale - 1, 2);
-  const footprintHpx = Math.max((rotated ? product.dims.w : product.dims.h) * scale - 1, 4);
-  const naturalWpx = Math.max(product.dims.w * scale - 1, 2);
-  const naturalHpx = Math.max(product.dims.h * scale - 1, 4);
+  const footprintHpx = Math.max((rotated ? dims.w : dims.h) * scale - 1, 4);
+  const naturalWpx = Math.max(dims.w * scale - 1, 2);
+  const naturalHpx = Math.max(dims.h * scale - 1, 4);
   const img = product.images?.[placement.orientation];
   const hasPeg = pegYIn !== undefined && pegYIn !== null;
-  const pegBottomPx = hasPeg ? (pegYIn - (rotated ? product.dims.w : product.dims.h)) * scale : undefined;
+  const pegBottomPx = hasPeg ? (pegYIn - (rotated ? dims.w : dims.h)) * scale : undefined;
   const isNew = newProductIds && newProductIds.has(product.id);
   return (
     <div className={`absolute ${hasPeg ? "" : "bottom-0"}`} style={{ left: xIn * scale, width: footprintWpx, height: footprintHpx, bottom: hasPeg ? pegBottomPx : undefined }}>
@@ -3317,7 +3336,8 @@ function computeJoinedGroupLayouts(planogram, fixtures, products) {
 }
 
 function ProductBox({ box, scale, selected, onSelect, metrics, schema, overlaySettings, onDragStartPlacement, onDragEndPlacement, dragging, readOnly, capacityWarningsEnabled, hideImages, highlightField, zoomLevel, pegYIn }) {
-  const { placement, product, xIn, wIn, overflow } = box;
+  const { placement, product, xIn, wIn, overflow, effectiveDims } = box;
+  const dims = effectiveDims || product.dims;
   const img = hideImages ? null : product.images?.[placement.orientation];
   const rotation = placement.rotation || 0;
   const rotated = rotation === 90 || rotation === 270;
@@ -3335,10 +3355,11 @@ function ProductBox({ box, scale, selected, onSelect, metrics, schema, overlaySe
 
   // footprint = the actual space this facing occupies on the shelf (swaps at 90/270)
   const footprintWpx = Math.max(wIn * scale - 1, 2);
-  const footprintHpx = Math.max((rotated ? product.dims.w : product.dims.h) * scale - 1, 4);
-  // natural = the product's own front-facing size, which then gets rotated as a whole block
-  const naturalWpx = Math.max(product.dims.w * scale - 1, 2);
-  const naturalHpx = Math.max(product.dims.h * scale - 1, 4);
+  const footprintHpx = Math.max((rotated ? dims.w : dims.h) * scale - 1, 4);
+  // natural = the product's own front-facing size (or its merch style's, if placed as one),
+  // which then gets rotated as a whole block
+  const naturalWpx = Math.max(dims.w * scale - 1, 2);
+  const naturalHpx = Math.max(dims.h * scale - 1, 4);
 
   const settings = overlaySettings || DEFAULT_OVERLAY_SETTINGS;
   const showOverlay = settings.mode === "always" || (settings.mode === "noImageOnly" && !img);
@@ -3354,7 +3375,7 @@ function ProductBox({ box, scale, selected, onSelect, metrics, schema, overlaySe
   // pegYIn (pegboard only): the peg hole sits at this height from the panel's bottom edge, and
   // the product hangs DOWN from it — so its own top, not its bottom, aligns to the peg
   const hasPeg = pegYIn !== undefined && pegYIn !== null;
-  const pegBottomPx = hasPeg ? (pegYIn - (rotated ? product.dims.w : product.dims.h)) * scale : undefined;
+  const pegBottomPx = hasPeg ? (pegYIn - (rotated ? dims.w : dims.h)) * scale : undefined;
 
   return (
     <div
@@ -4080,6 +4101,23 @@ function PlacementInspector({ placement, product, metrics, weeks, onChange, onRe
       )}
 
       <div>
+        <label className={labelCls}>Merchandising Style</label>
+        <select
+          className={inputCls}
+          value={placement.merchStyle || "unit"}
+          onChange={(e) => onChange({ ...placement, merchStyle: e.target.value })}
+        >
+          <option value="unit">Unit</option>
+          {MERCH_STYLE_DEFS.filter((s) => product?.merchStyles?.[s.id]).map((s) => (
+            <option key={s.id} value={s.id}>{s.label}</option>
+          ))}
+        </select>
+        {placement.merchStyle && placement.merchStyle !== "unit" && !product?.merchStyles?.[placement.merchStyle] && (
+          <p className="text-[10px] text-amber-600 mt-1">This style isn't defined for this product anymore — using Unit dimensions instead.</p>
+        )}
+      </div>
+
+      <div>
         <label className={labelCls}>Orientation</label>
         <div className="grid grid-cols-3 gap-1.5">
           {ORIENTATIONS.map((o) => (
@@ -4644,7 +4682,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
               fixtures: s.fixtures.map((f) => {
                 if (f.id !== fxId) return f;
                 const arr = [...f.placements];
-                const newPlacement = { id: newId, productId, facings: 1, orientation: "front", rotation: 0 };
+                const newPlacement = { id: newId, productId, facings: 1, orientation: "front", rotation: 0, merchStyle: "unit" };
                 if (pegCoords) { newPlacement.pegX = pegCoords.pegX; newPlacement.pegY = pegCoords.pegY; }
                 const idx = insertIndex == null ? arr.length : clamp(insertIndex, 0, arr.length);
                 arr.splice(idx, 0, newPlacement);
