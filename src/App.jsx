@@ -1516,6 +1516,16 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate
   };
   const fileInputRef = useRef(null);
 
+  const approveAllPending = () => {
+    products.filter((p) => p.pendingApproval).forEach((p) => onUpdate({ ...p, pendingApproval: false }));
+  };
+  const deleteAllPending = () => {
+    const targets = products.filter((p) => p.pendingApproval);
+    if (targets.length === 0) return;
+    if (!window.confirm(`Delete all ${targets.length} pending product${targets.length !== 1 ? "s" : ""}? This can't be undone.`)) return;
+    targets.forEach((p) => onDelete(p.id));
+  };
+
   const matchAllFromRepo = async () => {
     if (!imageRepo?.enabled) return;
     const targets = products.filter((p) => ORIENTATIONS.some((o) => !p.images?.[o.id]));
@@ -1721,12 +1731,26 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate
             />
           </div>
           {pendingCount > 0 && (
-            <button
-              onClick={() => setPendingOnly((v) => !v)}
-              className={`text-xs font-medium rounded-full px-3 py-1.5 border ${pendingOnly ? "bg-amber-500 border-amber-500 text-slate-900" : "border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100"}`}
-            >
-              Pending Approval ({pendingCount})
-            </button>
+            <>
+              <button
+                onClick={() => setPendingOnly((v) => !v)}
+                className={`text-xs font-medium rounded-full px-3 py-1.5 border ${pendingOnly ? "bg-amber-500 border-amber-500 text-slate-900" : "border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100"}`}
+              >
+                Pending Approval ({pendingCount})
+              </button>
+              <button
+                onClick={approveAllPending}
+                className="inline-flex items-center gap-1 text-xs font-medium rounded-full px-3 py-1.5 border border-emerald-300 text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
+              >
+                <Check size={12} /> Approve All
+              </button>
+              <button
+                onClick={deleteAllPending}
+                className="inline-flex items-center gap-1 text-xs font-medium rounded-full px-3 py-1.5 border border-red-300 text-red-600 bg-red-50 hover:bg-red-100"
+              >
+                <Trash2 size={12} /> Delete All
+              </button>
+            </>
           )}
         </div>
       )}
@@ -1904,6 +1928,15 @@ function FixtureLibrary({ schema, fixtures, onCreate, onUpdate, onDelete }) {
   const [viewMode, setViewMode] = useState("grid"); // grid | list
   const [pendingOnly, setPendingOnly] = useState(false);
   const pendingCount = fixtures.filter((f) => f.pendingApproval).length;
+  const approveAllPending = () => {
+    fixtures.filter((f) => f.pendingApproval).forEach((f) => onUpdate({ ...f, pendingApproval: false }));
+  };
+  const deleteAllPending = () => {
+    const targets = fixtures.filter((f) => f.pendingApproval);
+    if (targets.length === 0) return;
+    if (!window.confirm(`Delete all ${targets.length} pending fixture${targets.length !== 1 ? "s" : ""}? This can't be undone.`)) return;
+    targets.forEach((f) => onDelete(f.id));
+  };
   if (editing) {
     return (
       <FixtureForm
@@ -1961,12 +1994,26 @@ function FixtureLibrary({ schema, fixtures, onCreate, onUpdate, onDelete }) {
             />
           </div>
           {pendingCount > 0 && (
-            <button
-              onClick={() => setPendingOnly((v) => !v)}
-              className={`text-xs font-medium rounded-full px-3 py-1.5 border ${pendingOnly ? "bg-amber-500 border-amber-500 text-slate-900" : "border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100"}`}
-            >
-              Pending Approval ({pendingCount})
-            </button>
+            <>
+              <button
+                onClick={() => setPendingOnly((v) => !v)}
+                className={`text-xs font-medium rounded-full px-3 py-1.5 border ${pendingOnly ? "bg-amber-500 border-amber-500 text-slate-900" : "border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100"}`}
+              >
+                Pending Approval ({pendingCount})
+              </button>
+              <button
+                onClick={approveAllPending}
+                className="inline-flex items-center gap-1 text-xs font-medium rounded-full px-3 py-1.5 border border-emerald-300 text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
+              >
+                <Check size={12} /> Approve All
+              </button>
+              <button
+                onClick={deleteAllPending}
+                className="inline-flex items-center gap-1 text-xs font-medium rounded-full px-3 py-1.5 border border-red-300 text-red-600 bg-red-50 hover:bg-red-100"
+              >
+                <Trash2 size={12} /> Delete All
+              </button>
+            </>
           )}
         </div>
       )}
