@@ -2729,6 +2729,11 @@ function parsePSAFile(text) {
         key: (psaField(row, 1) || "").trim(),
         dims: { w: psaConv(psaField(row, 2), metric), h: psaConv(psaField(row, 3), metric), d: psaConv(psaField(row, 4), metric) },
         segments: [],
+        // kept flat at the planogram level, NOT bucketed into a single owning segment — a real
+        // gondola shelf often runs continuously across a section seam (see mapProSpaceImport,
+        // which is where that's actually resolved: a fixture whose footprint spans more than one
+        // segment gets split there instead of being force-fit, oversized, into just one).
+        fixtures: [],
       };
       curSegment = null;
       curFixture = null;
@@ -2743,7 +2748,6 @@ function parsePSAFile(text) {
         name: (psaField(row, 0) || "").trim() || `Section ${curPlanogram.segments.length + 1}`,
         width: psaConv(widthCm, metric) || 1,
         offsetXCm: segCumWidthCm,
-        fixtures: [],
       };
       segCumWidthCm += widthCm;
       curPlanogram.segments.push(seg);
@@ -2779,7 +2783,7 @@ function parsePSAFile(text) {
         depth: psaConv(psaField(row, 8), metric) || 1,
         positions: [],
       };
-      owner.fixtures.push(fx);
+      curPlanogram.fixtures.push(fx);
       curFixture = fx;
       continue;
     }
@@ -2891,64 +2895,142 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
   let placementCount = 0;
   let skippedPlacements = 0;
   const planogramDrafts = parsed.planograms.map((pg) => {
-    const sections = pg.segments.map((seg) => {
-      const fixtures = [];
-      // a segment's peg backboard often carries no positions at all — the retailer's real gondola
-      // has one everywhere structurally, but it's only merchandised in some spots. An unused one
-      // isn't a real interactive fixture worth importing (nothing is placed on it, so it has no
-      // capacity/placements to manage); it's just the cosmetic look of the backwall, which the
-      // section-level backboardStyle property now models directly instead.
-      let segBackboardStyle = null;
-      seg.fixtures.forEach((fx) => {
-        const fixtureId = resolveFixtureId(fx.type, { w: fx.width, h: fx.height, d: fx.depth });
-        const isPegboard = fx.type === "Pegboard";
-        const placements = [];
-        fx.positions.forEach((pos) => {
-          const productId = upcToProductId[pos.upc];
-          if (!productId) { skippedPlacements++; warnings.push(`A position referencing unknown UPC "${pos.upc}" was skipped.`); return; }
-          const placement = {
-            id: uid("pl"),
-            productId,
-            facings: pos.hFacings || 1,
-            orientation: pos.orientation,
-            rotation: pos.rotation,
-            merchStyle: pos.merchStyle,
-          };
-          if (isPegboard) {
-            // ProSpace's Position X is the item's LEFT edge on the panel — the same left-edge
-            // convention every other X field in this format uses. Tandom's own pegX is the
-            // physical peg/hook the item hangs CENTERED on, so shift by half the item's rendered
-            // width to convert conventions. Without this, every item is drawn half a width too
-            // far left — invisible for interior items, but a left-edge item (x=0) then hangs half
-            // off the panel and trips the "pegs outside the panel" warning.
-            const prod = productById[productId];
-            const dims = (prod && pos.merchStyle && pos.merchStyle !== "unit" && prod.merchStyles?.[pos.merchStyle]) || prod?.dims || { w: 1, h: 1 };
-            const rotated = pos.rotation === 90 || pos.rotation === 270;
-            const wIn = (rotated ? dims.h : dims.w) || 1;
-            // Snapping that center to the nearest whole-inch hole (pegs are physically discrete —
-            // see the comment on pegToOrigin) can round an already edge-flush item a hair past the
-            // panel boundary. Clamp the candidate hole to the nearest one that still keeps the
-            // item fully on the panel, rather than flagging a fraction-of-an-inch rounding
-            // artifact as a real placement problem.
-            let pegX = Math.round(pos.x + wIn / 2);
-            const minPegX = Math.ceil(wIn / 2 - 0.001);
-            const maxPegX = Math.floor(fx.width - wIn / 2 + 0.001);
-            if (Number.isFinite(minPegX)) pegX = Math.max(pegX, minPegX);
-            if (Number.isFinite(maxPegX)) pegX = Math.min(pegX, maxPegX);
-            placement.pegX = pegX;
-            placement.pegY = Math.round(pos.y);
-          }
-          placements.push(placement);
-          placementCount++;
-        });
-        if (isPegboard && placements.length === 0) {
-          segBackboardStyle = "pegboard";
-          return;
-        }
-        fixtures.push({ id: uid("fxi"), fixtureId, notchY: Math.max(0, Math.round(fx.y)), xOffset: Math.max(0, Math.round(fx.relativeX)), alignment: "left", placements });
-      });
-      return { id: uid("sec"), name: seg.name, width: Math.round(seg.width) || 1, fixtures, ...(segBackboardStyle ? { backboardStyle: segBackboardStyle } : {}) };
+    // absolute-inch [start, end) range for every segment, used below to find which segment(s) a
+    // fixture's physical footprint actually falls in — a real gondola shelf often runs
+    // continuously across a section seam, so a fixture's footprint can span more than one of
+    // these ranges.
+    let cursorIn = 0;
+    const segRanges = pg.segments.map((seg) => {
+      const r = { startIn: cursorIn, endIn: cursorIn + (seg.width || 0) };
+      cursorIn += seg.width || 0;
+      return r;
     });
+    const fixturesBySegment = pg.segments.map(() => []);
+    // a segment's peg backboard often carries no positions at all — the retailer's real gondola
+    // has one everywhere structurally, but it's only merchandised in some spots. An unused one
+    // isn't a real interactive fixture worth importing (nothing is placed on it, so it has no
+    // capacity/placements to manage); it's just the cosmetic look of the backwall, which the
+    // section-level backboardStyle property now models directly instead.
+    const segBackboardStyle = pg.segments.map(() => null);
+
+    pg.fixtures.forEach((fx) => {
+      const isPegboard = fx.type === "Pegboard";
+      const fxStart = fx.absoluteX;
+      const fxEnd = fx.absoluteX + fx.width;
+      // real exports carry a little rounding noise around clean boundaries (a fixture landing at
+      // e.g. x=11.97 instead of a true x=12 seam) — a sub-half-inch sliver of "overlap" from that
+      // noise isn't a genuine cross-segment shelf, so it's ignored rather than triggering a split
+      // over essentially nothing
+      let overlapping = segRanges
+        .map((r, idx) => ({ idx, startIn: Math.max(r.startIn, fxStart), endIn: Math.min(r.endIn, fxEnd) }))
+        .filter((o) => o.endIn - o.startIn > 0.5);
+      if (overlapping.length === 0) {
+        // didn't cleanly land in any segment's range (bad/rounded data) — fall back to whichever
+        // segment its left edge is closest to, rather than dropping the fixture entirely
+        let best = 0, bestDist = Infinity;
+        segRanges.forEach((r, idx) => { const d = Math.abs(r.startIn - fxStart); if (d < bestDist) { bestDist = d; best = idx; } });
+        overlapping = [{ idx: best, startIn: segRanges[best] ? segRanges[best].startIn : 0, endIn: (segRanges[best] ? segRanges[best].startIn : 0) + fx.width }];
+      }
+      // a pegboard is kept single-segment even if its footprint technically bleeds past its own
+      // section's edge — it already has its own dedicated cross-section "bleed" rendering as a
+      // backdrop, and its 2D peg grid doesn't fit the 1D shelf-splitting/joining model below.
+      if (isPegboard && overlapping.length > 1) overlapping = [overlapping[0]];
+      const split = overlapping.length > 1;
+      const groupId = split ? uid("psagrp") : null;
+
+      const allPlacements = [];
+      fx.positions.forEach((pos) => {
+        const productId = upcToProductId[pos.upc];
+        if (!productId) { skippedPlacements++; warnings.push(`A position referencing unknown UPC "${pos.upc}" was skipped.`); return; }
+        const placement = {
+          id: uid("pl"),
+          productId,
+          facings: pos.hFacings || 1,
+          orientation: pos.orientation,
+          rotation: pos.rotation,
+          merchStyle: pos.merchStyle,
+        };
+        if (isPegboard) {
+          // ProSpace's Position X is the item's LEFT edge on the panel — the same left-edge
+          // convention every other X field in this format uses. Tandom's own pegX is the
+          // physical peg/hook the item hangs CENTERED on, so shift by half the item's rendered
+          // width to convert conventions. Without this, every item is drawn half a width too
+          // far left — invisible for interior items, but a left-edge item (x=0) then hangs half
+          // off the panel and trips the "pegs outside the panel" warning.
+          const prod = productById[productId];
+          const dims = (prod && pos.merchStyle && pos.merchStyle !== "unit" && prod.merchStyles?.[pos.merchStyle]) || prod?.dims || { w: 1, h: 1 };
+          const rotated = pos.rotation === 90 || pos.rotation === 270;
+          const wIn = (rotated ? dims.h : dims.w) || 1;
+          // Snapping that center to the nearest whole-inch hole (pegs are physically discrete —
+          // see the comment on pegToOrigin) can round an already edge-flush item a hair past the
+          // panel boundary. Clamp the candidate hole to the nearest one that still keeps the
+          // item fully on the panel, rather than flagging a fraction-of-an-inch rounding
+          // artifact as a real placement problem.
+          let pegX = Math.round(pos.x + wIn / 2);
+          const minPegX = Math.ceil(wIn / 2 - 0.001);
+          const maxPegX = Math.floor(fx.width - wIn / 2 + 0.001);
+          if (Number.isFinite(minPegX)) pegX = Math.max(pegX, minPegX);
+          if (Number.isFinite(maxPegX)) pegX = Math.min(pegX, maxPegX);
+          placement.pegX = pegX;
+          placement.pegY = Math.round(pos.y);
+        }
+        placementCount++;
+        // absX is only used below to split a multi-segment shelf's items into the right member —
+        // pegboard placements already carry their own on-panel pegX/pegY above
+        allPlacements.push({ placement, absX: fx.absoluteX + pos.x });
+      });
+
+      if (isPegboard && allPlacements.length === 0) {
+        segBackboardStyle[overlapping[0].idx] = "pegboard";
+        return;
+      }
+
+      if (!split) {
+        const fixtureId = resolveFixtureId(fx.type, { w: fx.width, h: fx.height, d: fx.depth });
+        fixturesBySegment[overlapping[0].idx].push({
+          id: uid("fxi"), fixtureId,
+          notchY: Math.max(0, Math.round(fx.y)),
+          xOffset: Math.max(0, Math.round(fx.relativeX)),
+          alignment: "left",
+          placements: allPlacements.map((p) => p.placement),
+        });
+        return;
+      }
+
+      // split: one Tandom fixture instance per segment this fixture's footprint overlaps, each
+      // sized to just its own portion (not the fixture's full original width), flush against its
+      // section's left edge, and joined via a shared groupId — Tandom's existing cross-section
+      // "join" feature — so computeJoinedGroupLayouts packs all their placements as one
+      // continuous run instead of one oversized fixture bleeding over and burying whatever the
+      // neighboring section actually owns.
+      overlapping.forEach((o, idx) => {
+        const portionWidthIn = Math.max(1, o.endIn - o.startIn);
+        const memberFixtureId = resolveFixtureId(fx.type, { w: portionWidthIn, h: fx.height, d: fx.depth });
+        const isLastMember = idx === overlapping.length - 1;
+        // an item's LEFT edge decides which member it belongs to; the last member also catches
+        // anything at/past its own start (rounding, or genuine overflow past the combined run),
+        // same forgiving "catch everything beyond" behavior computeJoinedGroupLayouts itself uses
+        const memberPlacements = allPlacements
+          .filter((p) => isLastMember ? p.absX >= o.startIn - 0.05 : (p.absX >= o.startIn - 0.05 && p.absX < o.endIn - 0.05))
+          .map((p) => p.placement);
+        fixturesBySegment[o.idx].push({
+          id: uid("fxi"), fixtureId: memberFixtureId,
+          notchY: Math.max(0, Math.round(fx.y)),
+          xOffset: 0,
+          alignment: "left",
+          groupId,
+          placements: memberPlacements,
+        });
+      });
+    });
+
+    const sections = pg.segments.map((seg, segIdx) => ({
+      id: uid("sec"),
+      name: seg.name,
+      width: Math.round(seg.width) || 1,
+      fixtures: fixturesBySegment[segIdx],
+      ...(segBackboardStyle[segIdx] ? { backboardStyle: segBackboardStyle[segIdx] } : {}),
+    }));
     return {
       id: uid("pog"),
       name: pg.name,
