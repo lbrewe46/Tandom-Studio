@@ -2892,7 +2892,14 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
   let skippedPlacements = 0;
   const planogramDrafts = parsed.planograms.map((pg) => {
     const sections = pg.segments.map((seg) => {
-      const fixtures = seg.fixtures.map((fx) => {
+      const fixtures = [];
+      // a segment's peg backboard often carries no positions at all — the retailer's real gondola
+      // has one everywhere structurally, but it's only merchandised in some spots. An unused one
+      // isn't a real interactive fixture worth importing (nothing is placed on it, so it has no
+      // capacity/placements to manage); it's just the cosmetic look of the backwall, which the
+      // section-level backboardStyle property now models directly instead.
+      let segBackboardStyle = null;
+      seg.fixtures.forEach((fx) => {
         const fixtureId = resolveFixtureId(fx.type, { w: fx.width, h: fx.height, d: fx.depth });
         const isPegboard = fx.type === "Pegboard";
         const placements = [];
@@ -2934,9 +2941,13 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
           placements.push(placement);
           placementCount++;
         });
-        return { id: uid("fxi"), fixtureId, notchY: Math.max(0, Math.round(fx.y)), xOffset: Math.max(0, Math.round(fx.relativeX)), alignment: "left", placements };
+        if (isPegboard && placements.length === 0) {
+          segBackboardStyle = "pegboard";
+          return;
+        }
+        fixtures.push({ id: uid("fxi"), fixtureId, notchY: Math.max(0, Math.round(fx.y)), xOffset: Math.max(0, Math.round(fx.relativeX)), alignment: "left", placements });
       });
-      return { id: uid("sec"), name: seg.name, width: Math.round(seg.width) || 1, fixtures };
+      return { id: uid("sec"), name: seg.name, width: Math.round(seg.width) || 1, fixtures, ...(segBackboardStyle ? { backboardStyle: segBackboardStyle } : {}) };
     });
     return {
       id: uid("pog"),
@@ -4483,12 +4494,19 @@ function PegboardPanel({
   const hasOverflow = boxes.some((b) => b.overflow);
   const showWarnings = capacityWarningsEnabled !== false;
   const visualOverflow = showWarnings && hasOverflow;
+  // a pegboard panel is often much wider than its own section and visually bleeds across
+  // neighboring sections' columns (by design — it's the backdrop those sections' shelves sit
+  // in front of). Elevating it with z-20 just for being SELECTED would paint it over those
+  // shelves/products, covering them, so only actively dragging it (a brief, attention-grabbing
+  // state) gets the elevation — a merely-selected panel keeps its ring but stays in the back.
   const ringCls = !readOnly && dropHoverXY
     ? "ring-2 ring-amber-400 z-20"
     : visualOverflow
     ? "ring-2 ring-red-500 z-20"
-    : !readOnly && (selected || dragging)
+    : !readOnly && dragging
     ? "ring-2 ring-blue-500 z-20"
+    : !readOnly && selected
+    ? "ring-2 ring-blue-500"
     : "";
 
   return (
@@ -4613,7 +4631,7 @@ function PegboardPanel({
 
 function SectionColumn({
   section, index, total, planogram, fixtures, products, scale, readOnly, joinedLayouts, capacityWarningsEnabled, hideImages, highlightField, zoomLevel,
-  onRename, onResize, onMove, onDelete, onAddFixture, onDragFixture, onDropProductOnFixture, onMountFixture, onMovePlacement,
+  onRename, onResize, onSetBackboard, onMove, onDelete, onAddFixture, onDragFixture, onDropProductOnFixture, onMountFixture, onMovePlacement,
   selectedFixtureId, onSelectFixture, selectedPlacementId, onSelectPlacement, onDeselectAll,
   performance, cutoffISO, storeId, schema, overlaySettings,
 }) {
@@ -4628,6 +4646,12 @@ function SectionColumn({
     if (!f.mountedOnId) return;
     (mountedByHost[f.mountedOnId] = mountedByHost[f.mountedOnId] || []).push(f);
   });
+  // every gondola physically has SOME backwall, but most sections don't need it modeled as an
+  // actual merchandisable fixture — this is a purely cosmetic backdrop for realism. When a real
+  // Pegboard fixture IS present, it already shows the peg texture (and is a real drop/mount
+  // target), so the cosmetic backdrop stands down rather than competing with it.
+  const hasRealPegboard = topLevelFixtures.some((fx) => fixtures.find((f) => f.id === fx.fixtureId)?.type === "Pegboard");
+  const backboardStyle = !hasRealPegboard && section.backboardStyle && section.backboardStyle !== "none" ? section.backboardStyle : null;
   return (
     <div className="flex flex-col shrink-0" style={{ width: section.width * scale }}>
       <div className="flex items-center gap-1 mb-1.5 flex-wrap">
@@ -4648,6 +4672,17 @@ function SectionColumn({
               title="Section width (in)"
             />
             <span className="text-[10px] text-slate-400">in</span>
+            <select
+              value={section.backboardStyle || "none"}
+              onChange={(e) => onSetBackboard(e.target.value === "none" ? undefined : e.target.value)}
+              className="text-[10px] font-mono rounded border border-slate-200 px-1 py-0.5 bg-white"
+              title="Backboard appearance — a cosmetic backdrop for gondola realism; hidden automatically if this section also has a real Pegboard fixture"
+            >
+              <option value="none">No backdrop</option>
+              <option value="pegboard">Pegboard</option>
+              <option value="slatwall">Slatwall</option>
+              <option value="solid">Solid</option>
+            </select>
             <div className="ml-auto flex items-center gap-0.5">
               <button className={btnIcon} disabled={index === 0} onClick={() => onMove(-1)} title="Move left"><ChevronLeft size={14} /></button>
               <button className={btnIcon} disabled={index === total - 1} onClick={() => onMove(1)} title="Move right"><ChevronRight size={14} /></button>
@@ -4662,6 +4697,27 @@ function SectionColumn({
         className="relative border-x border-slate-300 bg-gradient-to-b from-slate-100 to-slate-200"
         style={{ width: section.width * scale, height: heightPx }}
       >
+        {/* cosmetic backdrop only — no capacity, no placements, not selectable/draggable, and
+            always painted first so the base plate and every fixture naturally draw on top of it */}
+        {backboardStyle && (
+          <div
+            className="absolute inset-0 pointer-events-none"
+            style={
+              backboardStyle === "pegboard"
+                ? {
+                    background: "#c2b8a3",
+                    backgroundImage: "radial-gradient(circle, #8a7d63 1px, transparent 1.5px)",
+                    backgroundSize: `${scale}px ${scale}px`,
+                  }
+                : backboardStyle === "slatwall"
+                ? {
+                    background: "#cdc4b0",
+                    backgroundImage: `repeating-linear-gradient(to bottom, transparent 0px, transparent ${3 * scale - 1}px, #9b8f76 ${3 * scale - 1}px, #9b8f76 ${3 * scale}px)`,
+                  }
+                : { background: "#d9d3c4" }
+            }
+          />
+        )}
         {/* base / kick plate */}
         <div
           className="absolute bottom-0 w-full bg-slate-700/80 flex items-center justify-center"
@@ -5308,6 +5364,10 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   };
   const renameSection = (id, name) => mutateSections((secs) => secs.map((s) => (s.id === id ? { ...s, name } : s)));
   const resizeSection = (id, width) => mutateSections((secs) => secs.map((s) => (s.id === id ? { ...s, width } : s)));
+  // cosmetic-only gondola backdrop (pegboard/slatwall/solid), independent of whether the section
+  // also has a real, merchandisable Pegboard fixture — see SectionColumn, which suppresses this
+  // when a real Pegboard fixture is present so the two never visually compete.
+  const setSectionBackboard = (id, style) => mutateSections((secs) => secs.map((s) => (s.id === id ? { ...s, backboardStyle: style } : s)));
   const deleteSection = (id) => mutateSections((secs) => secs.filter((s) => s.id !== id));
   const moveSection = (idx, dir) => mutateSections((secs) => {
     const next = [...secs];
@@ -5911,6 +5971,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                     joinedLayouts={joinedLayouts}
                     onRename={(v) => renameSection(section.id, v)}
                     onResize={(v) => resizeSection(section.id, v)}
+                    onSetBackboard={(v) => setSectionBackboard(section.id, v)}
                     onMove={(dir) => moveSection(idx, dir)}
                     onDelete={() => deleteSection(section.id)}
                     onAddFixture={() => setSelectedSectionForAdd(section.id)}
