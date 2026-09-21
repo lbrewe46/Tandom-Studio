@@ -4606,7 +4606,6 @@ function PegboardPanel({
     // point (e.g. crossing over a product already sitting on the panel), which was causing
     // drops to snap a few holes away from where the cursor actually was
     let xy;
-    const rectDebug = e.currentTarget.getBoundingClientRect();
     try { xy = computeDropXY(e); } catch (err) { xy = dropHoverXY || { xIn: 0, yIn: heightIn }; }
     setDropHoverXY(null);
     const raw = e.dataTransfer.getData("text/plain");
@@ -4615,18 +4614,6 @@ function PegboardPanel({
     try { payload = JSON.parse(raw); } catch { payload = { kind: "product", productId: raw }; }
 
     const pegCoords = { pegX: xy.xIn, pegY: xy.yIn };
-
-    // TEMPORARY diagnostic — remove once the vertical placement issue is confirmed fixed
-    const droppedProd = products.find((p) => p.id === (payload.productId || null));
-    console.log("[pegboard drop debug]", {
-      "e.clientY": e.clientY,
-      "panel rect top/height": [rectDebug.top, rectDebug.height],
-      scale,
-      "panel heightIn (fixture def)": heightIn,
-      "computed pegY (stored)": xy.yIn,
-      "derived row (1=top)": Math.round(heightIn - xy.yIn) + 1,
-      "product height (if known)": droppedProd ? droppedProd.dims.h : "unknown",
-    });
 
     if (payload.kind === "pegGroup") {
       // group move only within the SAME panel it was selected on — a rubberband selection is a
@@ -4708,6 +4695,10 @@ function PegboardPanel({
       <div
         onMouseDown={readOnly ? undefined : handleDown}
         onClick={readOnly ? undefined : (e) => { e.stopPropagation(); if (groupSelected.size) setGroupSelected(new Set()); }}
+        // on macOS, Ctrl+click is the system's secondary-click (right-click) gesture — without
+        // this, it opens the browser's context menu instead of ever reaching handleDown/handleMove
+        // as a normal drag, so a Ctrl+drag rubberband-select silently does nothing at all
+        onContextMenu={readOnly ? undefined : (e) => e.preventDefault()}
         onDragOver={readOnly ? undefined : handlePanelDragOver}
         onDragLeave={readOnly ? undefined : handlePanelDragLeave}
         onDrop={readOnly ? undefined : handlePanelDrop}
