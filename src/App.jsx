@@ -2898,6 +2898,15 @@ function ProSpaceImportModal({ products, fixtures, productSchema, onClose, onImp
     reader.onload = (e) => {
       try {
         const parsed = parsePSAFile(String(e.target.result || ""));
+        // Cm→inch conversion (unit math only, not layout logic) hasn't been validated against a
+        // real metric ProSpace export yet, so rather than silently convert and risk a subtly
+        // wrong import, we block metric files here with a clear reason — same file just re-runs
+        // once metric import is actually supported.
+        if (parsed.metric) {
+          setError("This ProSpace file uses Metric units (centimeters). Metric import isn't supported yet — only Imperial (inch-based) ProSpace planogram files can be imported right now.");
+          setPhase("error");
+          return;
+        }
         const mapped = mapProSpaceImport(parsed, { existingProducts: products, existingFixtures: fixtures, productSchema });
         setResult(mapped);
         setSelectedIds(new Set(mapped.planogramDrafts.map((p) => p.id)));
@@ -2945,9 +2954,13 @@ function ProSpaceImportModal({ products, fixtures, productSchema, onClose, onImp
           <div className="space-y-3">
             <p className="text-sm text-slate-500">
               Upload a ProSpace/Blue Yonder <code>.psa</code> project file. Each Planogram it contains is imported as its own,
-              independent Tandom planogram. Dimensions in cm are converted to inches automatically. Products and fixtures are
-              matched against your existing library where possible (by UPC and by dimensions) — anything new is created and
-              flagged <span className="font-semibold text-amber-600">Pending Approval</span> for you to review afterward.
+              independent Tandom planogram. Products and fixtures are matched against your existing library where possible
+              (by UPC and by dimensions) — anything new is created and flagged <span className="font-semibold text-amber-600">Pending Approval</span> for
+              you to review afterward.
+            </p>
+            <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5">
+              Only Imperial (inch-based) ProSpace files are supported right now. A Metric (cm) file will be rejected with an
+              explanation rather than auto-converted.
             </p>
             <input
               ref={fileInputRef}
