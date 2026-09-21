@@ -2961,6 +2961,7 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
           const dims = (prod && pos.merchStyle && pos.merchStyle !== "unit" && prod.merchStyles?.[pos.merchStyle]) || prod?.dims || { w: 1, h: 1 };
           const rotated = pos.rotation === 90 || pos.rotation === 270;
           const wIn = (rotated ? dims.h : dims.w) || 1;
+          const hIn = (rotated ? dims.w : dims.h) || 1;
           // Snapping that center to the nearest whole-inch hole (pegs are physically discrete —
           // see the comment on pegToOrigin) can round an already edge-flush item a hair past the
           // panel boundary. Clamp the candidate hole to the nearest one that still keeps the
@@ -2972,7 +2973,17 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
           if (Number.isFinite(minPegX)) pegX = Math.max(pegX, minPegX);
           if (Number.isFinite(maxPegX)) pegX = Math.min(pegX, maxPegX);
           placement.pegX = pegX;
-          placement.pegY = Math.round(pos.y);
+          // ProSpace's Position Y for a pegged item is its BOTTOM edge (confirmed directly
+          // against JDA's own Position Properties dialog: Y=63.5in absolute for an item whose
+          // relative Y is 10in above this panel's own 53.5in base — that matches this item's
+          // bottom, not its top or the hook it hangs from). Tandom's own pegY is the physical
+          // peg/hook position, which sits just ABOVE the item's top (see pegToOrigin's 0.25in
+          // hang-hole offset) — so it's Y + the item's own rendered height + that offset, not Y
+          // itself. Using Y directly (as if it were the hook) used to hang every item roughly one
+          // item-height too low — invisible for a short item, but for a tall bag or box it put
+          // the item's bottom edge below the panel entirely, overlapping whatever fixture sits
+          // underneath the pegboard.
+          placement.pegY = Math.round(pos.y + hIn + 0.25);
         }
         placementCount++;
         // absX is only used below to split a multi-segment shelf's items into the right member —
@@ -4116,6 +4127,14 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
   const naturalWpx = Math.max(dims.w * scale - 1, 2);
   const naturalHpx = Math.max(dims.h * scale - 1, 4);
 
+  // how many characters of the name can actually fit on one line at this box's width/font size —
+  // a rough average-glyph-width estimate, used to truncate with an explicit "…" rather than
+  // letting a too-long name wrap onto multiple lines and then get silently clipped by the box's
+  // own overflow, which used to leave a random, confusing MIDDLE fragment on screen (e.g. "PLANTERS
+  // TRAIL MIX..." rendering as just "ANTE T") instead of a readable, predictable prefix
+  const maxNameChars = Math.max(1, Math.floor((naturalWpx - 4) / (nameFontSize * 0.62)));
+  const displayName = product.name.length > maxNameChars ? product.name.slice(0, Math.max(1, maxNameChars - 1)) + "…" : product.name;
+
   const settings = overlaySettings || DEFAULT_OVERLAY_SETTINGS;
   const showOverlay = settings.mode === "always" || (settings.mode === "noImageOnly" && !img);
   const { detailLines, metricLines } = showOverlay ? resolveOverlayLines(product, placement, metrics, schema, settings) : { detailLines: [], metricLines: [] };
@@ -4157,8 +4176,8 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
         {img ? (
           <img src={img} alt={product.name} className="absolute inset-0 w-full h-full object-cover" />
         ) : !hasOverlayContent ? (
-          <span className="leading-tight text-white font-semibold text-center px-0.5 break-words" style={{ fontSize: nameFontSize }}>
-            {product.name.slice(0, 10)}
+          <span className="block w-full leading-tight text-white font-semibold text-center px-0.5 whitespace-nowrap overflow-hidden text-ellipsis" style={{ fontSize: nameFontSize }}>
+            {displayName}
           </span>
         ) : null}
 
