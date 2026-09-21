@@ -2882,6 +2882,12 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
     return draft.id;
   };
 
+  // needed to convert a pegboard Position's X into Tandom's pegX below — looked up by id since
+  // productId may point at either a just-matched existing product or a newly-created draft
+  const productById = {};
+  (existingProducts || []).forEach((p) => { productById[p.id] = p; });
+  newProducts.forEach((p) => { productById[p.id] = p; });
+
   let placementCount = 0;
   let skippedPlacements = 0;
   const planogramDrafts = parsed.planograms.map((pg) => {
@@ -2901,7 +2907,30 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
             rotation: pos.rotation,
             merchStyle: pos.merchStyle,
           };
-          if (isPegboard) { placement.pegX = Math.round(pos.x); placement.pegY = Math.round(pos.y); }
+          if (isPegboard) {
+            // ProSpace's Position X is the item's LEFT edge on the panel — the same left-edge
+            // convention every other X field in this format uses. Tandom's own pegX is the
+            // physical peg/hook the item hangs CENTERED on, so shift by half the item's rendered
+            // width to convert conventions. Without this, every item is drawn half a width too
+            // far left — invisible for interior items, but a left-edge item (x=0) then hangs half
+            // off the panel and trips the "pegs outside the panel" warning.
+            const prod = productById[productId];
+            const dims = (prod && pos.merchStyle && pos.merchStyle !== "unit" && prod.merchStyles?.[pos.merchStyle]) || prod?.dims || { w: 1, h: 1 };
+            const rotated = pos.rotation === 90 || pos.rotation === 270;
+            const wIn = (rotated ? dims.h : dims.w) || 1;
+            // Snapping that center to the nearest whole-inch hole (pegs are physically discrete —
+            // see the comment on pegToOrigin) can round an already edge-flush item a hair past the
+            // panel boundary. Clamp the candidate hole to the nearest one that still keeps the
+            // item fully on the panel, rather than flagging a fraction-of-an-inch rounding
+            // artifact as a real placement problem.
+            let pegX = Math.round(pos.x + wIn / 2);
+            const minPegX = Math.ceil(wIn / 2 - 0.001);
+            const maxPegX = Math.floor(fx.width - wIn / 2 + 0.001);
+            if (Number.isFinite(minPegX)) pegX = Math.max(pegX, minPegX);
+            if (Number.isFinite(maxPegX)) pegX = Math.min(pegX, maxPegX);
+            placement.pegX = pegX;
+            placement.pegY = Math.round(pos.y);
+          }
           placements.push(placement);
           placementCount++;
         });
