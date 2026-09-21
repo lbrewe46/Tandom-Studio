@@ -1518,12 +1518,16 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate
 
   const approveAllPending = () => {
     products.filter((p) => p.pendingApproval).forEach((p) => onUpdate({ ...p, pendingApproval: false }));
+    // the pending-only filter would otherwise keep showing an empty grid once nothing left matches it
+    setPendingOnly(false);
   };
   const deleteAllPending = () => {
     const targets = products.filter((p) => p.pendingApproval);
     if (targets.length === 0) return;
     if (!window.confirm(`Delete all ${targets.length} pending product${targets.length !== 1 ? "s" : ""}? This can't be undone.`)) return;
     targets.forEach((p) => onDelete(p.id));
+    // same reason — clear the filter so the (now empty of pending) library renders immediately
+    setPendingOnly(false);
   };
 
   const matchAllFromRepo = async () => {
@@ -1930,12 +1934,16 @@ function FixtureLibrary({ schema, fixtures, onCreate, onUpdate, onDelete }) {
   const pendingCount = fixtures.filter((f) => f.pendingApproval).length;
   const approveAllPending = () => {
     fixtures.filter((f) => f.pendingApproval).forEach((f) => onUpdate({ ...f, pendingApproval: false }));
+    // the pending-only filter would otherwise keep showing an empty grid once nothing left matches it
+    setPendingOnly(false);
   };
   const deleteAllPending = () => {
     const targets = fixtures.filter((f) => f.pendingApproval);
     if (targets.length === 0) return;
     if (!window.confirm(`Delete all ${targets.length} pending fixture${targets.length !== 1 ? "s" : ""}? This can't be undone.`)) return;
     targets.forEach((f) => onDelete(f.id));
+    // same reason — clear the filter so the (now empty of pending) library renders immediately
+    setPendingOnly(false);
   };
   if (editing) {
     return (
