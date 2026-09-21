@@ -2768,6 +2768,11 @@ function parsePSAFile(text) {
         type: PSA_FIXTURE_TYPE_MAP[psaField(row, 0)] || "Shelf",
         name: (psaField(row, 1) || "Fixture").trim(),
         relativeX: psaConv(xCm - owner.offsetXCm, metric),
+        // Position X/Y (below) are ALSO absolute within the whole planogram, same as a Fixture's
+        // own X — so a peg's on-panel offset has to be found the same way: absolute minus the
+        // owning fixture's own absolute origin. absoluteX/absoluteY capture that origin, in the
+        // same (converted) units as Position.x/y, so Position parsing below can just subtract.
+        absoluteX: psaConv(xCm, metric),
         width: psaConv(psaField(row, 4), metric) || 1,
         y: psaConv(psaField(row, 5), metric) || 0,
         height: psaConv(psaField(row, 6), metric) || 1,
@@ -2783,8 +2788,10 @@ function parsePSAFile(text) {
       const [face, rot] = PSA_ORIENTATION_MAP[psaNum(psaField(row, 28))] || ["front", 0];
       curFixture.positions.push({
         upc: (psaField(row, 0) || "").trim(),
-        x: psaConv(psaField(row, 3), metric),
-        y: psaConv(psaField(row, 5), metric),
+        // relative to the owning fixture's own panel origin (see absoluteX comment above) — not
+        // the raw absolute planogram coordinate, which is what these fields hold in the file.
+        x: psaConv(psaField(row, 3), metric) - curFixture.absoluteX,
+        y: psaConv(psaField(row, 5), metric) - curFixture.y,
         merchStyle: PSA_MERCH_STYLE_MAP[psaField(row, 12)] || "unit",
         hFacings: Math.max(1, Math.round(psaNum(psaField(row, 13)) || 1)),
         orientation: face,
