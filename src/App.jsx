@@ -4090,6 +4090,9 @@ function FixtureBar({
   fx, fixtureDef, products, scale, base, maxNotchY, selected, sectionId, readOnly, joinedBoxes, capacityWarningsEnabled, hideImages, highlightField, zoomLevel,
   onSelectFixture, selectedPlacementId, onSelectPlacement, onDragCommit, onDropProduct, onMovePlacement,
   performance, cutoffISO, storeId, schema, overlaySettings,
+  // only passed for a top-level (unmounted) fixture — lets dragging this bar onto a pegboard panel
+  // mount it there instead of just moving it up/down in its own section (see handleUp below)
+  onMountOnPegboard,
 }) {
   const boxes = joinedBoxes || layoutFixtureBoxes(fx, fixtureDef, products).boxes;
   const widthIn = fixtureDef ? fixtureDef.dims.w : 24;
@@ -4117,7 +4120,7 @@ function FixtureBar({
     setLiveNotchY(newNotch);
   };
 
-  const handleUp = () => {
+  const handleUp = (e) => {
     const d = dragRef.current;
     window.removeEventListener("mousemove", handleMove);
     window.removeEventListener("mouseup", handleUp);
@@ -4127,7 +4130,17 @@ function FixtureBar({
     dragRef.current = null;
     if (d) {
       if (d.moved) {
-        onDragCommit(d.currentNotch);
+        // released over a pegboard panel? mount this fixture there (cosmetics-wall pattern: a
+        // shelf physically attached to a pegboard backdrop) instead of the usual vertical reslot
+        const panelEl = onMountOnPegboard && e && document.elementFromPoint(e.clientX, e.clientY)?.closest?.("[data-pegboard-panel-id]");
+        if (panelEl && panelEl.dataset.pegboardPanelId !== fx.id) {
+          const rect = panelEl.getBoundingClientRect();
+          const dropXOffset = Math.max(0, Math.round((e.clientX - rect.left) / scale));
+          const dropNotchY = Math.max(0, Math.round((rect.bottom - e.clientY) / scale));
+          onMountOnPegboard(panelEl.dataset.pegboardPanelId, dropXOffset, dropNotchY);
+        } else {
+          onDragCommit(d.currentNotch);
+        }
         onSelectFixture(fx.id);
       } else {
         onSelectFixture(fx.id);
@@ -4249,7 +4262,9 @@ function FixtureBar({
         title={
           visualOverflow
             ? "This shelf has more product than it can physically hold — remove facings, reduce sizes, or widen the fixture."
-            : fixtureDef ? `${fixtureDef.name} (${fixtureDef.type}) — drag to reposition, or drop a product here` : "Missing fixture"
+            : fixtureDef
+            ? `${fixtureDef.name} (${fixtureDef.type}) — drag to reposition, drop a product here${onMountOnPegboard ? ", or drag onto a pegboard to mount it there" : ""}`
+            : "Missing fixture"
         }
       />
       {visualOverflow && (
@@ -4330,8 +4345,12 @@ function FixtureBar({
 // FixtureBar's shelf model.
 function PegboardPanel({
   fx, fixtureDef, products, scale, base, maxNotchY, selected, sectionId, readOnly, capacityWarningsEnabled, hideImages, highlightField, zoomLevel,
-  onSelectFixture, selectedPlacementId, onSelectPlacement, onDragCommit, onDropProduct, onMovePlacement,
+  onSelectFixture, selectedFixtureId, selectedPlacementId, onSelectPlacement, onDragCommit, onDropProduct, onMovePlacement,
   performance, cutoffISO, storeId, schema, overlaySettings,
+  // fixtures (e.g. shelves) physically mounted on this panel — the cosmetics-wall pattern of a
+  // pegboard backdrop with a few shelves attached to it. Each carries its own xOffset/notchY
+  // relative to THIS panel's own origin, so it tracks along if the panel itself moves.
+  mountedFixtures, fixtures, onDragMountedFixture, onDropProductOnMounted,
 }) {
   const widthIn = fixtureDef ? fixtureDef.dims.w : 24;
   const heightIn = fixtureDef ? fixtureDef.dims.h : 24;
@@ -4483,6 +4502,10 @@ function PegboardPanel({
         onDragOver={readOnly ? undefined : handlePanelDragOver}
         onDragLeave={readOnly ? undefined : handlePanelDragLeave}
         onDrop={readOnly ? undefined : handlePanelDrop}
+        // hit-test target for dragging an ordinary shelf fixture onto this panel to mount it —
+        // see FixtureBar's handleUp, which looks for these data attributes at the drop point
+        data-pegboard-panel-id={fx.id}
+        data-pegboard-section-id={sectionId}
         className={`absolute select-none ${readOnly ? "" : dragging ? "cursor-grabbing" : "cursor-grab"} ${ringCls}`}
         style={{
           left: fx.xOffset * scale,
@@ -4496,7 +4519,7 @@ function PegboardPanel({
           boxShadow: dragging ? "0 4px 10px rgba(0,0,0,0.25)" : "none",
           transition: dragging ? "none" : "bottom 80ms ease-out",
         }}
-        title={fixtureDef ? `${fixtureDef.name} (Pegboard) — 1in peg grid; drop a product anywhere on the panel, or drag the panel to reposition it` : "Missing fixture"}
+        title={fixtureDef ? `${fixtureDef.name} (Pegboard) — 1in peg grid; drop a product anywhere on the panel, drag the panel to reposition it, or drag a shelf fixture onto it to mount that shelf here` : "Missing fixture"}
       >
         {!readOnly && dropHoverXY && (
           <div
@@ -4505,6 +4528,45 @@ function PegboardPanel({
           />
         )}
       </div>
+      {/* fixtures mounted on this panel (e.g. a shelf physically attached to the pegboard) —
+          rendered as ordinary FixtureBars, opaque on top of the peg mesh, with their own
+          xOffset/notchY combined with the panel's so they track along if the panel moves */}
+      {(mountedFixtures || []).map((mfx) => {
+        const mdef = fixtures && fixtures.find((f) => f.id === mfx.fixtureId);
+        const mMaxNotchY = Math.max(0, (base + heightIn) - base - (mdef ? mdef.dims.h : 2));
+        const displayFx = { ...mfx, xOffset: fx.xOffset + (mfx.xOffset || 0), notchY: liveNotchY + (mfx.notchY || 0) };
+        return (
+          <FixtureBar
+            key={mfx.id}
+            fx={displayFx}
+            fixtureDef={mdef}
+            products={products}
+            scale={scale}
+            base={base}
+            maxNotchY={mMaxNotchY}
+            selected={selectedFixtureId === mfx.id}
+            sectionId={sectionId}
+            readOnly={readOnly}
+            capacityWarningsEnabled={capacityWarningsEnabled}
+            hideImages={hideImages}
+            highlightField={highlightField}
+            zoomLevel={zoomLevel}
+            onSelectFixture={onSelectFixture}
+            selectedPlacementId={selectedPlacementId}
+            onSelectPlacement={onSelectPlacement}
+            // committed notch is in the SAME absolute frame as displayFx.notchY above — convert
+            // back to panel-relative before storing, so it stays correct if the panel itself moves
+            onDragCommit={(absNotchY) => onDragMountedFixture && onDragMountedFixture(mfx.id, absNotchY - fx.notchY)}
+            onDropProduct={(productId, insertIndex) => onDropProductOnMounted && onDropProductOnMounted(mfx.id, productId, insertIndex)}
+            onMovePlacement={onMovePlacement}
+            performance={performance}
+            cutoffISO={cutoffISO}
+            storeId={storeId}
+            schema={schema}
+            overlaySettings={overlaySettings}
+          />
+        );
+      })}
       {visualOverflow && (
         <div className="absolute z-30 flex items-center gap-1 text-[10px] font-semibold bg-red-600 text-white rounded px-1.5 py-0.5 pointer-events-none" style={{ left: fx.xOffset * scale, bottom: (bottomIn + heightIn) * scale + 4 }}>
           <AlertTriangle size={10} /> One or more pegs are outside the panel
@@ -4551,11 +4613,21 @@ function PegboardPanel({
 
 function SectionColumn({
   section, index, total, planogram, fixtures, products, scale, readOnly, joinedLayouts, capacityWarningsEnabled, hideImages, highlightField, zoomLevel,
-  onRename, onResize, onMove, onDelete, onAddFixture, onDragFixture, onDropProductOnFixture, onMovePlacement,
+  onRename, onResize, onMove, onDelete, onAddFixture, onDragFixture, onDropProductOnFixture, onMountFixture, onMovePlacement,
   selectedFixtureId, onSelectFixture, selectedPlacementId, onSelectPlacement, onDeselectAll,
   performance, cutoffISO, storeId, schema, overlaySettings,
 }) {
   const heightPx = planogram.dims.h * scale;
+  // fixtures mounted on a pegboard (a shelf physically attached to the peg panel) render inside
+  // that panel, not stacked independently in the section's own flow — split them out here so the
+  // normal per-fixture stack below only sees the top-level ones, and group the rest by host id so
+  // each PegboardPanel can render whatever's attached to it.
+  const topLevelFixtures = section.fixtures.filter((f) => !f.mountedOnId);
+  const mountedByHost = {};
+  section.fixtures.forEach((f) => {
+    if (!f.mountedOnId) return;
+    (mountedByHost[f.mountedOnId] = mountedByHost[f.mountedOnId] || []).push(f);
+  });
   return (
     <div className="flex flex-col shrink-0" style={{ width: section.width * scale }}>
       <div className="flex items-center gap-1 mb-1.5 flex-wrap">
@@ -4598,7 +4670,7 @@ function SectionColumn({
           {planogram.base * scale > 14 && <span className="text-[8px] text-slate-200">BASE</span>}
         </div>
 
-        {section.fixtures.map((fx) => {
+        {topLevelFixtures.map((fx) => {
           const def = fixtures.find((f) => f.id === fx.fixtureId);
           const maxNotchY = Math.max(0, planogram.dims.h - planogram.base - (def ? def.dims.h : 2));
           if (def?.type === "Pegboard") {
@@ -4619,6 +4691,7 @@ function SectionColumn({
                 highlightField={highlightField}
                 zoomLevel={zoomLevel}
                 onSelectFixture={onSelectFixture}
+                selectedFixtureId={selectedFixtureId}
                 selectedPlacementId={selectedPlacementId}
                 onSelectPlacement={onSelectPlacement}
                 onDragCommit={(notchY) => onDragFixture(fx.id, notchY)}
@@ -4629,6 +4702,10 @@ function SectionColumn({
                 storeId={storeId}
                 schema={schema}
                 overlaySettings={overlaySettings}
+                mountedFixtures={mountedByHost[fx.id] || []}
+                fixtures={fixtures}
+                onDragMountedFixture={(mountedFxId, notchY) => onDragFixture(mountedFxId, notchY)}
+                onDropProductOnMounted={(mountedFxId, productId, insertIndex) => onDropProductOnFixture(mountedFxId, productId, insertIndex)}
               />
             );
           }
@@ -4660,11 +4737,12 @@ function SectionColumn({
               storeId={storeId}
               schema={schema}
               overlaySettings={overlaySettings}
+              onMountOnPegboard={onMountFixture ? (targetFixtureId, xOffset, notchY) => onMountFixture(section.id, fx.id, targetFixtureId, xOffset, notchY) : undefined}
             />
           );
         })}
 
-        {section.fixtures.length === 0 && !readOnly && (
+        {topLevelFixtures.length === 0 && !readOnly && (
           <div className="absolute inset-0 flex items-center justify-center text-[11px] text-slate-400 italic px-2 text-center">
             Empty section
           </div>
@@ -5244,13 +5322,63 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
     setSelectedSectionForAdd(null);
   };
   const deleteFixture = (sectionId, fxId) => {
-    mutateSections((secs) => secs.map((s) => (s.id === sectionId ? { ...s, fixtures: s.fixtures.filter((f) => f.id !== fxId) } : s)));
+    mutateSections((secs) =>
+      secs.map((s) =>
+        s.id === sectionId
+          ? {
+              ...s,
+              // anything mounted on the fixture being deleted (e.g. a shelf sitting on a pegboard)
+              // falls back to a normal top-level spot in the section rather than disappearing —
+              // losing the panel it was attached to shouldn't silently lose the shelf and its products too
+              fixtures: s.fixtures
+                .filter((f) => f.id !== fxId)
+                .map((f) => (f.mountedOnId === fxId ? { ...f, mountedOnId: undefined, xOffset: 0, notchY: 0 } : f)),
+            }
+          : s
+      )
+    );
     setSelectedFixtureId(null);
   };
   const updateFixtureInst = (sectionId, fxId, patch) => {
     mutateSections((secs) =>
       secs.map((s) =>
         s.id === sectionId ? { ...s, fixtures: s.fixtures.map((f) => (f.id === fxId ? { ...f, ...patch } : f)) } : s
+      )
+    );
+  };
+
+  // attaches an existing fixture (e.g. a shelf) to a pegboard so it renders sitting on top of the
+  // peg mesh instead of stacked in its own section slot — the classic cosmetics-wall layout where
+  // a wide pegboard is the backdrop and a few shelves are mounted directly onto it. xOffset/notchY
+  // on the moved fixture become relative to the HOST PANEL's own origin (not the section's), so it
+  // tracks along automatically if the host panel itself is later dragged to a new height.
+  const mountFixtureOnPegboard = (sourceSectionId, sourceFixtureId, targetSectionId, targetFixtureId, xOffset, notchY) => {
+    if (sourceFixtureId === targetFixtureId) return; // can't mount a panel on itself
+    mutateSections((secs) => {
+      let moved = null;
+      const withoutSource = secs.map((s) => {
+        if (s.id !== sourceSectionId) return s;
+        return {
+          ...s,
+          fixtures: s.fixtures.filter((f) => {
+            if (f.id === sourceFixtureId) { moved = f; return false; }
+            return true;
+          }),
+        };
+      });
+      if (!moved) return secs;
+      const mounted = { ...moved, mountedOnId: targetFixtureId, xOffset, notchY };
+      return withoutSource.map((s) => (s.id === targetSectionId ? { ...s, fixtures: [...s.fixtures, mounted] } : s));
+    });
+    setSelectedFixtureId(sourceFixtureId);
+  };
+  // detaches a mounted fixture back into a normal, independently-stacked slot in its own section
+  const unmountFixture = (sectionId, fxId) => {
+    mutateSections((secs) =>
+      secs.map((s) =>
+        s.id === sectionId
+          ? { ...s, fixtures: s.fixtures.map((f) => (f.id === fxId ? { ...f, mountedOnId: undefined, xOffset: 0, notchY: 0 } : f)) }
+          : s
       )
     );
   };
@@ -5275,6 +5403,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
       xOffset: fx.xOffset,
       alignment: fx.alignment,
       groupId: null,
+      mountedOnId: fx.mountedOnId, // a copy of a mounted fixture stays mounted on the same host panel
       placements: (fx.placements || []).map((p) => ({ ...p, id: uid("pl") })),
     };
 
@@ -5787,6 +5916,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                     onAddFixture={() => setSelectedSectionForAdd(section.id)}
                     onDragFixture={(fxId, notchY) => updateFixtureInst(section.id, fxId, { notchY })}
                     onDropProductOnFixture={(fxId, productId, insertIndex, pegCoords) => addPlacement(section.id, fxId, productId, insertIndex, pegCoords)}
+                    onMountFixture={(sourceSectionId, sourceFixtureId, targetFixtureId, xOffset, notchY) => mountFixtureOnPegboard(sourceSectionId, sourceFixtureId, section.id, targetFixtureId, xOffset, notchY)}
                     onMovePlacement={movePlacement}
                     performance={performance}
                     cutoffISO={cutoffISO}
@@ -5850,11 +5980,22 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                 <h4 className="font-bold text-sm text-slate-800">Fixture Position</h4>
                 <button onClick={() => setSelectedFixtureId(null)} className="text-slate-400 hover:text-slate-600"><X size={15} /></button>
               </div>
+              {fixtureCtx.fx.mountedOnId && (
+                <div className="flex items-center justify-between gap-2 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-2 text-xs text-amber-700">
+                  <span>Mounted on a pegboard — position below is relative to that panel.</span>
+                  <button
+                    className="shrink-0 font-semibold hover:underline"
+                    onClick={() => unmountFixture(fixtureCtx.section.id, fixtureCtx.fx.id)}
+                  >
+                    Detach
+                  </button>
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-2">
-                <Field label="Notch Y (in from base)">
+                <Field label={fixtureCtx.fx.mountedOnId ? "Notch Y (in from panel base)" : "Notch Y (in from base)"}>
                   <input type="number" step="1" className={inputCls} value={fixtureCtx.fx.notchY} onChange={(e) => updateFixtureInst(fixtureCtx.section.id, fixtureCtx.fx.id, { notchY: Math.round(Number(e.target.value)) || 0 })} />
                 </Field>
-                <Field label="X Offset (in)">
+                <Field label={fixtureCtx.fx.mountedOnId ? "X Offset (in, on panel)" : "X Offset (in)"}>
                   <input type="number" step="1" className={inputCls} value={fixtureCtx.fx.xOffset} onChange={(e) => updateFixtureInst(fixtureCtx.section.id, fixtureCtx.fx.id, { xOffset: Math.round(Number(e.target.value)) || 0 })} />
                 </Field>
               </div>
