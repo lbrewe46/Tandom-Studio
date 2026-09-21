@@ -4216,6 +4216,10 @@ function FixtureBar({
   const [dropInsertIndex, setDropInsertIndex] = useState(null);
   const [dropArrowXIn, setDropArrowXIn] = useState(0);
   const [liveNotchY, setLiveNotchY] = useState(fx.notchY);
+  // the "Xin left" pill is only worth showing when the planner's actually looking at THIS shelf
+  // (hovering or having it selected) — surfacing it for every shelf at once, all the time, was
+  // more visual noise than help. Genuine warnings (over capacity, tight space) stay always-on.
+  const [hovering, setHovering] = useState(false);
   const dragRef = useRef(null);
 
   // keep the displayed position in sync when not actively dragging (e.g. typed in the side panel)
@@ -4357,6 +4361,8 @@ function FixtureBar({
       <div
         onMouseDown={readOnly ? undefined : handleDown}
         onClick={readOnly ? undefined : (e) => e.stopPropagation()}
+        onMouseEnter={() => setHovering(true)}
+        onMouseLeave={() => setHovering(false)}
         onDragOver={readOnly ? undefined : handleDragOver}
         onDragLeave={readOnly ? undefined : handleDragLeave}
         onDrop={readOnly ? undefined : handleDrop}
@@ -4387,7 +4393,7 @@ function FixtureBar({
           <AlertTriangle size={10} /> Over capacity
         </div>
       )}
-      {showWarnings && !visualOverflow && boxes.length > 0 && (
+      {showWarnings && !visualOverflow && boxes.length > 0 && (hovering || selected || dragging) && (
         <div
           className={`absolute z-30 text-[10px] font-semibold rounded px-1.5 py-0.5 pointer-events-none ${remainingTight || remainingIn < 0 ? "bg-amber-500 text-slate-900" : "bg-slate-600 text-white"}`}
           style={{ left: fx.xOffset * scale, bottom: bottomIn * scale + Math.max(heightIn * scale, 3) + 4 }}
@@ -8362,7 +8368,7 @@ function AppContent({ session }) {
                 <label className="flex items-center justify-between gap-3 cursor-pointer">
                   <span>
                     <span className="text-sm font-medium text-slate-700 block">Show shelf capacity warnings</span>
-                    <span className="text-xs text-slate-400">The "Xin left" / "Xin overhang" badges and the red "Over capacity" warning on shelves. Turn off for a clean view when presenting to retailers.</span>
+                    <span className="text-xs text-slate-400">The "Xin left" / "Xin overhang" badge (shown on hover/select) and the red "Over capacity" warning on shelves. Turn off for a clean view when presenting to retailers.</span>
                   </span>
                   <input
                     type="checkbox"
