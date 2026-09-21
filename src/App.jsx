@@ -4090,7 +4090,7 @@ function computeJoinedGroupLayouts(planogram, fixtures, products) {
   return result;
 }
 
-function ProductBox({ box, scale, selected, onSelect, metrics, schema, overlaySettings, onDragStartPlacement, onDragEndPlacement, dragging, readOnly, capacityWarningsEnabled, hideImages, highlightField, zoomLevel, pegYIn }) {
+function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, schema, overlaySettings, onDragStartPlacement, onDragEndPlacement, dragging, readOnly, capacityWarningsEnabled, hideImages, highlightField, zoomLevel, pegYIn }) {
   const { placement, product, xIn, wIn, overflow, effectiveDims } = box;
   const dims = effectiveDims || product.dims;
   const img = hideImages ? null : product.images?.[placement.orientation];
@@ -4144,7 +4144,7 @@ function ProductBox({ box, scale, selected, onSelect, metrics, schema, overlaySe
         onDragEnd={readOnly ? undefined : (e) => { e.stopPropagation(); onDragEndPlacement(); }}
         onClick={readOnly ? undefined : (e) => { e.stopPropagation(); onSelect(placement.id); }}
         className={`absolute top-1/2 left-1/2 flex items-center justify-center overflow-hidden border ${readOnly ? "" : "cursor-grab active:cursor-grabbing"} ${
-          selected ? "ring-2 ring-amber-500 border-amber-500" : showOverflowBorder ? "border-red-400" : hasHighlight ? "" : "border-slate-400/60"
+          selected ? "ring-2 ring-amber-500 border-amber-500" : groupSelected ? "ring-2 ring-blue-500 border-blue-500" : showOverflowBorder ? "border-red-400" : hasHighlight ? "" : "border-slate-400/60"
         } ${dragging ? "opacity-30" : ""}`}
         style={{
           width: naturalWpx,
@@ -4438,7 +4438,7 @@ function FixtureBar({
 // FixtureBar's shelf model.
 function PegboardPanel({
   fx, fixtureDef, products, scale, base, maxNotchY, selected, sectionId, readOnly, capacityWarningsEnabled, hideImages, highlightField, zoomLevel,
-  onSelectFixture, selectedFixtureId, selectedPlacementId, onSelectPlacement, onDragCommit, onDropProduct, onMovePlacement,
+  onSelectFixture, selectedFixtureId, selectedPlacementId, onSelectPlacement, onDragCommit, onDropProduct, onMovePlacement, onMoveGroup,
   performance, cutoffISO, storeId, schema, overlaySettings,
   // fixtures (e.g. shelves) physically mounted on this panel — the cosmetics-wall pattern of a
   // pegboard backdrop with a few shelves attached to it. Each carries its own xOffset/notchY
@@ -4453,6 +4453,13 @@ function PegboardPanel({
   const [dropHoverXY, setDropHoverXY] = useState(null); // snapped {xIn, yIn} peg the drop would land on
   const [liveNotchY, setLiveNotchY] = useState(fx.notchY);
   const dragRef = useRef(null);
+  // rubberband multi-select: Ctrl/Cmd+drag on empty peg space marks a set of pegged placements as
+  // "move together" — a plain drag still repositions the whole panel, so the modifier key is what
+  // tells the two gestures apart. Purely local/transient (not lifted to app state): it only
+  // matters for the next drag, and is cleared once that drag lands or a plain click happens.
+  const [groupSelected, setGroupSelected] = useState(() => new Set());
+  const [rubberband, setRubberband] = useState(null); // {x0,y0,x1,y1} in panel-local pixels
+  const rubberRef = useRef(null);
 
   // keep the displayed position in sync when not actively dragging (e.g. typed in the side panel)
   useEffect(() => { if (!dragging) setLiveNotchY(fx.notchY); }, [fx.notchY, dragging]);
@@ -4483,6 +4490,7 @@ function PegboardPanel({
     }
   };
   const handleDown = (e) => {
+    if (e.ctrlKey || e.metaKey) { handleRubberDown(e); return; }
     e.stopPropagation();
     e.preventDefault();
     dragRef.current = { startClientY: e.clientY, startNotch: fx.notchY, currentNotch: fx.notchY, moved: false };
@@ -4491,6 +4499,55 @@ function PegboardPanel({
     document.body.style.userSelect = "none";
     window.addEventListener("mousemove", handleMove);
     window.addEventListener("mouseup", handleUp);
+  };
+
+  // Ctrl/Cmd+drag over empty peg space draws a selection rectangle; anything it overlaps when
+  // released becomes the "move together" group for the next placement drag (see
+  // handlePlacementDragStart/handlePanelDrop's "pegGroup" payload below).
+  const handleRubberDown = (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const startX = e.clientX - rect.left, startY = e.clientY - rect.top;
+    rubberRef.current = { rect, startX, startY, curX: startX, curY: startY, moved: false };
+    setRubberband({ x0: startX, y0: startY, x1: startX, y1: startY });
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", handleRubberMove);
+    window.addEventListener("mouseup", handleRubberUp);
+  };
+  const handleRubberMove = (e) => {
+    const r = rubberRef.current;
+    if (!r) return;
+    const curX = clamp(e.clientX - r.rect.left, 0, r.rect.width);
+    const curY = clamp(e.clientY - r.rect.top, 0, r.rect.height);
+    if (Math.abs(curX - r.startX) > 3 || Math.abs(curY - r.startY) > 3) r.moved = true;
+    r.curX = curX; r.curY = curY;
+    setRubberband({ x0: r.startX, y0: r.startY, x1: curX, y1: curY });
+  };
+  const handleRubberUp = () => {
+    const r = rubberRef.current;
+    window.removeEventListener("mousemove", handleRubberMove);
+    window.removeEventListener("mouseup", handleRubberUp);
+    document.body.style.userSelect = "";
+    rubberRef.current = null;
+    setRubberband(null);
+    if (!r || !r.moved) return; // a bare Ctrl/Cmd-click with no drag — leave the current group as-is
+    // panel pixels are top-down (CSS top), but peg space is bottom-up (inches from the panel's
+    // own bottom edge, same convention layoutPegboardBoxes/pegToOrigin use) — flip Y here
+    const xMinIn = Math.min(r.startX, r.curX) / scale;
+    const xMaxIn = Math.max(r.startX, r.curX) / scale;
+    const yMinIn = heightIn - Math.max(r.startY, r.curY) / scale;
+    const yMaxIn = heightIn - Math.min(r.startY, r.curY) / scale;
+    const hit = new Set();
+    boxes.forEach((b) => {
+      const dims = b.effectiveDims || b.product.dims;
+      const rotated = b.placement.rotation === 90 || b.placement.rotation === 270;
+      const boxHIn = rotated ? dims.w : dims.h;
+      const bx0 = b.xIn, bx1 = b.xIn + b.wIn;
+      const by0 = b.pegYIn - boxHIn, by1 = b.pegYIn;
+      if (bx1 > xMinIn && bx0 < xMaxIn && by1 > yMinIn && by0 < yMaxIn) hit.add(b.placement.id);
+    });
+    setGroupSelected(hit);
   };
 
   const bottomIn = base + liveNotchY;
@@ -4546,6 +4603,18 @@ function PegboardPanel({
       "product height (if known)": droppedProd ? droppedProd.dims.h : "unknown",
     });
 
+    if (payload.kind === "pegGroup") {
+      // group move only within the SAME panel it was selected on — a rubberband selection is a
+      // "move these together, right here" gesture, not a cross-panel one, so a drop elsewhere is
+      // just ignored rather than silently breaking the group apart
+      if (payload.sectionId === sectionId && payload.fixtureInstId === fx.id && Array.isArray(payload.placementIds) && onMoveGroup) {
+        const dx = xy.xIn - payload.anchorPegX;
+        const dy = xy.yIn - payload.anchorPegY;
+        onMoveGroup(sectionId, fx.id, payload.placementIds, dx, dy);
+      }
+      setGroupSelected(new Set());
+      return;
+    }
     if (payload.kind === "placement") {
       onMovePlacement(
         { sectionId: payload.sectionId, fixtureInstId: payload.fixtureInstId, placementId: payload.placementId },
@@ -4560,14 +4629,29 @@ function PegboardPanel({
 
   const handlePlacementDragStart = (e, placement) => {
     e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("text/plain", JSON.stringify({
-      kind: "placement",
-      sectionId,
-      fixtureInstId: fx.id,
-      placementId: placement.id,
-      productId: placement.productId,
-      rotation: placement.rotation || 0,
-    }));
+    // dragging a placement that's part of the current rubberband selection carries the WHOLE
+    // group along, anchored to this one item — handlePanelDrop computes the drop delta from this
+    // item's new position and applies the same delta to every other selected placement
+    if (groupSelected.size > 1 && groupSelected.has(placement.id)) {
+      e.dataTransfer.setData("text/plain", JSON.stringify({
+        kind: "pegGroup",
+        sectionId,
+        fixtureInstId: fx.id,
+        placementIds: Array.from(groupSelected),
+        anchorPegX: placement.pegX ?? 0,
+        anchorPegY: placement.pegY ?? 0,
+      }));
+    } else {
+      setGroupSelected(new Set());
+      e.dataTransfer.setData("text/plain", JSON.stringify({
+        kind: "placement",
+        sectionId,
+        fixtureInstId: fx.id,
+        placementId: placement.id,
+        productId: placement.productId,
+        rotation: placement.rotation || 0,
+      }));
+    }
     // anchor the drag ghost at its top-left corner, not wherever it was grabbed — the cursor
     // position must represent that corner exactly for the peg calculation to land correctly
     try { e.dataTransfer.setDragImage(e.currentTarget, 0, 0); } catch (err) {}
@@ -4598,7 +4682,7 @@ function PegboardPanel({
           nearest 1in peg hole */}
       <div
         onMouseDown={readOnly ? undefined : handleDown}
-        onClick={readOnly ? undefined : (e) => e.stopPropagation()}
+        onClick={readOnly ? undefined : (e) => { e.stopPropagation(); if (groupSelected.size) setGroupSelected(new Set()); }}
         onDragOver={readOnly ? undefined : handlePanelDragOver}
         onDragLeave={readOnly ? undefined : handlePanelDragLeave}
         onDrop={readOnly ? undefined : handlePanelDrop}
@@ -4619,12 +4703,23 @@ function PegboardPanel({
           boxShadow: dragging ? "0 4px 10px rgba(0,0,0,0.25)" : "none",
           transition: dragging ? "none" : "bottom 80ms ease-out",
         }}
-        title={fixtureDef ? `${fixtureDef.name} (Pegboard) — 1in peg grid; drop a product anywhere on the panel, drag the panel to reposition it, or drag a shelf fixture onto it to mount that shelf here` : "Missing fixture"}
+        title={fixtureDef ? `${fixtureDef.name} (Pegboard) — 1in peg grid; drop a product anywhere on the panel, drag the panel to reposition it, drag a shelf fixture onto it to mount that shelf here, or Ctrl/Cmd+drag to rubberband-select several pegged products and move them together` : "Missing fixture"}
       >
         {!readOnly && dropHoverXY && (
           <div
             className="absolute rounded-full bg-amber-400 pointer-events-none border border-amber-600"
             style={{ left: dropHoverXY.xIn * scale - 4, bottom: dropHoverXY.yIn * scale - 4, width: 8, height: 8 }}
+          />
+        )}
+        {!readOnly && rubberband && (
+          <div
+            className="absolute border-2 border-blue-500 bg-blue-400/15 pointer-events-none z-30"
+            style={{
+              left: Math.min(rubberband.x0, rubberband.x1),
+              top: Math.min(rubberband.y0, rubberband.y1),
+              width: Math.abs(rubberband.x1 - rubberband.x0),
+              height: Math.abs(rubberband.y1 - rubberband.y0),
+            }}
           />
         )}
       </div>
@@ -4691,7 +4786,8 @@ function PegboardPanel({
             box={box}
             scale={scale}
             selected={!readOnly && selectedPlacementId === box.placement.id}
-            onSelect={onSelectPlacement}
+            groupSelected={!readOnly && groupSelected.has(box.placement.id)}
+            onSelect={(id) => { if (groupSelected.size) setGroupSelected(new Set()); onSelectPlacement(id); }}
             metrics={aggregateProductPerformance(box.product.id, performance, cutoffISO, storeId)}
             schema={schema}
             overlaySettings={overlaySettings}
@@ -4713,7 +4809,7 @@ function PegboardPanel({
 
 function SectionColumn({
   section, index, total, planogram, fixtures, products, scale, readOnly, joinedLayouts, capacityWarningsEnabled, hideImages, highlightField, zoomLevel,
-  onRename, onResize, onSetBackboard, onMove, onDelete, onAddFixture, onDragFixture, onDropProductOnFixture, onMountFixture, onMovePlacement,
+  onRename, onResize, onSetBackboard, onMove, onDelete, onAddFixture, onDragFixture, onDropProductOnFixture, onMountFixture, onMovePlacement, onMoveGroup,
   selectedFixtureId, onSelectFixture, selectedPlacementId, onSelectPlacement, onDeselectAll,
   performance, cutoffISO, storeId, schema, overlaySettings,
 }) {
@@ -4835,6 +4931,7 @@ function SectionColumn({
                 onDragCommit={(notchY) => onDragFixture(fx.id, notchY)}
                 onDropProduct={(productId, insertIndex, pegCoords) => onDropProductOnFixture(fx.id, productId, insertIndex, pegCoords)}
                 onMovePlacement={onMovePlacement}
+                onMoveGroup={onMoveGroup}
                 performance={performance}
                 cutoffISO={cutoffISO}
                 storeId={storeId}
@@ -5702,6 +5799,31 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
     setSelectedFixtureId(null);
   };
 
+  // rubberband-drag several pegged products at once (see PegboardPanel's "pegGroup" drag
+  // payload) — shifts every selected placement's own peg by the same (dx, dy), preserving their
+  // layout relative to each other. Always within one fixture, so this can update pegX/pegY in
+  // place rather than movePlacement's remove-then-reinsert (which would also scramble array order
+  // for no benefit here, since a pegboard's 2D layout doesn't care about placement array order).
+  const moveGroupOnPegboard = (sectionId, fixtureInstId, placementIds, dx, dy) => {
+    if (!dx && !dy) return;
+    const idSet = new Set(placementIds);
+    mutateSections((secs) => secs.map((s) => {
+      if (s.id !== sectionId) return s;
+      return {
+        ...s,
+        fixtures: s.fixtures.map((f) => {
+          if (f.id !== fixtureInstId) return f;
+          return {
+            ...f,
+            placements: f.placements.map((p) =>
+              idSet.has(p.id) ? { ...p, pegX: Math.round((p.pegX ?? 0) + dx), pegY: Math.round((p.pegY ?? 0) + dy) } : p
+            ),
+          };
+        }),
+      };
+    }));
+  };
+
   // find current selected placement object + product
   let placementCtx = null;
   if (selectedPlacement) {
@@ -6061,6 +6183,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                     onDropProductOnFixture={(fxId, productId, insertIndex, pegCoords) => addPlacement(section.id, fxId, productId, insertIndex, pegCoords)}
                     onMountFixture={(sourceSectionId, sourceFixtureId, targetFixtureId, xOffset, notchY) => mountFixtureOnPegboard(sourceSectionId, sourceFixtureId, section.id, targetFixtureId, xOffset, notchY)}
                     onMovePlacement={movePlacement}
+                    onMoveGroup={moveGroupOnPegboard}
                     performance={performance}
                     cutoffISO={cutoffISO}
                     storeId={activeStoreId}
