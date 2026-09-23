@@ -5,7 +5,7 @@ import {
   RotateCw, X, Layers, Package, Boxes, Ruler, ArrowLeft, Check, Grid3x3,
   Pencil, Save, AlertTriangle, RefreshCw, Download, Upload, FileSpreadsheet, CalendarDays, TrendingUp,
   Maximize2, Minimize2, Store, ChevronDown, ChevronUp, AlignLeft, AlignCenter, AlignRight, Search, Eye, Printer, Copy,
-  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe
+  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe, HelpCircle
 } from "lucide-react";
 import {
   supabase, supabaseConfigured, pendingWriteListeners,
@@ -1833,11 +1833,11 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
         </div>
       )}
       <p className="text-xs text-slate-400 mb-3 flex items-center gap-1.5">
-        <FileSpreadsheet size={13} /> The template's columns always match your current attribute fields — configure those under Attribute Fields first. Products are matched on import by <span className="font-semibold text-slate-500">{primaryKeyField === "upc" ? "UPC" : "SKU"}</span> (set in Attribute Fields).
+        <FileSpreadsheet size={13} /> The template's columns always match your current attribute fields — configure those under Settings first. Products are matched on import by <span className="font-semibold text-slate-500">{primaryKeyField === "upc" ? "UPC" : "SKU"}</span> (set in Settings).
       </p>
       {primaryKeyField === "upc" && !hasUpcField(schema) && (
         <div className="text-sm rounded-md px-3 py-2 mb-3 bg-amber-50 text-amber-700 border border-amber-200">
-          Your Product Primary Key is set to UPC, but no "UPC" attribute field exists yet — add one under Attribute Fields or matching will always fail.
+          Your Product Primary Key is set to UPC, but no "UPC" attribute field exists yet — add one under Settings or matching will always fail.
         </div>
       )}
       {importProgress && (
@@ -2563,11 +2563,11 @@ function PerformanceModule({ products, performance, stores, productSchema, prima
         </div>
       )}
       <p className="text-xs text-slate-400 mb-3 flex items-center gap-1.5">
-        <FileSpreadsheet size={13} /> Load weekly unit cost, retail price, and units sold per product per store. Products are matched by <span className="font-semibold text-slate-500">{primaryKeyField === "upc" ? "UPC" : "SKU"}</span> (set in Attribute Fields).
+        <FileSpreadsheet size={13} /> Load weekly unit cost, retail price, and units sold per product per store. Products are matched by <span className="font-semibold text-slate-500">{primaryKeyField === "upc" ? "UPC" : "SKU"}</span> (set in Settings).
       </p>
       {primaryKeyField === "upc" && !hasUpcField(productSchema) && (
         <div className="text-sm rounded-md px-3 py-2 mb-3 bg-amber-50 text-amber-700 border border-amber-200">
-          Your Product Primary Key is set to UPC, but no "UPC" attribute field exists yet — add one under Attribute Fields or matching will always fail.
+          Your Product Primary Key is set to UPC, but no "UPC" attribute field exists yet — add one under Settings or matching will always fail.
         </div>
       )}
 
@@ -2673,6 +2673,291 @@ function PerformanceModule({ products, performance, stores, productSchema, prima
 
 // Planner-side Store Feedback — every condition/issue reported by any store, across every
 // planogram, in one place. This is what the header's "open issues" badge now links to.
+/* ------------------------------------------------------------------ */
+/* Help                                                                 */
+/* ------------------------------------------------------------------ */
+
+const HELP_SECTIONS = [
+  {
+    id: "overview",
+    title: "Overview",
+    blocks: [
+      { type: "p", text: "Tandom Studio is an enterprise retail space-planning platform, used several ways. A separate **Event Planner** module coordinates resets, promos, and campaigns across the calendar that drives all planning and execution for merchandising planograms." },
+      { type: "p", text: "Once Events are planned, Space Planners can create planograms that can be store-specific or cluster planograms, then publish to **Store Assistant** so store associates can track and execute a reset once it reaches their store." },
+      { type: "p", text: "This guide walks through every screen, roughly in the order you'd use them. Use the search box on the left to jump straight to a topic." },
+    ],
+  },
+  {
+    id: "eventPlanner",
+    title: "Event Planner",
+    blocks: [
+      { type: "p", text: "A separate full-screen module, reached from the top bar (**Event Planner** button), showing a monthly calendar of resets, promos, and campaigns with month/year navigation, search, and filter-by-type. Event types are fully customizable (defaults: Reset, Promo, Loyalty Campaign, Line Review, Vendor Collaboration, Clearance, Competitor Event, Line Extensions), each with its own label and color." },
+      { type: "p", text: "Creating an event captures **Name**, **Type**, **Owner**, **Start/End Date**, **Lead Time** (in weeks), an optional list of linked planograms, and a **Category**." },
+      { type: "ul", items: [
+        "The **supplier deadline** — Start Date minus Lead Time — is computed live and flagged on the calendar as an alert for anything due within two weeks.",
+        "**Promo conflict detection** flags pairs of Promo-type events in the same category whose date ranges overlap.",
+      ] },
+    ],
+  },
+  {
+    id: "lifecycle",
+    title: "Planogram Lifecycle & Versioning",
+    blocks: [
+      { type: "p", text: "Every planogram moves through five statuses: **WIP → Approved → Pending → Live → Historical.**" },
+      { type: "p", text: "WIP and the Approved step are manual (an explicit \"Approve\" action); the two middle transitions run automatically off a single **Event Date** field: an Approved planogram becomes Pending 21 days before its Event Date, giving stores time to start markdown on items being discontinued, and a Pending planogram becomes Live exactly on the Event Date. Promoting to Live automatically retires any other Live member of the same version family to Historical in the same step, so exactly one Live layout exists per family at a time — a store marking its execution \"Completed\" also triggers this promotion." },
+      { type: "p", text: "Versioning uses a flat family model: the first WIP a planogram is created as becomes that family's master, and every later copy points directly at the master rather than at whichever version it was copied from. \"Create Version\" clones the planogram (sections, fixtures, placements) with a new WIP status and no Event Date." },
+      { type: "p", text: "The **Versions bar** atop the editor lists every family member as a clickable version pill with its own status badge; the planogram list also supports bulk multi-select with a \"Create Versions\" action to version several planograms at once, and nests non-master versions under their master in List view." },
+    ],
+  },
+  {
+    id: "editorBasics",
+    title: "Planogram Editor Basics",
+    blocks: [
+      { type: "p", text: "A planogram is organized into **sections**, each holding a vertical stack of **fixtures** — Shelf, Pegboard, Hook Rail, Basket, or Divider Bar — snapped to 1-inch notches. Drag a fixture from the library into a section to add it, and drag it up or down to reslot it to a new notch position." },
+      { type: "p", text: "Products come from the Product Library and are placed by dragging them onto a fixture. On a shelf, products pack left to right; on a pegboard, drop a product onto an open peg position." },
+      { type: "p", text: "Each product's **Overhang Allowance** controls how far it can extend past a shelf's edge before being flagged as overflow, and its **Squeeze Factor** controls how tightly it can be compressed against neighbors when space is tight — both are set per product in the Product Library." },
+    ],
+  },
+  {
+    id: "multiSelect",
+    title: "Multi-Select & Group Move",
+    blocks: [
+      { type: "p", text: "Hold **Ctrl** (**Cmd** on Mac) and drag anywhere in a section to draw a selection box. Anything the box touches gets selected:" },
+      { type: "ul", items: [
+        "Individual products, on any fixture — a shelf or a pegboard.",
+        "Whole fixture bars — shelves and pegboards — if the box touches the bar itself.",
+      ] },
+      { type: "p", text: "Once something's selected:" },
+      { type: "ul", items: [
+        "Drag any selected product onto a different fixture, and the whole group moves together, in the order they were selected.",
+        "Drag any selected fixture bar up or down, and every selected fixture moves together by the same amount, each one clamped to its own valid range.",
+      ] },
+      { type: "p", text: "Click anywhere empty to clear the selection — selecting something new also clears any previous group automatically." },
+      { type: "p", text: "**Known limitations:**" },
+      { type: "ul", items: [
+        "Moving a group of pegboard-placed products to a *different* pegboard doesn't preserve their relative spacing — they're spread out from the drop point instead.",
+        "Fixtures mounted directly onto a pegboard (the \"shelf on a pegboard backdrop\" pattern) aren't included in the selection box's hit-test yet — select those individually.",
+      ] },
+    ],
+  },
+  {
+    id: "remainingSpace",
+    title: "Remaining Space Label",
+    blocks: [
+      { type: "p", text: "The \"X in left\" / \"X in overhang\" badge on a shelf or pegboard bar only shows when you hover over or select that fixture, instead of always being visible — a cleaner canvas, especially when presenting to retailers. The red \"Over capacity\" warning is unaffected and still always shows. Turn this off entirely (along with capacity warnings generally) in Settings." },
+    ],
+  },
+  {
+    id: "psaImports",
+    title: "PSA Imports from Blue Yonder",
+    blocks: [
+      { type: "p", text: "Planograms can be imported from Blue Yonder .psa file format." },
+      { type: "p", text: "Products and fixtures brought in this way land flagged **Pending Approval**, the same as a manual import, and need review before they're fully part of the library — see Product Library Basics and Fixture Library below." },
+    ],
+  },
+  {
+    id: "productLibrary",
+    title: "Product Library Basics",
+    blocks: [
+      { type: "p", text: "Products created or imported from an external system (like a PSA import) land flagged **Pending Approval**; a filter chip shows the count, and bulk \"Approve All\" / \"Delete All\" actions clear the queue." },
+      { type: "p", text: "The library supports a **column picker** (toggle columns on/off, drag to reorder, drag to resize), Grid and List view toggles, full-text search across name/SKU/every attribute, and sortable columns." },
+      { type: "p", text: "Bulk import/export runs through an Excel workbook: **Download Template** generates a spreadsheet with columns matching your current attribute schema, and **Upload Products** reads a filled-in workbook back in, matching existing products by SKU or UPC (whichever is set as your Primary Key) and creating anything new." },
+    ],
+  },
+  {
+    id: "imageRepo",
+    title: "Product Images — Image Repository",
+    blocks: [
+      { type: "p", text: "Turn this on in Settings to have Tandom automatically find a product's orientation images from your own image server or CDN, matched by a filename pattern you define from the product's UPC or SKU. Configure:" },
+      { type: "ul", items: [
+        "**Lookup Key** — UPC or SKU",
+        "**Base URL** — where your images live (a local folder or a cloud/CDN URL)",
+        "**Filename Pattern** and **File Extensions** — how filenames are built from the key",
+      ] },
+      { type: "p", text: "Once enabled, a **Match from Repository** button appears in the product editor (fills in whichever of the 6 orientation views — Front, Back, Top, Bottom, Left, Right — it can find), and a **Match Images from Repository** bulk button appears in the Product Library toolbar to run it across every product still missing an image." },
+    ],
+  },
+  {
+    id: "webImageLookup",
+    title: "Product Images — Web Image Lookup",
+    blocks: [
+      { type: "p", text: "A second, independent image source for when the Image Repository above has nothing yet — useful right after import, before anyone has sourced images. Rather than a JSON lookup API (every provider we tried blocks browser calls via CORS), this works by guessing a retailer's own public product-image URL pattern and using it if it loads — for example, Kroger's product-image CDN." },
+      { type: "p", text: "Configure in Settings: **Base URL**, **Filename Pattern**, and **File Extensions**, the same shape as the Image Repository above. Retailer CDNs like Kroger's key their images by a specific 13-digit code rather than a raw UPC, so Tandom normalizes the UPC automatically before looking it up:" },
+      { type: "ul", items: [
+        "10-digit UPC → used as-is",
+        "11-digit UPC → drop the leading digit",
+        "12-digit UPC → drop the leading and trailing digit",
+        "13-digit UPC → used as-is",
+      ] },
+      { type: "p", text: "Each of these is then zero-padded to 13 digits, so different digit-lengths for the same product all resolve to the same lookup key." },
+      { type: "p", text: "Same two entry points as the Image Repository: **Find on Web (UPC)** in the product editor, and **Backfill Missing Images from Web** in the Product Library toolbar." },
+      { type: "note", text: "This is a best-effort guess at an undocumented URL pattern, not an official API — it only finds images for products the retailer actually carries, and the retailer could change or block the pattern without notice. Treat the Image Repository as your primary, reliable source and this as a convenience for filling gaps." },
+    ],
+  },
+  {
+    id: "fixtureLibrary",
+    title: "Fixture Library",
+    blocks: [
+      { type: "p", text: "A fixture is a reusable template: **Name**, **Type** (Shelf, Pegboard, Hook Rail, Basket, or Divider Bar), **Dimensions** (W × H × D in inches, snapped to 1\" notches), and any custom attributes from the Fixture Attribute Fields schema (configured in Settings)." },
+      { type: "p", text: "Fixtures imported from an external system land flagged Pending Approval, the same as products, and need to be approved — individually or in bulk — before they're fully part of the library. The library offers Grid/List views and search by name or type." },
+    ],
+  },
+  {
+    id: "storeManagement",
+    title: "Store Management",
+    blocks: [
+      { type: "p", text: "A store record holds **Name**, **Store Number**, **Address**, **Region**, **Format** (Supercenter, Standard Grocery, Express, Fuel & Convenience, or Warehouse), and **Square Footage**." },
+      { type: "p", text: "Stores get linked to a planogram through an \"Assign Stores\" action on the planogram — that assignment is what makes a planogram appear in a given store's Store Assistant. The Store Library uses the same Grid/List and search pattern as Fixtures." },
+    ],
+  },
+  {
+    id: "storeAssistant",
+    title: "Store Assistant",
+    blocks: [
+      { type: "p", text: "A separate app mode for store-level associates, entered from the top bar (**Store Assistant** button). A store-selector screen stands in for login — just a searchable list of stores to \"become.\"" },
+      { type: "p", text: "The left-nav shell covers:" },
+      { type: "ul", items: [
+        "**My Store** — store profile and its assigned Live/Pending planograms",
+        "**My Activities** — those same planograms with an execution status badge",
+        "**Task Management**",
+        "**Store Feedback**",
+        "**Orders**",
+        "**Photo Collection**",
+      ] },
+      { type: "p", text: "Execution status runs **New → Reviewed → In Progress → Partially Completed / Completed / Rejected.** Opening a planogram's instructions auto-advances New to Reviewed; an associate can then mark it Complete, Partially Completed, or Reject (with a reason) — Completed also promotes the planogram to Live. A completed or rejected item can be reopened back to In Progress." },
+      { type: "p", text: "The **Execution Guide** steps an associate through the reset: it compares the planogram against whatever was previously Live and buckets every product into **New Items** (\"Get Inventory\"), **Deleted Items** (\"Remove from Shelf & Markdown\"), or **Keep Items** (\"No Action Needed\") — each a checkable row, with per-section badges showing which changes belong to that section." },
+      { type: "p", text: "**Store Feedback** reports a structured issue (Fixture Mismatch, Physical Obstruction, Shelf Overfilled, Delayed Shipment, Other) plus free text against a planogram." },
+      { type: "p", text: "**Task Management** is the store's own operational to-do list, with a customizable task-type set (defaults: Inventory Audit, Pricing Audit, Fronting and Facing, Restocking, Damaged Good Processing, Other)." },
+      { type: "p", text: "**Photo Collection** uploads a photo tagged with Category, \"Photo Represents\" (Compliance Photo, Issue, or Request), and Execution Date, browsable with a Grid/List toggle." },
+      { type: "note", text: "Orders is not yet built — it currently shows a \"coming in a future update\" placeholder." },
+    ],
+  },
+  {
+    id: "performance",
+    title: "Performance",
+    blocks: [
+      { type: "p", text: "The Performance tab imports per-product, per-store sales data (its own Excel template and upload, matched by SKU or UPC) and feeds the sales, margin, and unit-profit figures used by Tandom's analysis tools." },
+    ],
+  },
+  {
+    id: "settingsReference",
+    title: "Settings Reference",
+    blocks: [
+      { type: "p", text: "The **Settings** tab in the top nav is the full settings screen:" },
+      { type: "ul", items: [
+        "**Backup/Restore** — export or import the entire data set (schemas, products, fixtures, planograms, performance, stores) as one file.",
+        "**Global Settings** — Product Primary Key (SKU or UPC, governs import/performance matching) and a Capacity Warnings toggle (controls the \"X in left/overhang\" badges and red \"Over capacity\" shelf warnings).",
+        "**Image Repository** — auto-match product images from your own server/CDN by UPC or SKU.",
+        "**Web Image Lookup (Retailer CDN)** — auto-match product images from a retailer's public image CDN, as a fallback when the Repository has nothing.",
+        "**Product Attribute Fields** and **Fixture Attribute Fields** — define the custom attribute schema used throughout the product and fixture forms, columns, and templates.",
+      ] },
+    ],
+  },
+];
+
+function renderHelpInline(text) {
+  const parts = String(text).split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return <strong key={i} className="font-semibold text-slate-800">{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith("*") && part.endsWith("*") && part.length > 1) {
+      return <em key={i}>{part.slice(1, -1)}</em>;
+    }
+    return <React.Fragment key={i}>{part}</React.Fragment>;
+  });
+}
+
+function HelpBlock({ block }) {
+  if (block.type === "ul") {
+    return (
+      <ul className="list-disc list-outside ml-5 space-y-1.5 text-sm text-slate-600 leading-relaxed">
+        {block.items.map((item, i) => (
+          <li key={i}>{renderHelpInline(item)}</li>
+        ))}
+      </ul>
+    );
+  }
+  if (block.type === "note") {
+    return (
+      <p className="text-xs italic text-slate-500 bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
+        {renderHelpInline(block.text)}
+      </p>
+    );
+  }
+  return <p className="text-sm text-slate-600 leading-relaxed">{renderHelpInline(block.text)}</p>;
+}
+
+function helpSectionMatches(section, q) {
+  if (!q) return true;
+  if (section.title.toLowerCase().includes(q)) return true;
+  return section.blocks.some((b) => {
+    if (b.type === "ul") return b.items.some((i) => i.toLowerCase().includes(q));
+    return (b.text || "").toLowerCase().includes(q);
+  });
+}
+
+function HelpScreen() {
+  const [query, setQuery] = useState("");
+  const [activeId, setActiveId] = useState(HELP_SECTIONS[0].id);
+
+  const q = query.trim().toLowerCase();
+  const filtered = HELP_SECTIONS.filter((s) => helpSectionMatches(s, q));
+  const active = filtered.find((s) => s.id === activeId) || filtered[0] || HELP_SECTIONS[0];
+
+  useEffect(() => {
+    if (filtered.length > 0 && !filtered.some((s) => s.id === activeId)) {
+      setActiveId(filtered[0].id);
+    }
+  }, [q]);
+
+  return (
+    <div className="grid grid-cols-[240px_1fr] gap-5 items-start">
+      <div className="bg-white rounded-lg border border-slate-200 p-2 sticky top-4">
+        <div className="relative mb-2">
+          <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input
+            className="w-full text-xs pl-7 pr-2 py-1.5 rounded-md border border-slate-200 focus:outline-none focus:ring-1 focus:ring-amber-400"
+            placeholder="Search help…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </div>
+        <nav className="space-y-0.5 max-h-[70vh] overflow-y-auto">
+          {filtered.map((s) => (
+            <button
+              key={s.id}
+              onClick={() => setActiveId(s.id)}
+              className={`w-full text-left text-xs rounded-md px-2.5 py-1.5 transition-colors ${
+                active?.id === s.id ? "bg-amber-500 text-slate-900 font-semibold" : "text-slate-600 hover:bg-slate-50"
+              }`}
+            >
+              {s.title}
+            </button>
+          ))}
+          {filtered.length === 0 && <div className="text-xs text-slate-400 px-2.5 py-2">No results for "{query}".</div>}
+        </nav>
+      </div>
+      <div className="bg-white rounded-lg border border-slate-200 p-6 space-y-3 max-w-3xl">
+        {active ? (
+          <>
+            <h2 className="font-bold text-slate-800 text-base flex items-center gap-2 pb-1 border-b border-slate-100">
+              <HelpCircle size={16} className="text-amber-500 shrink-0" /> {active.title}
+            </h2>
+            <div className="space-y-3 pt-1">
+              {active.blocks.map((b, i) => (
+                <HelpBlock key={i} block={b} />
+              ))}
+            </div>
+          </>
+        ) : (
+          <div className="text-sm text-slate-400">No help topic matches your search.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function StoreFeedbackView({ planograms, onResolveIssue, onOpenPlanogram }) {
   const [query, setQuery] = useState("");
   const [filterStatus, setFilterStatus] = useState("open"); // open | all | resolved
@@ -8615,7 +8900,8 @@ function AppContent({ session }) {
           <TabButton active={tab === "stores"} onClick={() => setTab("stores")} icon={Store}>Stores</TabButton>
           <TabButton active={tab === "performance"} onClick={() => setTab("performance")} icon={TrendingUp}>Performance</TabButton>
           <TabButton active={tab === "storeFeedback"} onClick={() => setTab("storeFeedback")} icon={AlertTriangle}>Store Feedback</TabButton>
-          <TabButton active={tab === "schema"} onClick={() => setTab("schema")} icon={Settings2}>Attribute Fields</TabButton>
+          <TabButton active={tab === "schema"} onClick={() => setTab("schema")} icon={Settings2}>Settings</TabButton>
+          <TabButton active={tab === "help"} onClick={() => setTab("help")} icon={HelpCircle}>Help</TabButton>
         </div>
       )}
 
@@ -8692,6 +8978,8 @@ function AppContent({ session }) {
           />
         ) : tab === "storeFeedback" ? (
           <StoreFeedbackView planograms={planograms} onResolveIssue={resolvePlanogramIssue} onOpenPlanogram={setActivePlanogramId} />
+        ) : tab === "help" ? (
+          <HelpScreen />
         ) : (
           <div className="space-y-5">
             <BackupRestorePanel
