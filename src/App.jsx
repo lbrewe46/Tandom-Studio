@@ -1372,6 +1372,27 @@ function aggregateProductPerformance(productId, performanceMap, cutoffISO, store
   };
 }
 
+// Same as aggregateProductPerformance, but bounded on both ends (startISO..endISO inclusive)
+// instead of an open-ended cutoff — used to pull one specific historical window (e.g. "the same
+// 13 weeks, one year ago") for year-over-year comparisons.
+function aggregateProductPerformanceRange(productId, performanceMap, startISO, endISO, storeId) {
+  const records = performanceMap[productId] || [];
+  let inWindow = records.filter((r) => (!startISO || r.weekEnding >= startISO) && (!endISO || r.weekEnding <= endISO));
+  if (storeId) inWindow = inWindow.filter((r) => r.storeId === storeId);
+  if (inWindow.length === 0) return { totalUnits: 0, totalSales: 0, totalCost: 0, grossProfit: 0, weeksOfData: 0 };
+  const totalUnits = inWindow.reduce((s, r) => s + (r.units || 0), 0);
+  const totalSales = inWindow.reduce((s, r) => s + (r.units || 0) * (r.price || 0), 0);
+  const totalCost = inWindow.reduce((s, r) => s + (r.units || 0) * (r.unitCost || 0), 0);
+  return { totalUnits, totalSales, totalCost, grossProfit: totalSales - totalCost, weeksOfData: inWindow.length };
+}
+
+// Percent change from `prior` to `current`; null when there's nothing to compare against
+// (no prior-period data at all, as opposed to a genuine drop to zero).
+function pctChange(current, prior) {
+  if (!prior) return current > 0 ? null : 0;
+  return ((current - prior) / prior) * 100;
+}
+
 const money = (n) => `$${(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const money0 = (n) => `$${Math.round(n || 0).toLocaleString()}`;
 
@@ -2524,11 +2545,12 @@ function buildCategoryAnalysisRows(planograms, products, stores, performance, pr
   // 3. Group into rows by the chosen dimension and total everything.
   const groups = {};
   const bump = (key, label, row) => {
-    if (!groups[key]) groups[key] = { key, label, spaceIn: 0, sales: 0, units: 0, profit: 0 };
+    if (!groups[key]) groups[key] = { key, label, spaceIn: 0, sales: 0, units: 0, profit: 0, members: [] };
     groups[key].spaceIn += row.spaceIn;
     groups[key].sales += row.sales;
     groups[key].units += row.units;
     groups[key].profit += row.profit;
+    groups[key].members.push({ productId: row.productId, storeId: row.storeId });
   };
   rawRows.forEach((row) => {
     const product = productsById[row.productId];
@@ -2569,12 +2591,210 @@ function buildCategoryAnalysisRows(planograms, products, stores, performance, pr
   return { rows, totals };
 }
 
+// Product-level drill-down for one breakdown row (e.g. one Store, one Brand): current-period
+// vs. same-period-last-year Sales/Units/Profit for every product that contributed to that row,
+// summed only across the exact (productId, storeId) pairs the row is made of — so a Store
+// drill-down is that store's own products, while a Category/Brand/etc. drill-down stays scoped
+// to the same stores the summary row itself was built from.
+function buildAnalysisDrillDownRows(members, products, performance, productSchema, currentStart, currentEnd, priorStart, priorEnd) {
+  const productsById = {};
+  products.forEach((p) => { productsById[p.id] = p; });
+
+  const byProduct = {};
+  (members || []).forEach(({ productId, storeId }) => {
+    if (!byProduct[productId]) {
+      byProduct[productId] = {
+        productId,
+        current: { sales: 0, units: 0, profit: 0 },
+        prior: { sales: 0, units: 0, profit: 0 },
+      };
+    }
+    const cur = aggregateProductPerformanceRange(productId, performance, currentStart, currentEnd, storeId);
+    const pri = aggregateProductPerformanceRange(productId, performance, priorStart, priorEnd, storeId);
+    byProduct[productId].current.sales += cur.totalSales;
+    byProduct[productId].current.units += cur.totalUnits;
+    byProduct[productId].current.profit += cur.grossProfit;
+    byProduct[productId].prior.sales += pri.totalSales;
+    byProduct[productId].prior.units += pri.totalUnits;
+    byProduct[productId].prior.profit += pri.grossProfit;
+  });
+
+  const rows = Object.values(byProduct).map((r) => {
+    const product = productsById[r.productId];
+    return {
+      productId: r.productId,
+      name: product ? product.name : "(Deleted product)",
+      category: product ? getAttrByLabel(product, productSchema, ["category"]) : "",
+      sales: r.current.sales, priorSales: r.prior.sales, salesChangePct: pctChange(r.current.sales, r.prior.sales),
+      units: r.current.units, priorUnits: r.prior.units, unitsChangePct: pctChange(r.current.units, r.prior.units),
+      profit: r.current.profit, priorProfit: r.prior.profit, profitChangePct: pctChange(r.current.profit, r.prior.profit),
+    };
+  });
+
+  const totals = rows.reduce(
+    (acc, r) => ({
+      sales: acc.sales + r.sales, priorSales: acc.priorSales + r.priorSales,
+      units: acc.units + r.units, priorUnits: acc.priorUnits + r.priorUnits,
+      profit: acc.profit + r.profit, priorProfit: acc.priorProfit + r.priorProfit,
+    }),
+    { sales: 0, priorSales: 0, units: 0, priorUnits: 0, profit: 0, priorProfit: 0 }
+  );
+
+  return {
+    rows,
+    totals: {
+      ...totals,
+      salesChangePct: pctChange(totals.sales, totals.priorSales),
+      unitsChangePct: pctChange(totals.units, totals.priorUnits),
+      profitChangePct: pctChange(totals.profit, totals.priorProfit),
+    },
+  };
+}
+
+function ChangeBadge({ pct, size = "sm" }) {
+  if (pct == null) return <span className="text-slate-300">— new</span>;
+  const up = pct > 0.05, down = pct < -0.05;
+  const cls = up ? "text-emerald-600" : down ? "text-red-500" : "text-slate-400";
+  const arrow = up ? "▲" : down ? "▼" : "▬";
+  return <span className={`${cls} ${size === "lg" ? "text-sm" : "text-xs"} font-semibold whitespace-nowrap`}>{arrow} {Math.abs(pct).toFixed(1)}%</span>;
+}
+
+function AnalysisDrillDownView({ drillDown, products, performance, productSchema, periodWeeks, latestISO, onBack }) {
+  const currentEnd = latestISO;
+  const currentStart = periodWeeks === "all" ? null : getCutoffISO(latestISO, periodWeeks);
+  // "same period, one year ago": shift the whole window back 52 weeks (364 days) so it stays
+  // aligned to the same week-of-year, rather than a straight calendar-year shift.
+  const priorEnd = currentEnd ? addDaysISO(currentEnd, -364) : null;
+  const priorStart = currentStart ? addDaysISO(currentStart, -364) : (priorEnd ? addDaysISO(priorEnd, -364) : null);
+
+  const [sortKey, setSortKey] = useState("sales");
+  const [sortDir, setSortDir] = useState("desc");
+
+  const { rows, totals } = React.useMemo(
+    () => buildAnalysisDrillDownRows(drillDown.members, products, performance, productSchema, currentStart, currentEnd, priorStart, priorEnd),
+    [drillDown, products, performance, productSchema, currentStart, currentEnd, priorStart, priorEnd]
+  );
+
+  const hasAnyPriorData = rows.some((r) => r.priorSales > 0 || r.priorUnits > 0);
+
+  const sortedRows = [...rows].sort((a, b) => {
+    const av = a[sortKey] ?? -Infinity, bv = b[sortKey] ?? -Infinity;
+    return sortDir === "asc" ? av - bv : bv - av;
+  });
+
+  const biggestGainer = rows.filter((r) => r.salesChangePct != null).sort((a, b) => (b.sales - b.priorSales) - (a.sales - a.priorSales))[0];
+  const biggestDecliner = rows.filter((r) => r.salesChangePct != null).sort((a, b) => (a.sales - a.priorSales) - (b.sales - b.priorSales))[0];
+
+  const sortHeader = (key, label) => (
+    <th
+      className="text-right px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap cursor-pointer select-none"
+      onClick={() => { if (sortKey === key) setSortDir(sortDir === "asc" ? "desc" : "asc"); else { setSortKey(key); setSortDir("desc"); } }}
+    >
+      {label} {sortKey === key && (sortDir === "asc" ? "▲" : "▼")}
+    </th>
+  );
+
+  return (
+    <div className="space-y-4">
+      <button onClick={onBack} className="text-xs text-slate-500 hover:text-slate-800 flex items-center gap-1">
+        <ChevronLeft size={13} /> Back to {drillDown.groupLabel} breakdown
+      </button>
+
+      <div className="bg-white rounded-lg border border-slate-200 p-4">
+        <h2 className="font-bold text-slate-800 text-base">{drillDown.label}</h2>
+        <p className="text-xs text-slate-500 mt-0.5">
+          {rows.length} product{rows.length !== 1 ? "s" : ""} · current period vs. the same {periodWeeks === "all" ? "" : `${periodWeeks}-week `}window one year earlier
+          {currentStart && currentEnd ? ` (${currentStart} → ${currentEnd} vs. ${priorStart} → ${priorEnd})` : ""}.
+        </p>
+
+        <div className="grid grid-cols-3 gap-3 mt-4">
+          <div className="rounded-md border border-slate-200 p-3">
+            <div className="text-[11px] text-slate-400 uppercase tracking-wide">Sales</div>
+            <div className="font-bold text-slate-800 text-lg">{money0(totals.sales)}</div>
+            <ChangeBadge pct={totals.salesChangePct} size="lg" />
+          </div>
+          <div className="rounded-md border border-slate-200 p-3">
+            <div className="text-[11px] text-slate-400 uppercase tracking-wide">Units</div>
+            <div className="font-bold text-slate-800 text-lg">{Math.round(totals.units).toLocaleString()}</div>
+            <ChangeBadge pct={totals.unitsChangePct} size="lg" />
+          </div>
+          <div className="rounded-md border border-slate-200 p-3">
+            <div className="text-[11px] text-slate-400 uppercase tracking-wide">Gross Profit</div>
+            <div className="font-bold text-slate-800 text-lg">{money0(totals.profit)}</div>
+            <ChangeBadge pct={totals.profitChangePct} size="lg" />
+          </div>
+        </div>
+
+        {!hasAnyPriorData && (
+          <div className="flex items-center gap-1.5 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5 mt-3">
+            <AlertTriangle size={12} /> No Performance data found for a year ago — year-over-year change can't be computed yet for this {drillDown.groupLabel.toLowerCase()}, only the current period is shown.
+          </div>
+        )}
+
+        {(biggestGainer || biggestDecliner) && hasAnyPriorData && (
+          <div className="flex flex-wrap items-center gap-2 mt-3 text-xs">
+            {biggestGainer && biggestGainer.sales - biggestGainer.priorSales > 0 && (
+              <span className="rounded-full px-2.5 py-1 bg-emerald-50 border border-emerald-200 text-emerald-700">
+                Biggest gainer: <span className="font-semibold">{biggestGainer.name}</span> ({money0(biggestGainer.sales - biggestGainer.priorSales)})
+              </span>
+            )}
+            {biggestDecliner && biggestDecliner.sales - biggestDecliner.priorSales < 0 && (
+              <span className="rounded-full px-2.5 py-1 bg-red-50 border border-red-200 text-red-600">
+                Biggest decliner: <span className="font-semibold">{biggestDecliner.name}</span> ({money0(biggestDecliner.sales - biggestDecliner.priorSales)})
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="bg-white rounded-lg border border-dashed border-slate-300 p-8 text-center text-sm text-slate-400">
+          No products with Performance data for this period.
+        </div>
+      ) : (
+        <div className="bg-white rounded-lg border border-slate-200 overflow-hidden overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 border-b border-slate-200">
+              <tr>
+                <th className="text-left px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Product</th>
+                {sortHeader("sales", "Sales")}
+                <th className="text-right px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Sales Δ YoY</th>
+                {sortHeader("units", "Units")}
+                <th className="text-right px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Units Δ YoY</th>
+                {sortHeader("profit", "Profit")}
+                <th className="text-right px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Profit Δ YoY</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sortedRows.map((r) => (
+                <tr key={r.productId} className="border-b border-slate-100 last:border-0 hover:bg-slate-50">
+                  <td className="px-3 py-2 font-medium text-slate-800 whitespace-nowrap">
+                    {r.name}
+                    {r.category && <span className="text-[10px] font-semibold uppercase tracking-wide rounded-full px-1.5 py-0.5 ml-1.5" style={{ background: hashColor(r.category) + "33", color: hashColor(r.category) }}>{r.category}</span>}
+                  </td>
+                  <td className="px-3 py-2 text-right font-mono">{money0(r.sales)}</td>
+                  <td className="px-3 py-2 text-right"><ChangeBadge pct={r.salesChangePct} /></td>
+                  <td className="px-3 py-2 text-right font-mono">{Math.round(r.units).toLocaleString()}</td>
+                  <td className="px-3 py-2 text-right"><ChangeBadge pct={r.unitsChangePct} /></td>
+                  <td className="px-3 py-2 text-right font-mono">{money0(r.profit)}</td>
+                  <td className="px-3 py-2 text-right"><ChangeBadge pct={r.profitChangePct} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CategoryAnalysisModule({ products, planograms, stores, performance, productSchema }) {
   const [groupBy, setGroupBy] = useState("category");
   const [categoryFilter, setCategoryFilter] = useState("All");
   const [periodWeeks, setPeriodWeeks] = useState(13);
   const [sortKey, setSortKey] = useState("pctSales");
   const [sortDir, setSortDir] = useState("desc");
+  const [drillDown, setDrillDown] = useState(null); // { key, label, groupLabel, members } | null
 
   const categories = React.useMemo(() => {
     const set = new Set();
@@ -2600,6 +2820,20 @@ function CategoryAnalysisModule({ products, planograms, stores, performance, pro
   });
 
   const groupLabel = ANALYSIS_GROUP_OPTIONS.find((o) => o.id === groupBy)?.label || "Category";
+
+  if (drillDown) {
+    return (
+      <AnalysisDrillDownView
+        drillDown={drillDown}
+        products={products}
+        performance={performance}
+        productSchema={productSchema}
+        periodWeeks={periodWeeks}
+        latestISO={latestISO}
+        onBack={() => setDrillDown(null)}
+      />
+    );
+  }
 
   const sortHeader = (key, label) => (
     <th
@@ -2669,8 +2903,15 @@ function CategoryAnalysisModule({ products, planograms, stores, performance, pro
             </thead>
             <tbody>
               {sortedRows.map((r) => (
-                <tr key={r.key} className="border-b border-slate-100 last:border-0 hover:bg-slate-50">
-                  <td className="px-3 py-2 font-medium text-slate-800 whitespace-nowrap">{r.label}</td>
+                <tr
+                  key={r.key}
+                  onClick={() => setDrillDown({ key: r.key, label: r.label, groupLabel, members: r.members })}
+                  className="border-b border-slate-100 last:border-0 hover:bg-amber-50 cursor-pointer"
+                  title={`See ${r.label}'s products, year over year`}
+                >
+                  <td className="px-3 py-2 font-medium text-slate-800 whitespace-nowrap flex items-center gap-1">
+                    {r.label} <ChevronRight size={12} className="text-slate-300" />
+                  </td>
                   <td className="px-3 py-2 text-right font-mono">{r.pctSpace.toFixed(1)}%</td>
                   <td className="px-3 py-2 text-right font-mono">{r.pctUnits.toFixed(1)}%</td>
                   <td className="px-3 py-2 text-right font-mono">{r.pctSales.toFixed(1)}%</td>
@@ -2696,6 +2937,7 @@ function CategoryAnalysisModule({ products, planograms, stores, performance, pro
       )}
 
       <div className="bg-white rounded-lg border border-slate-200 p-3 text-[11px] text-slate-400 space-y-1">
+        <p>Click any row to drill into its products — current vs. same-period-last-year Sales, Units, and Profit.</p>
         <p><span className="font-semibold text-slate-500">Sales/Space Index</span> = %Sales ÷ %Space × 100. Above 100 means {groupLabel.toLowerCase()} sells more than its shelf space would suggest; below 100 means it's over-spaced relative to its sales.</p>
         <p>Space is estimated from each product's placed width × facings (× squeeze factor), summed across every Live planogram's assigned stores — the same footprint math the shelf editor itself uses. Pegboard and Hook Rail placements use the same estimate since they don't pack linearly.</p>
       </div>
@@ -3109,6 +3351,7 @@ const HELP_SECTIONS = [
       { type: "p", text: "Shows how a category is performing across the whole chain — **%Space**, **%Sales**, **%Units**, and **%Profit** — by joining every Live, store-assigned planogram against imported Performance data." },
       { type: "p", text: "Pick a **Period** (4/13/26/52 weeks, or all available Performance history), then break the numbers down **By Category**, **By Brand**, **By Manufacturer**, **By Store**, **By Region**, or **By Store Format**. When breaking down by anything other than Category, an optional Category filter narrows the view to just that category." },
       { type: "p", text: "**Sales/Space Index** = %Sales ÷ %Space × 100. Above 100 means that row is selling more than its shelf space would suggest; below 100 means it's over-spaced relative to its sales — a quick flag for space that could be reallocated." },
+      { type: "p", text: "**Click any row** to drill into its products — a summary of current-period Sales, Units, and Gross Profit versus the same period one year earlier, with a callout for the biggest gainer and decliner, and a sortable per-product table showing each one's own year-over-year change. Clicking a Store row, for example, drills into that store's own products; clicking a Category row (while grouped by something else) drills into that category across whichever stores it appeared in." },
       { type: "note", text: "%Space is estimated from each placed product's width × facings (× squeeze factor), summed across every Live planogram's assigned stores — the same footprint math the shelf editor itself uses. Pegboard and Hook Rail placements use the same width-based estimate since they don't pack linearly the way a shelf does, so treat their %Space as a close approximation rather than an exact footprint." },
     ],
   },
