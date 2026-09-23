@@ -4205,6 +4205,11 @@ function FixtureBar({
   // only passed for a top-level (unmounted) fixture — lets dragging this bar onto a pegboard panel
   // mount it there instead of just moving it up/down in its own section (see handleUp below)
   onMountOnPegboard,
+  // section-wide rubberband multi-select (see SectionColumn) — groupSelected means THIS fixture's
+  // own bar is part of a multi-fixture selection (drag moves all of them together, vertically);
+  // groupSelectedPlacementIds/Items cover individual products selected across the whole section,
+  // possibly spanning other fixtures too (drag carries the whole group to wherever it's dropped).
+  onDragCommitGroup, groupSelected, groupSelectedPlacementIds, groupSelectedItems, onClearGroupSelection, onMoveGroupToFixture,
 }) {
   const boxes = joinedBoxes || layoutFixtureBoxes(fx, fixtureDef, products).boxes;
   const widthIn = fixtureDef ? fixtureDef.dims.w : 24;
@@ -4254,6 +4259,8 @@ function FixtureBar({
           const dropXOffset = Math.max(0, Math.round((e.clientX - rect.left) / scale));
           const dropNotchY = Math.max(0, Math.round((rect.bottom - e.clientY) / scale));
           onMountOnPegboard(panelEl.dataset.pegboardPanelId, dropXOffset, dropNotchY);
+        } else if (groupSelected && onDragCommitGroup) {
+          onDragCommitGroup(d.currentNotch - d.startNotch);
         } else {
           onDragCommit(d.currentNotch);
         }
@@ -4265,6 +4272,7 @@ function FixtureBar({
   };
 
   const handleDown = (e) => {
+    if (e.ctrlKey || e.metaKey) return; // let it bubble up to the section for rubberband-select
     e.stopPropagation();
     e.preventDefault();
     dragRef.current = { startClientY: e.clientY, startNotch: fx.notchY, currentNotch: fx.notchY, moved: false };
@@ -4277,14 +4285,22 @@ function FixtureBar({
 
   const handlePlacementDragStart = (e, placement) => {
     e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("text/plain", JSON.stringify({
-      kind: "placement",
-      sectionId,
-      fixtureInstId: fx.id,
-      placementId: placement.id,
-      productId: placement.productId,
-      rotation: placement.rotation || 0,
-    }));
+    // dragging a placement that's part of the current section-wide selection carries the WHOLE
+    // group along as one ordered block — handleDrop below re-inserts them together, preserving
+    // that order, at wherever this lands (a different shelf, or back on this one to reorder)
+    if (groupSelectedPlacementIds && groupSelectedPlacementIds.size > 1 && groupSelectedPlacementIds.has(placement.id)) {
+      e.dataTransfer.setData("text/plain", JSON.stringify({ kind: "shelfGroup", items: groupSelectedItems }));
+    } else {
+      onClearGroupSelection && onClearGroupSelection();
+      e.dataTransfer.setData("text/plain", JSON.stringify({
+        kind: "placement",
+        sectionId,
+        fixtureInstId: fx.id,
+        placementId: placement.id,
+        productId: placement.productId,
+        rotation: placement.rotation || 0,
+      }));
+    }
     // anchor the drag ghost at its top-left corner, not wherever it was grabbed — matters if this
     // ends up dropped on a pegboard, where the cursor position must represent that corner exactly
     try { e.dataTransfer.setDragImage(e.currentTarget, 0, 0); } catch (err) {}
@@ -4318,6 +4334,19 @@ function FixtureBar({
     if (!raw) return;
     let payload;
     try { payload = JSON.parse(raw); } catch { payload = { kind: "product", productId: raw }; }
+    if (payload.kind === "shelfGroup" && Array.isArray(payload.items)) {
+      onMoveGroupToFixture(payload.items, { sectionId, fixtureInstId: fx.id }, insertIndex);
+      onClearGroupSelection && onClearGroupSelection();
+      return;
+    }
+    if (payload.kind === "pegGroup" && Array.isArray(payload.placementIds)) {
+      // a peg-selected group dropped onto a plain shelf — it's leaving the pegboard, so it just
+      // becomes an ordered block of shelf placements like any other group move
+      const items = payload.placementIds.map((id) => ({ sectionId: payload.sectionId, fixtureInstId: payload.fixtureInstId, placementId: id }));
+      onMoveGroupToFixture(items, { sectionId, fixtureInstId: fx.id }, insertIndex);
+      onClearGroupSelection && onClearGroupSelection();
+      return;
+    }
     if (payload.kind === "placement") {
       onMovePlacement(
         { sectionId: payload.sectionId, fixtureInstId: payload.fixtureInstId, placementId: payload.placementId },
@@ -4351,7 +4380,7 @@ function FixtureBar({
     ? "ring-2 ring-amber-400 z-20"
     : visualOverflow
     ? "ring-2 ring-red-500 z-20"
-    : !readOnly && (selected || dragging)
+    : !readOnly && (selected || dragging || groupSelected)
     ? "ring-2 ring-blue-500 z-20"
     : "";
 
@@ -4360,9 +4389,10 @@ function FixtureBar({
       {/* the shelf/fixture bar itself — mousedown drags it up/down along notches, also accepts product drops */}
       <div
         onMouseDown={readOnly ? undefined : handleDown}
-        onClick={readOnly ? undefined : (e) => e.stopPropagation()}
+        onClick={readOnly ? undefined : (e) => { e.stopPropagation(); onClearGroupSelection && onClearGroupSelection(); }}
         onMouseEnter={() => setHovering(true)}
         onMouseLeave={() => setHovering(false)}
+        onContextMenu={readOnly ? undefined : (e) => e.preventDefault()}
         onDragOver={readOnly ? undefined : handleDragOver}
         onDragLeave={readOnly ? undefined : handleDragLeave}
         onDrop={readOnly ? undefined : handleDrop}
@@ -4437,7 +4467,8 @@ function FixtureBar({
             box={box}
             scale={scale}
             selected={!readOnly && selectedPlacementId === box.placement.id}
-            onSelect={onSelectPlacement}
+            groupSelected={!readOnly && groupSelectedPlacementIds && groupSelectedPlacementIds.has(box.placement.id)}
+            onSelect={(id) => { onClearGroupSelection && onClearGroupSelection(); onSelectPlacement(id); }}
             metrics={aggregateProductPerformance(box.product.id, performance, cutoffISO, storeId)}
             schema={schema}
             overlaySettings={overlaySettings}
@@ -4469,6 +4500,11 @@ function PegboardPanel({
   // pegboard backdrop with a few shelves attached to it. Each carries its own xOffset/notchY
   // relative to THIS panel's own origin, so it tracks along if the panel itself moves.
   mountedFixtures, fixtures, onDragMountedFixture, onDropProductOnMounted,
+  // section-wide rubberband multi-select (see SectionColumn) — groupSelected means THIS panel's
+  // own bar is part of a multi-fixture selection (drag moves all of them together, vertically);
+  // groupSelectedPlacementIds/Items cover individual products selected across the whole section,
+  // possibly spanning other fixtures too (drag carries the whole group to wherever it's dropped).
+  onDragCommitGroup, groupSelected, groupSelectedPlacementIds, groupSelectedItems, onClearGroupSelection, onMoveGroupToFixture,
 }) {
   const widthIn = fixtureDef ? fixtureDef.dims.w : 24;
   const heightIn = fixtureDef ? fixtureDef.dims.h : 24;
@@ -4478,13 +4514,6 @@ function PegboardPanel({
   const [dropHoverXY, setDropHoverXY] = useState(null); // snapped {xIn, yIn} peg the drop would land on
   const [liveNotchY, setLiveNotchY] = useState(fx.notchY);
   const dragRef = useRef(null);
-  // rubberband multi-select: Ctrl/Cmd+drag on empty peg space marks a set of pegged placements as
-  // "move together" — a plain drag still repositions the whole panel, so the modifier key is what
-  // tells the two gestures apart. Purely local/transient (not lifted to app state): it only
-  // matters for the next drag, and is cleared once that drag lands or a plain click happens.
-  const [groupSelected, setGroupSelected] = useState(() => new Set());
-  const [rubberband, setRubberband] = useState(null); // {x0,y0,x1,y1} in panel-local pixels
-  const rubberRef = useRef(null);
 
   // keep the displayed position in sync when not actively dragging (e.g. typed in the side panel)
   useEffect(() => { if (!dragging) setLiveNotchY(fx.notchY); }, [fx.notchY, dragging]);
@@ -4510,12 +4539,15 @@ function PegboardPanel({
     setDragging(false);
     dragRef.current = null;
     if (d) {
-      if (d.moved) { onDragCommit(d.currentNotch); onSelectFixture(fx.id); }
-      else onSelectFixture(fx.id);
+      if (d.moved) {
+        if (groupSelected && onDragCommitGroup) onDragCommitGroup(d.currentNotch - d.startNotch);
+        else onDragCommit(d.currentNotch);
+        onSelectFixture(fx.id);
+      } else onSelectFixture(fx.id);
     }
   };
   const handleDown = (e) => {
-    if (e.ctrlKey || e.metaKey) { handleRubberDown(e); return; }
+    if (e.ctrlKey || e.metaKey) return; // let it bubble up to the section for rubberband-select
     e.stopPropagation();
     e.preventDefault();
     dragRef.current = { startClientY: e.clientY, startNotch: fx.notchY, currentNotch: fx.notchY, moved: false };
@@ -4524,55 +4556,6 @@ function PegboardPanel({
     document.body.style.userSelect = "none";
     window.addEventListener("mousemove", handleMove);
     window.addEventListener("mouseup", handleUp);
-  };
-
-  // Ctrl/Cmd+drag over empty peg space draws a selection rectangle; anything it overlaps when
-  // released becomes the "move together" group for the next placement drag (see
-  // handlePlacementDragStart/handlePanelDrop's "pegGroup" payload below).
-  const handleRubberDown = (e) => {
-    e.stopPropagation();
-    e.preventDefault();
-    const rect = e.currentTarget.getBoundingClientRect();
-    const startX = e.clientX - rect.left, startY = e.clientY - rect.top;
-    rubberRef.current = { rect, startX, startY, curX: startX, curY: startY, moved: false };
-    setRubberband({ x0: startX, y0: startY, x1: startX, y1: startY });
-    document.body.style.userSelect = "none";
-    window.addEventListener("mousemove", handleRubberMove);
-    window.addEventListener("mouseup", handleRubberUp);
-  };
-  const handleRubberMove = (e) => {
-    const r = rubberRef.current;
-    if (!r) return;
-    const curX = clamp(e.clientX - r.rect.left, 0, r.rect.width);
-    const curY = clamp(e.clientY - r.rect.top, 0, r.rect.height);
-    if (Math.abs(curX - r.startX) > 3 || Math.abs(curY - r.startY) > 3) r.moved = true;
-    r.curX = curX; r.curY = curY;
-    setRubberband({ x0: r.startX, y0: r.startY, x1: curX, y1: curY });
-  };
-  const handleRubberUp = () => {
-    const r = rubberRef.current;
-    window.removeEventListener("mousemove", handleRubberMove);
-    window.removeEventListener("mouseup", handleRubberUp);
-    document.body.style.userSelect = "";
-    rubberRef.current = null;
-    setRubberband(null);
-    if (!r || !r.moved) return; // a bare Ctrl/Cmd-click with no drag — leave the current group as-is
-    // panel pixels are top-down (CSS top), but peg space is bottom-up (inches from the panel's
-    // own bottom edge, same convention layoutPegboardBoxes/pegToOrigin use) — flip Y here
-    const xMinIn = Math.min(r.startX, r.curX) / scale;
-    const xMaxIn = Math.max(r.startX, r.curX) / scale;
-    const yMinIn = heightIn - Math.max(r.startY, r.curY) / scale;
-    const yMaxIn = heightIn - Math.min(r.startY, r.curY) / scale;
-    const hit = new Set();
-    boxes.forEach((b) => {
-      const dims = b.effectiveDims || b.product.dims;
-      const rotated = b.placement.rotation === 90 || b.placement.rotation === 270;
-      const boxHIn = rotated ? dims.w : dims.h;
-      const bx0 = b.xIn, bx1 = b.xIn + b.wIn;
-      const by0 = b.pegYIn - boxHIn, by1 = b.pegYIn;
-      if (bx1 > xMinIn && bx0 < xMaxIn && by1 > yMinIn && by0 < yMaxIn) hit.add(b.placement.id);
-    });
-    setGroupSelected(hit);
   };
 
   const bottomIn = base + liveNotchY;
@@ -4624,7 +4607,17 @@ function PegboardPanel({
         const dy = xy.yIn - payload.anchorPegY;
         onMoveGroup(sectionId, fx.id, payload.placementIds, dx, dy);
       }
-      setGroupSelected(new Set());
+      onClearGroupSelection && onClearGroupSelection();
+      return;
+    }
+    if (payload.kind === "shelfGroup" && Array.isArray(payload.items)) {
+      // a shelf-selected group landing on a pegboard — it's becoming pegged, so give each item its
+      // own hole rather than trying to preserve shelf ordering; simple left-to-right spread from
+      // the drop point is enough to land them all visibly and non-overlapping
+      payload.items.forEach((it, i) => {
+        onMovePlacement(it, { sectionId, fixtureInstId: fx.id }, null, { pegX: clamp(Math.round(xy.xIn + i * 2), 0, widthIn), pegY: xy.yIn });
+      });
+      onClearGroupSelection && onClearGroupSelection();
       return;
     }
     if (payload.kind === "placement") {
@@ -4644,17 +4637,25 @@ function PegboardPanel({
     // dragging a placement that's part of the current rubberband selection carries the WHOLE
     // group along, anchored to this one item — handlePanelDrop computes the drop delta from this
     // item's new position and applies the same delta to every other selected placement
-    if (groupSelected.size > 1 && groupSelected.has(placement.id)) {
+    const groupIds = groupSelectedPlacementIds || new Set();
+    const inGroup = groupIds.size > 1 && groupIds.has(placement.id);
+    // a pure single-pegboard-origin group keeps the precise dx/dy free-move (pegGroup); a group
+    // that spans other fixtures too doesn't have a shared 2D space to move within, so it falls
+    // back to the generic ordered-block move (shelfGroup) — same as dragging it onto a shelf
+    const allMineOnThisFixture = inGroup && Array.from(groupIds).every((id) => (fx.placements || []).some((p) => p.id === id));
+    if (allMineOnThisFixture) {
       e.dataTransfer.setData("text/plain", JSON.stringify({
         kind: "pegGroup",
         sectionId,
         fixtureInstId: fx.id,
-        placementIds: Array.from(groupSelected),
+        placementIds: Array.from(groupIds),
         anchorPegX: placement.pegX ?? 0,
         anchorPegY: placement.pegY ?? 0,
       }));
+    } else if (inGroup) {
+      e.dataTransfer.setData("text/plain", JSON.stringify({ kind: "shelfGroup", items: groupSelectedItems }));
     } else {
-      setGroupSelected(new Set());
+      onClearGroupSelection && onClearGroupSelection();
       e.dataTransfer.setData("text/plain", JSON.stringify({
         kind: "placement",
         sectionId,
@@ -4683,7 +4684,7 @@ function PegboardPanel({
     ? "ring-2 ring-red-500 z-20"
     : !readOnly && dragging
     ? "ring-2 ring-blue-500 z-20"
-    : !readOnly && selected
+    : !readOnly && (selected || groupSelected)
     ? "ring-2 ring-blue-500"
     : "";
 
@@ -4694,7 +4695,7 @@ function PegboardPanel({
           nearest 1in peg hole */}
       <div
         onMouseDown={readOnly ? undefined : handleDown}
-        onClick={readOnly ? undefined : (e) => { e.stopPropagation(); if (groupSelected.size) setGroupSelected(new Set()); }}
+        onClick={readOnly ? undefined : (e) => { e.stopPropagation(); onClearGroupSelection && onClearGroupSelection(); }}
         // on macOS, Ctrl+click is the system's secondary-click (right-click) gesture — without
         // this, it opens the browser's context menu instead of ever reaching handleDown/handleMove
         // as a normal drag, so a Ctrl+drag rubberband-select silently does nothing at all
@@ -4719,23 +4720,12 @@ function PegboardPanel({
           boxShadow: dragging ? "0 4px 10px rgba(0,0,0,0.25)" : "none",
           transition: dragging ? "none" : "bottom 80ms ease-out",
         }}
-        title={fixtureDef ? `${fixtureDef.name} (Pegboard) — 1in peg grid; drop a product anywhere on the panel, drag the panel to reposition it, drag a shelf fixture onto it to mount that shelf here, or Ctrl/Cmd+drag to rubberband-select several pegged products and move them together` : "Missing fixture"}
+        title={fixtureDef ? `${fixtureDef.name} (Pegboard) — 1in peg grid; drop a product anywhere on the panel, drag the panel to reposition it, drag a shelf fixture onto it to mount that shelf here, or Ctrl/Cmd+drag anywhere in the section to rubberband-select several products or fixtures and move them together` : "Missing fixture"}
       >
         {!readOnly && dropHoverXY && (
           <div
             className="absolute rounded-full bg-amber-400 pointer-events-none border border-amber-600"
             style={{ left: dropHoverXY.xIn * scale - 4, bottom: dropHoverXY.yIn * scale - 4, width: 8, height: 8 }}
-          />
-        )}
-        {!readOnly && rubberband && (
-          <div
-            className="absolute border-2 border-blue-500 bg-blue-400/15 pointer-events-none z-30"
-            style={{
-              left: Math.min(rubberband.x0, rubberband.x1),
-              top: Math.min(rubberband.y0, rubberband.y1),
-              width: Math.abs(rubberband.x1 - rubberband.x0),
-              height: Math.abs(rubberband.y1 - rubberband.y0),
-            }}
           />
         )}
       </div>
@@ -4770,6 +4760,10 @@ function PegboardPanel({
             onDragCommit={(absNotchY) => onDragMountedFixture && onDragMountedFixture(mfx.id, absNotchY - fx.notchY)}
             onDropProduct={(productId, insertIndex) => onDropProductOnMounted && onDropProductOnMounted(mfx.id, productId, insertIndex)}
             onMovePlacement={onMovePlacement}
+            groupSelectedPlacementIds={groupSelectedPlacementIds}
+            groupSelectedItems={groupSelectedItems}
+            onClearGroupSelection={onClearGroupSelection}
+            onMoveGroupToFixture={onMoveGroupToFixture}
             performance={performance}
             cutoffISO={cutoffISO}
             storeId={storeId}
@@ -4802,8 +4796,8 @@ function PegboardPanel({
             box={box}
             scale={scale}
             selected={!readOnly && selectedPlacementId === box.placement.id}
-            groupSelected={!readOnly && groupSelected.has(box.placement.id)}
-            onSelect={(id) => { if (groupSelected.size) setGroupSelected(new Set()); onSelectPlacement(id); }}
+            groupSelected={!readOnly && groupSelectedPlacementIds && groupSelectedPlacementIds.has(box.placement.id)}
+            onSelect={(id) => { onClearGroupSelection && onClearGroupSelection(); onSelectPlacement(id); }}
             metrics={aggregateProductPerformance(box.product.id, performance, cutoffISO, storeId)}
             schema={schema}
             overlaySettings={overlaySettings}
@@ -4825,11 +4819,119 @@ function PegboardPanel({
 
 function SectionColumn({
   section, index, total, planogram, fixtures, products, scale, readOnly, joinedLayouts, capacityWarningsEnabled, hideImages, highlightField, zoomLevel,
-  onRename, onResize, onSetBackboard, onMove, onDelete, onAddFixture, onDragFixture, onDropProductOnFixture, onMountFixture, onMovePlacement, onMoveGroup,
+  onRename, onResize, onSetBackboard, onMove, onDelete, onAddFixture, onDragFixture, onDragFixtureGroup, onDropProductOnFixture, onMountFixture, onMovePlacement, onMoveGroup, onMoveGroupToFixture,
   selectedFixtureId, onSelectFixture, selectedPlacementId, onSelectPlacement, onDeselectAll,
   performance, cutoffISO, storeId, schema, overlaySettings,
 }) {
   const heightPx = planogram.dims.h * scale;
+  // section-wide rubberband multi-select: Ctrl/Cmd+drag over empty space, a shelf, or the
+  // pegboard lassos whatever it touches — whole fixtures (by their bar) for a group reposition,
+  // and/or individual products (on a shelf or a pegboard) for a group move to another fixture.
+  // One unified selection mechanism for the whole section, not a separate one per panel, so the
+  // gesture can start anywhere and still capture everything it passes over. Purely local/transient
+  // UI state — it only matters for the next drag and clears once that drag lands or on a plain
+  // click elsewhere.
+  const [rubberband, setRubberband] = useState(null); // {x0,y0,x1,y1} in section-local pixels
+  const [groupSelectedFixtureIds, setGroupSelectedFixtureIds] = useState(() => new Set());
+  const [groupSelectedPlacementIds, setGroupSelectedPlacementIds] = useState(() => new Set());
+  const [groupSelectedItems, setGroupSelectedItems] = useState([]); // [{sectionId,fixtureInstId,placementId}], stable order
+  const rubberRef = useRef(null);
+
+  const clearGroupSelection = () => {
+    if (!groupSelectedFixtureIds.size && !groupSelectedPlacementIds.size) return;
+    setGroupSelectedFixtureIds(new Set());
+    setGroupSelectedPlacementIds(new Set());
+    setGroupSelectedItems([]);
+  };
+
+  const handleRubberDown = (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const startX = e.clientX - rect.left, startY = e.clientY - rect.top;
+    rubberRef.current = { rect, startX, startY, curX: startX, curY: startY, moved: false };
+    setRubberband({ x0: startX, y0: startY, x1: startX, y1: startY });
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", handleRubberMove);
+    window.addEventListener("mouseup", handleRubberUp);
+  };
+  const handleRubberMove = (e) => {
+    const r = rubberRef.current;
+    if (!r) return;
+    const curX = clamp(e.clientX - r.rect.left, 0, r.rect.width);
+    const curY = clamp(e.clientY - r.rect.top, 0, r.rect.height);
+    if (Math.abs(curX - r.startX) > 3 || Math.abs(curY - r.startY) > 3) r.moved = true;
+    r.curX = curX; r.curY = curY;
+    setRubberband({ x0: r.startX, y0: r.startY, x1: curX, y1: curY });
+  };
+  const handleRubberUp = () => {
+    const r = rubberRef.current;
+    window.removeEventListener("mousemove", handleRubberMove);
+    window.removeEventListener("mouseup", handleRubberUp);
+    document.body.style.userSelect = "";
+    rubberRef.current = null;
+    setRubberband(null);
+    if (!r || !r.moved) return; // a bare Ctrl/Cmd-click with no drag — leave the current selection as-is
+    // section pixels are top-down (CSS top), but every fixture's own inches are bottom-up (from
+    // the planogram's own base) — flip Y here, once, for the whole section
+    const heightInTotal = planogram.dims.h;
+    const xMinIn = Math.min(r.startX, r.curX) / scale;
+    const xMaxIn = Math.max(r.startX, r.curX) / scale;
+    const yMinIn = heightInTotal - Math.max(r.startY, r.curY) / scale;
+    const yMaxIn = heightInTotal - Math.min(r.startY, r.curY) / scale;
+
+    const hitFixtures = new Set();
+    const hitPlacementIds = new Set();
+    const hitItems = [];
+    const addPlacementHit = (fx, placementId) => {
+      if (hitPlacementIds.has(placementId)) return;
+      hitPlacementIds.add(placementId);
+      hitItems.push({ sectionId: section.id, fixtureInstId: fx.id, placementId });
+    };
+
+    const topLevel = section.fixtures.filter((f) => !f.mountedOnId);
+    topLevel.forEach((fx) => {
+      const def = fixtures.find((f) => f.id === fx.fixtureId);
+      const isPeg = def?.type === "Pegboard";
+      const widthIn = def ? def.dims.w : 24;
+      const heightIn = def ? def.dims.h : 2;
+      const bottomIn = planogram.base + fx.notchY;
+
+      // the fixture's own bar/panel footprint — touching this selects the WHOLE fixture, for a
+      // group vertical reposition ("these three shelves move up together")
+      const barX0 = fx.xOffset, barX1 = fx.xOffset + widthIn;
+      const barY0 = bottomIn, barY1 = bottomIn + heightIn;
+      if (barX1 > xMinIn && barX0 < xMaxIn && barY1 > yMinIn && barY0 < yMaxIn) hitFixtures.add(fx.id);
+
+      // individual products on it — touching a product (even without touching the bar) selects
+      // just that product, for a group product move
+      if (isPeg) {
+        const { boxes } = layoutPegboardBoxes(fx, def, products);
+        boxes.forEach((b) => {
+          const dims = b.effectiveDims || b.product.dims;
+          const rotated = b.placement.rotation === 90 || b.placement.rotation === 270;
+          const boxHIn = rotated ? dims.w : dims.h;
+          const bxAbs0 = fx.xOffset + b.xIn, bxAbs1 = fx.xOffset + b.xIn + b.wIn;
+          const by0 = bottomIn + b.pegYIn - boxHIn, by1 = bottomIn + b.pegYIn;
+          if (bxAbs1 > xMinIn && bxAbs0 < xMaxIn && by1 > yMinIn && by0 < yMaxIn) addPlacementHit(fx, b.placement.id);
+        });
+      } else {
+        const { boxes } = layoutFixtureBoxes(fx, def, products);
+        boxes.forEach((b) => {
+          const dims = b.effectiveDims || b.product.dims;
+          const rotated = b.placement.rotation === 90 || b.placement.rotation === 270;
+          const boxHIn = rotated ? dims.w : dims.h;
+          const bxAbs0 = fx.xOffset + b.xIn, bxAbs1 = fx.xOffset + b.xIn + b.wIn;
+          const by0 = bottomIn + heightIn, by1 = by0 + boxHIn;
+          if (bxAbs1 > xMinIn && bxAbs0 < xMaxIn && by1 > yMinIn && by0 < yMaxIn) addPlacementHit(fx, b.placement.id);
+        });
+      }
+    });
+
+    setGroupSelectedFixtureIds(hitFixtures);
+    setGroupSelectedPlacementIds(hitPlacementIds);
+    setGroupSelectedItems(hitItems);
+  };
   // fixtures mounted on a pegboard (a shelf physically attached to the peg panel) render inside
   // that panel, not stacked independently in the section's own flow — split them out here so the
   // normal per-fixture stack below only sees the top-level ones, and group the rest by host id so
@@ -4887,7 +4989,9 @@ function SectionColumn({
       </div>
 
       <div
-        onClick={readOnly ? undefined : onDeselectAll}
+        onMouseDown={readOnly ? undefined : (e) => { if (e.ctrlKey || e.metaKey) handleRubberDown(e); }}
+        onClick={readOnly ? undefined : (e) => { if (groupSelectedFixtureIds.size || groupSelectedPlacementIds.size) { clearGroupSelection(); return; } onDeselectAll(); }}
+        onContextMenu={readOnly ? undefined : (e) => e.preventDefault()}
         className="relative border-x border-slate-300 bg-gradient-to-b from-slate-100 to-slate-200"
         style={{ width: section.width * scale, height: heightPx }}
       >
@@ -4945,6 +5049,12 @@ function SectionColumn({
                 selectedPlacementId={selectedPlacementId}
                 onSelectPlacement={onSelectPlacement}
                 onDragCommit={(notchY) => onDragFixture(fx.id, notchY)}
+                onDragCommitGroup={(delta) => onDragFixtureGroup(section.id, Array.from(groupSelectedFixtureIds), delta)}
+                groupSelected={groupSelectedFixtureIds.has(fx.id)}
+                groupSelectedPlacementIds={groupSelectedPlacementIds}
+                groupSelectedItems={groupSelectedItems}
+                onClearGroupSelection={clearGroupSelection}
+                onMoveGroupToFixture={onMoveGroupToFixture}
                 onDropProduct={(productId, insertIndex, pegCoords) => onDropProductOnFixture(fx.id, productId, insertIndex, pegCoords)}
                 onMovePlacement={onMovePlacement}
                 onMoveGroup={onMoveGroup}
@@ -4981,6 +5091,12 @@ function SectionColumn({
               selectedPlacementId={selectedPlacementId}
               onSelectPlacement={onSelectPlacement}
               onDragCommit={(notchY) => onDragFixture(fx.id, notchY)}
+              onDragCommitGroup={(delta) => onDragFixtureGroup(section.id, Array.from(groupSelectedFixtureIds), delta)}
+              groupSelected={groupSelectedFixtureIds.has(fx.id)}
+              groupSelectedPlacementIds={groupSelectedPlacementIds}
+              groupSelectedItems={groupSelectedItems}
+              onClearGroupSelection={clearGroupSelection}
+              onMoveGroupToFixture={onMoveGroupToFixture}
               onDropProduct={(productId, insertIndex) => onDropProductOnFixture(fx.id, productId, insertIndex)}
               onMovePlacement={onMovePlacement}
               performance={performance}
@@ -4997,6 +5113,17 @@ function SectionColumn({
           <div className="absolute inset-0 flex items-center justify-center text-[11px] text-slate-400 italic px-2 text-center">
             Empty section
           </div>
+        )}
+        {!readOnly && rubberband && (
+          <div
+            className="absolute border-2 border-blue-500 bg-blue-400/15 pointer-events-none z-40"
+            style={{
+              left: Math.min(rubberband.x0, rubberband.x1),
+              top: Math.min(rubberband.y0, rubberband.y1),
+              width: Math.abs(rubberband.x1 - rubberband.x0),
+              height: Math.abs(rubberband.y1 - rubberband.y0),
+            }}
+          />
         )}
       </div>
 
@@ -5840,6 +5967,76 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
     }));
   };
 
+  // rubberband-drag several whole FIXTURES at once (a shelf's own bar, not its products) — shifts
+  // every selected fixture's notchY by the same delta, each clamped to its own valid range so a
+  // short fixture in the group can't be dragged further than its own height allows even if a
+  // taller groupmate could go further.
+  const dragFixtureGroup = (sectionId, fxIds, deltaNotchY) => {
+    if (!deltaNotchY) return;
+    const idSet = new Set(fxIds);
+    mutateSections((secs) => secs.map((s) => {
+      if (s.id !== sectionId) return s;
+      return {
+        ...s,
+        fixtures: s.fixtures.map((f) => {
+          if (!idSet.has(f.id)) return f;
+          const def = fixtures.find((d) => d.id === f.fixtureId);
+          const heightIn = def ? def.dims.h : 2;
+          const maxNotchY = Math.max(0, planogram.dims.h - planogram.base - heightIn);
+          return { ...f, notchY: clamp(f.notchY + deltaNotchY, 0, maxNotchY) };
+        }),
+      };
+    }));
+  };
+
+  // rubberband-drag several PRODUCTS at once onto a (possibly different) shelf — e.g. "grab
+  // everything on this shelf and move it to that one." Unlike moveGroupOnPegboard (which just
+  // nudges pegX/pegY in place), this removes each item from wherever it started — one shelf, a
+  // pegboard, or a mix — and reinserts them together as one ordered block at the drop point,
+  // preserving the relative order they were selected in. Any stale peg coordinates are dropped
+  // (a shelf placement doesn't have a 2D position), matching movePlacement's own behavior when
+  // crossing into a non-pegboard fixture.
+  const moveGroupToFixture = (items, dest, insertIndex) => {
+    if (!items || items.length === 0) return;
+    mutateSections((secs) => {
+      const movedById = {};
+      let next = secs.map((s) => ({
+        ...s,
+        fixtures: s.fixtures.map((f) => {
+          const toRemove = items.filter((it) => it.sectionId === s.id && it.fixtureInstId === f.id);
+          if (toRemove.length === 0) return f;
+          const removeIds = new Set(toRemove.map((it) => it.placementId));
+          const kept = [];
+          f.placements.forEach((p) => {
+            if (removeIds.has(p.id)) {
+              const { pegX, pegY, ...rest } = p;
+              movedById[p.id] = rest;
+            } else kept.push(p);
+          });
+          return { ...f, placements: kept };
+        }),
+      }));
+      const block = items.map((it) => movedById[it.placementId]).filter(Boolean);
+      if (block.length === 0) return secs;
+      next = next.map((s) => {
+        if (s.id !== dest.sectionId) return s;
+        return {
+          ...s,
+          fixtures: s.fixtures.map((f) => {
+            if (f.id !== dest.fixtureInstId) return f;
+            const arr = [...f.placements];
+            const idx = insertIndex == null ? arr.length : clamp(insertIndex, 0, arr.length);
+            arr.splice(idx, 0, ...block);
+            return { ...f, placements: arr };
+          }),
+        };
+      });
+      return next;
+    });
+    setSelectedFixtureId(null);
+    setSelectedPlacement(null);
+  };
+
   // find current selected placement object + product
   let placementCtx = null;
   if (selectedPlacement) {
@@ -6196,10 +6393,12 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                     onDelete={() => deleteSection(section.id)}
                     onAddFixture={() => setSelectedSectionForAdd(section.id)}
                     onDragFixture={(fxId, notchY) => updateFixtureInst(section.id, fxId, { notchY })}
+                    onDragFixtureGroup={dragFixtureGroup}
                     onDropProductOnFixture={(fxId, productId, insertIndex, pegCoords) => addPlacement(section.id, fxId, productId, insertIndex, pegCoords)}
                     onMountFixture={(sourceSectionId, sourceFixtureId, targetFixtureId, xOffset, notchY) => mountFixtureOnPegboard(sourceSectionId, sourceFixtureId, section.id, targetFixtureId, xOffset, notchY)}
                     onMovePlacement={movePlacement}
                     onMoveGroup={moveGroupOnPegboard}
+                    onMoveGroupToFixture={moveGroupToFixture}
                     performance={performance}
                     cutoffISO={cutoffISO}
                     storeId={activeStoreId}
