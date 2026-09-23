@@ -5,7 +5,7 @@ import {
   RotateCw, X, Layers, Package, Boxes, Ruler, ArrowLeft, Check, Grid3x3,
   Pencil, Save, AlertTriangle, RefreshCw, Download, Upload, FileSpreadsheet, CalendarDays, TrendingUp,
   Maximize2, Minimize2, Store, ChevronDown, ChevronUp, AlignLeft, AlignCenter, AlignRight, Search, Eye, Printer, Copy,
-  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe, HelpCircle
+  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe, HelpCircle, BarChart3
 } from "lucide-react";
 import {
   supabase, supabaseConfigured, pendingWriteListeners,
@@ -2438,6 +2438,271 @@ function StoreAssignmentPopover({ stores, selectedIds, onToggle, onClose }) {
 /* Performance module — load history, view rolled-up metrics            */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Category Analysis — chain-wide %Space / %Sales / %Units / %Profit,   */
+/* broken down by Category, Brand, Manufacturer, Store, Region, or      */
+/* Store Format                                                          */
+/* ------------------------------------------------------------------ */
+
+const ANALYSIS_GROUP_OPTIONS = [
+  { id: "category", label: "Category" },
+  { id: "brand", label: "Brand" },
+  { id: "manufacturer", label: "Manufacturer" },
+  { id: "store", label: "Store" },
+  { id: "region", label: "Region" },
+  { id: "format", label: "Store Format" },
+];
+
+const ANALYSIS_PERIODS = [4, 13, 26, 52];
+
+// Space consumed by one placement, in inches: the product's (or merch-style's) width for
+// whichever orientation it's rotated to, compressed by its squeeze factor, times facings.
+// Mirrors the per-item width formula layoutFixtureBoxes uses to pack a shelf — this just sums
+// it instead of positioning it, so a shelf's actual packed width and this report's "space"
+// figure always agree. Used as the same approximation for Pegboard/Hook Rail placements too,
+// since those don't pack linearly the way a shelf does.
+function getPlacementSpaceIn(product, placement) {
+  if (!product) return 0;
+  const effectiveDims = getEffectiveDims(product, placement);
+  const rotated = placement.rotation === 90 || placement.rotation === 270;
+  const nominalW = (rotated ? effectiveDims.h : effectiveDims.w) || 1;
+  const squeeze = product.squeezeFactor ?? 1;
+  return nominalW * squeeze * (placement.facings || 1);
+}
+
+// Rolls up every product placed in a Live, store-assigned planogram against imported
+// Performance data, then groups the result by the requested dimension. categoryFilter narrows
+// to one category before grouping (ignored when groupField itself is "category").
+function buildCategoryAnalysisRows(planograms, products, stores, performance, productSchema, cutoffISO, groupField, categoryFilter) {
+  const productsById = {};
+  products.forEach((p) => { productsById[p.id] = p; });
+  const storesById = {};
+  stores.forEach((s) => { storesById[s.id] = s; });
+
+  // 1. Space (inches) per store × product, from every Live planogram's placements.
+  const spaceByStoreProduct = {};
+  planograms.forEach((pg) => {
+    if (effectivePlanogramStatus(pg) !== "live") return;
+    const storeIds = pg.storeIds || [];
+    if (storeIds.length === 0) return;
+    (pg.sections || []).forEach((section) => {
+      (section.fixtures || []).forEach((fx) => {
+        (fx.placements || []).forEach((pl) => {
+          const product = productsById[pl.productId];
+          if (!product) return;
+          const spaceIn = getPlacementSpaceIn(product, pl);
+          if (spaceIn <= 0) return;
+          storeIds.forEach((storeId) => {
+            if (!spaceByStoreProduct[storeId]) spaceByStoreProduct[storeId] = {};
+            spaceByStoreProduct[storeId][product.id] = (spaceByStoreProduct[storeId][product.id] || 0) + spaceIn;
+          });
+        });
+      });
+    });
+  });
+
+  // 2. Join each store × product with its Performance figures for the selected period.
+  const rawRows = [];
+  Object.entries(spaceByStoreProduct).forEach(([storeId, byProduct]) => {
+    Object.entries(byProduct).forEach(([productId, spaceIn]) => {
+      const product = productsById[productId];
+      if (!product) return;
+      if (categoryFilter && categoryFilter !== "All" && groupField !== "category") {
+        const cat = getAttrByLabel(product, productSchema, ["category"]) || "(Uncategorized)";
+        if (cat !== categoryFilter) return;
+      }
+      const perf = aggregateProductPerformance(productId, performance, cutoffISO, storeId);
+      rawRows.push({
+        productId, storeId, spaceIn,
+        sales: perf?.totalSales || 0,
+        units: perf?.totalUnits || 0,
+        profit: perf?.grossProfit || 0,
+      });
+    });
+  });
+
+  // 3. Group into rows by the chosen dimension and total everything.
+  const groups = {};
+  const bump = (key, label, row) => {
+    if (!groups[key]) groups[key] = { key, label, spaceIn: 0, sales: 0, units: 0, profit: 0 };
+    groups[key].spaceIn += row.spaceIn;
+    groups[key].sales += row.sales;
+    groups[key].units += row.units;
+    groups[key].profit += row.profit;
+  };
+  rawRows.forEach((row) => {
+    const product = productsById[row.productId];
+    const store = storesById[row.storeId];
+    let key, label;
+    if (groupField === "store") {
+      label = store ? store.name : "Unknown Store"; key = row.storeId;
+    } else if (groupField === "region") {
+      label = store?.region || "(No Region)"; key = label;
+    } else if (groupField === "format") {
+      label = store?.format || "(No Format)"; key = label;
+    } else if (groupField === "brand") {
+      label = getAttrByLabel(product, productSchema, ["brand"]) || "(No Brand)"; key = label;
+    } else if (groupField === "manufacturer") {
+      label = getAttrByLabel(product, productSchema, ["manufacturer"]) || "(No Manufacturer)"; key = label;
+    } else {
+      label = getAttrByLabel(product, productSchema, ["category"]) || "(Uncategorized)"; key = label;
+    }
+    bump(key, label, row);
+  });
+
+  const totals = Object.values(groups).reduce(
+    (acc, g) => ({ spaceIn: acc.spaceIn + g.spaceIn, sales: acc.sales + g.sales, units: acc.units + g.units, profit: acc.profit + g.profit }),
+    { spaceIn: 0, sales: 0, units: 0, profit: 0 }
+  );
+
+  const rows = Object.values(groups).map((g) => {
+    const pctSpace = totals.spaceIn > 0 ? (g.spaceIn / totals.spaceIn) * 100 : 0;
+    const pctSales = totals.sales > 0 ? (g.sales / totals.sales) * 100 : 0;
+    const pctUnits = totals.units > 0 ? (g.units / totals.units) * 100 : 0;
+    const pctProfit = totals.profit > 0 ? (g.profit / totals.profit) * 100 : 0;
+    return {
+      ...g, pctSpace, pctSales, pctUnits, pctProfit,
+      salesToSpaceIndex: pctSpace > 0 ? (pctSales / pctSpace) * 100 : null,
+    };
+  });
+
+  return { rows, totals };
+}
+
+function CategoryAnalysisModule({ products, planograms, stores, performance, productSchema }) {
+  const [groupBy, setGroupBy] = useState("category");
+  const [categoryFilter, setCategoryFilter] = useState("All");
+  const [periodWeeks, setPeriodWeeks] = useState(13);
+  const [sortKey, setSortKey] = useState("pctSales");
+  const [sortDir, setSortDir] = useState("desc");
+
+  const categories = React.useMemo(() => {
+    const set = new Set();
+    products.forEach((p) => {
+      const c = getAttrByLabel(p, productSchema, ["category"]);
+      if (c) set.add(c);
+    });
+    return Array.from(set).sort();
+  }, [products, productSchema]);
+
+  const latestISO = React.useMemo(() => getLatestWeekEnding(performance), [performance]);
+  const availableWeeks = React.useMemo(() => countAvailableWeeks(performance), [performance]);
+  const cutoffISO = periodWeeks === "all" ? null : getCutoffISO(latestISO, periodWeeks);
+
+  const { rows } = React.useMemo(
+    () => buildCategoryAnalysisRows(planograms, products, stores, performance, productSchema, cutoffISO, groupBy, groupBy !== "category" ? categoryFilter : "All"),
+    [planograms, products, stores, performance, productSchema, cutoffISO, groupBy, categoryFilter]
+  );
+
+  const sortedRows = [...rows].sort((a, b) => {
+    const av = a[sortKey] ?? -Infinity, bv = b[sortKey] ?? -Infinity;
+    return sortDir === "asc" ? av - bv : bv - av;
+  });
+
+  const groupLabel = ANALYSIS_GROUP_OPTIONS.find((o) => o.id === groupBy)?.label || "Category";
+
+  const sortHeader = (key, label) => (
+    <th
+      className="text-right px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap cursor-pointer select-none"
+      onClick={() => { if (sortKey === key) setSortDir(sortDir === "asc" ? "desc" : "asc"); else { setSortKey(key); setSortDir("desc"); } }}
+    >
+      {label} {sortKey === key && (sortDir === "asc" ? "▲" : "▼")}
+    </th>
+  );
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white rounded-lg border border-slate-200 p-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="font-bold text-slate-800 text-base">Category Analysis</h2>
+            <p className="text-xs text-slate-500 mt-0.5 max-w-lg">
+              %Space, %Sales, %Units, and %Profit across every store with a Live planogram, joined against imported Performance data.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-slate-500">Period</label>
+            <select className={inputCls + " w-auto text-xs py-1"} value={periodWeeks} onChange={(e) => setPeriodWeeks(e.target.value === "all" ? "all" : Number(e.target.value))}>
+              {ANALYSIS_PERIODS.map((w) => (
+                <option key={w} value={w} disabled={availableWeeks > 0 && availableWeeks < w}>Last {w} weeks</option>
+              ))}
+              <option value="all">All available</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1.5 mt-3">
+          {ANALYSIS_GROUP_OPTIONS.map((opt) => (
+            <button
+              key={opt.id}
+              onClick={() => setGroupBy(opt.id)}
+              className={`text-xs rounded-full px-3 py-1.5 border font-medium ${groupBy === opt.id ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-300 text-slate-600 hover:bg-slate-50"}`}
+            >
+              By {opt.label}
+            </button>
+          ))}
+          {groupBy !== "category" && categories.length > 0 && (
+            <select className={inputCls + " w-auto text-xs py-1 ml-2"} value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
+              <option value="All">All Categories</option>
+              {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          )}
+        </div>
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="bg-white rounded-lg border border-dashed border-slate-300 p-8 text-center text-sm text-slate-400">
+          No data yet — this needs at least one Live planogram assigned to a store, with matching Performance data imported for the same period.
+        </div>
+      ) : (
+        <div className="bg-white rounded-lg border border-slate-200 overflow-hidden overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 border-b border-slate-200">
+              <tr>
+                <th className="text-left px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">{groupLabel}</th>
+                {sortHeader("pctSpace", "% Space")}
+                {sortHeader("pctUnits", "% Units")}
+                {sortHeader("pctSales", "% Sales")}
+                {sortHeader("pctProfit", "% Profit")}
+                {sortHeader("salesToSpaceIndex", "Sales/Space Index")}
+              </tr>
+            </thead>
+            <tbody>
+              {sortedRows.map((r) => (
+                <tr key={r.key} className="border-b border-slate-100 last:border-0 hover:bg-slate-50">
+                  <td className="px-3 py-2 font-medium text-slate-800 whitespace-nowrap">{r.label}</td>
+                  <td className="px-3 py-2 text-right font-mono">{r.pctSpace.toFixed(1)}%</td>
+                  <td className="px-3 py-2 text-right font-mono">{r.pctUnits.toFixed(1)}%</td>
+                  <td className="px-3 py-2 text-right font-mono">{r.pctSales.toFixed(1)}%</td>
+                  <td className="px-3 py-2 text-right font-mono">{r.pctProfit.toFixed(1)}%</td>
+                  <td className={`px-3 py-2 text-right font-mono font-semibold ${r.salesToSpaceIndex == null ? "text-slate-300" : r.salesToSpaceIndex >= 105 ? "text-emerald-600" : r.salesToSpaceIndex <= 95 ? "text-red-500" : "text-slate-600"}`}>
+                    {r.salesToSpaceIndex == null ? "—" : r.salesToSpaceIndex.toFixed(0)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot className="bg-slate-50 border-t border-slate-200">
+              <tr>
+                <td className="px-3 py-2 font-bold text-slate-700">Total</td>
+                <td className="px-3 py-2 text-right font-mono font-bold">100.0%</td>
+                <td className="px-3 py-2 text-right font-mono font-bold">100.0%</td>
+                <td className="px-3 py-2 text-right font-mono font-bold">100.0%</td>
+                <td className="px-3 py-2 text-right font-mono font-bold">100.0%</td>
+                <td className="px-3 py-2 text-right font-mono text-slate-300">—</td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      )}
+
+      <div className="bg-white rounded-lg border border-slate-200 p-3 text-[11px] text-slate-400 space-y-1">
+        <p><span className="font-semibold text-slate-500">Sales/Space Index</span> = %Sales ÷ %Space × 100. Above 100 means {groupLabel.toLowerCase()} sells more than its shelf space would suggest; below 100 means it's over-spaced relative to its sales.</p>
+        <p>Space is estimated from each product's placed width × facings (× squeeze factor), summed across every Live planogram's assigned stores — the same footprint math the shelf editor itself uses. Pegboard and Hook Rail placements use the same estimate since they don't pack linearly.</p>
+      </div>
+    </div>
+  );
+}
+
 function PerformanceModule({ products, performance, stores, productSchema, primaryKeyField, onSaveProductPerformance, onDeleteProductPerformance, onClearAllPerformance }) {
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [importStatus, setImportStatus] = useState(null);
@@ -2821,7 +3086,6 @@ const HELP_SECTIONS = [
         "**My Activities** — those same planograms with an execution status badge",
         "**Task Management**",
         "**Store Feedback**",
-        "**Orders**",
         "**Photo Collection**",
       ] },
       { type: "p", text: "Execution status runs **New → Reviewed → In Progress → Partially Completed / Completed / Rejected.** Opening a planogram's instructions auto-advances New to Reviewed; an associate can then mark it Complete, Partially Completed, or Reject (with a reason) — Completed also promotes the planogram to Live. A completed or rejected item can be reopened back to In Progress." },
@@ -2829,7 +3093,6 @@ const HELP_SECTIONS = [
       { type: "p", text: "**Store Feedback** reports a structured issue (Fixture Mismatch, Physical Obstruction, Shelf Overfilled, Delayed Shipment, Other) plus free text against a planogram." },
       { type: "p", text: "**Task Management** is the store's own operational to-do list, with a customizable task-type set (defaults: Inventory Audit, Pricing Audit, Fronting and Facing, Restocking, Damaged Good Processing, Other)." },
       { type: "p", text: "**Photo Collection** uploads a photo tagged with Category, \"Photo Represents\" (Compliance Photo, Issue, or Request), and Execution Date, browsable with a Grid/List toggle." },
-      { type: "note", text: "Orders is not yet built — it currently shows a \"coming in a future update\" placeholder." },
     ],
   },
   {
@@ -2837,6 +3100,16 @@ const HELP_SECTIONS = [
     title: "Performance",
     blocks: [
       { type: "p", text: "The Performance tab imports per-product, per-store sales data (its own Excel template and upload, matched by SKU or UPC) and feeds the sales, margin, and unit-profit figures used by Tandom's analysis tools." },
+    ],
+  },
+  {
+    id: "categoryAnalysis",
+    title: "Analysis — Category Analysis",
+    blocks: [
+      { type: "p", text: "Shows how a category is performing across the whole chain — **%Space**, **%Sales**, **%Units**, and **%Profit** — by joining every Live, store-assigned planogram against imported Performance data." },
+      { type: "p", text: "Pick a **Period** (4/13/26/52 weeks, or all available Performance history), then break the numbers down **By Category**, **By Brand**, **By Manufacturer**, **By Store**, **By Region**, or **By Store Format**. When breaking down by anything other than Category, an optional Category filter narrows the view to just that category." },
+      { type: "p", text: "**Sales/Space Index** = %Sales ÷ %Space × 100. Above 100 means that row is selling more than its shelf space would suggest; below 100 means it's over-spaced relative to its sales — a quick flag for space that could be reallocated." },
+      { type: "note", text: "%Space is estimated from each placed product's width × facings (× squeeze factor), summed across every Live planogram's assigned stores — the same footprint math the shelf editor itself uses. Pegboard and Hook Rail placements use the same width-based estimate since they don't pack linearly the way a shelf does, so treat their %Space as a close approximation rather than an exact footprint." },
     ],
   },
   {
@@ -7854,7 +8127,6 @@ const STORE_ASSISTANT_NAV = [
   { id: "myActivities", label: "My Activities", icon: Layers },
   { id: "taskManagement", label: "Task Management", icon: Check },
   { id: "storeFeedback", label: "Store Feedback", icon: AlertTriangle },
-  { id: "orders", label: "Orders", icon: Package },
   { id: "photoCollection", label: "Photo Collection", icon: ImageIcon },
 ];
 
@@ -7902,7 +8174,6 @@ function StoreAssistantModule({ stores, planograms, products, fixtures, selected
         {section === "myActivities" && <MyActivitiesView store={store} planograms={planograms} products={products} fixtures={fixtures} onSetExecutionStatus={onSetExecutionStatus} onCompleteExecution={onCompleteExecution} onMarkReviewed={onMarkReviewed} onToggleItemCheck={onToggleItemCheck} onAddIssue={onAddIssue} />}
         {section === "taskManagement" && <TaskManagementView store={store} taskTypes={taskTypes} onAddTask={onAddTask} onUpdateTask={onUpdateTask} onDeleteTask={onDeleteTask} onUpdateTaskTypes={onUpdateTaskTypes} />}
         {section === "storeFeedback" && <StoreFeedbackViewSA store={store} planograms={planograms} />}
-        {section === "orders" && <StoreAssistantComingSoon title="Orders" />}
         {section === "photoCollection" && <PhotoCollectionView store={store} planograms={planograms} onAddPhoto={onAddPhoto} onDeletePhoto={onDeletePhoto} />}
       </div>
     </div>
@@ -8899,6 +9170,7 @@ function AppContent({ session }) {
           <TabButton active={tab === "fixtures"} onClick={() => setTab("fixtures")} icon={Boxes}>Fixtures</TabButton>
           <TabButton active={tab === "stores"} onClick={() => setTab("stores")} icon={Store}>Stores</TabButton>
           <TabButton active={tab === "performance"} onClick={() => setTab("performance")} icon={TrendingUp}>Performance</TabButton>
+          <TabButton active={tab === "analysis"} onClick={() => setTab("analysis")} icon={BarChart3}>Analysis</TabButton>
           <TabButton active={tab === "storeFeedback"} onClick={() => setTab("storeFeedback")} icon={AlertTriangle}>Store Feedback</TabButton>
           <TabButton active={tab === "schema"} onClick={() => setTab("schema")} icon={Settings2}>Settings</TabButton>
           <TabButton active={tab === "help"} onClick={() => setTab("help")} icon={HelpCircle}>Help</TabButton>
@@ -8975,6 +9247,14 @@ function AppContent({ session }) {
             onSaveProductPerformance={savePerformanceForProduct}
             onDeleteProductPerformance={deletePerformanceForProduct}
             onClearAllPerformance={clearAllPerformance}
+          />
+        ) : tab === "analysis" ? (
+          <CategoryAnalysisModule
+            products={products}
+            planograms={planograms}
+            stores={stores}
+            performance={performance}
+            productSchema={productSchema}
           />
         ) : tab === "storeFeedback" ? (
           <StoreFeedbackView planograms={planograms} onResolveIssue={resolvePlanogramIssue} onOpenPlanogram={setActivePlanogramId} />
