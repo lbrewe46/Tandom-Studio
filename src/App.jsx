@@ -5,7 +5,7 @@ import {
   RotateCw, X, Layers, Package, Boxes, Ruler, ArrowLeft, Check, Grid3x3,
   Pencil, Save, AlertTriangle, RefreshCw, Download, Upload, FileSpreadsheet, CalendarDays, TrendingUp,
   Maximize2, Minimize2, Store, ChevronDown, ChevronUp, AlignLeft, AlignCenter, AlignRight, Search, Eye, Printer, Copy,
-  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair
+  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe
 } from "lucide-react";
 import {
   supabase, supabaseConfigured, pendingWriteListeners,
@@ -301,6 +301,57 @@ async function matchProductImagesFromRepo(product, repo, schema) {
     if (found) { images[o.id] = found; matchedCount++; }
   }
   return { images, matchedCount };
+}
+
+/* ------------------------------------------------------------------ */
+/* Web (UPC lookup API) image lookup — a second, independent image      */
+/* source for when the Image Repository above has nothing for a         */
+/* product yet, e.g. right after import when nobody has sourced images  */
+/* for it. Public UPC-lookup APIs return one generic product photo per  */
+/* item, not per-orientation views, so this only ever fills "front" —   */
+/* the other five orientations still come from the Repository or a      */
+/* manual upload.                                                       */
+/* ------------------------------------------------------------------ */
+
+const DEFAULT_UPC_LOOKUP = {
+  enabled: false,
+  apiKey: "", // optional — blank uses UPCitemdb's shared free trial endpoint (rate-limited to a
+  // small number of lookups/day); a paid key removes that limit and is sent as the user_key header
+};
+
+class UpcApiRateLimitError extends Error {}
+class UpcApiNetworkError extends Error {}
+
+async function lookupUpcApiImage(upc, apiKey) {
+  if (!upc) return null;
+  const url = apiKey
+    ? `https://api.upcitemdb.com/prod/v1/lookup?upc=${encodeURIComponent(upc)}`
+    : `https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(upc)}`;
+  let res;
+  try {
+    res = await fetch(url, apiKey ? { headers: { user_key: apiKey, key_type: "3scale" } } : undefined);
+  } catch (e) {
+    // the request never reached the API at all (offline, blocked, CORS) — distinct from a normal
+    // "not found" so a bulk backfill can stop immediately instead of retrying every product
+    throw new UpcApiNetworkError("Couldn't reach the UPC lookup API.");
+  }
+  if (res.status === 429) throw new UpcApiRateLimitError("Rate limited by the UPC lookup API.");
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  const image = data?.items?.[0]?.images?.[0];
+  return image || null;
+}
+
+// Fills only the "front" image, and only if it's currently missing. Returns {images, matched}.
+// Throws UpcApiRateLimitError / UpcApiNetworkError so a bulk loop can distinguish "stop now" from
+// "this one product just had no match."
+async function matchProductImageFromUpcApi(product, schema, apiKey) {
+  if (product.images?.front) return { images: product.images, matched: false };
+  const upc = (getAttrByLabel(product, schema, ["upc"]) || "").trim();
+  if (!upc) return { images: product.images, matched: false };
+  const url = await lookupUpcApiImage(upc, apiKey);
+  if (!url) return { images: product.images, matched: false };
+  return { images: { ...product.images, front: url }, matched: true };
 }
 
 const inputCls =
@@ -721,11 +772,13 @@ function SchemaEditor({ title, schema, onChange, max }) {
 /* Orientation image picker for a product                              */
 /* ------------------------------------------------------------------ */
 
-function OrientationImages({ images, onChange, repo, lookupKey }) {
+function OrientationImages({ images, onChange, repo, lookupKey, upcLookup, upc }) {
   const fileInputs = useRef({});
   const [urlDrafts, setUrlDrafts] = useState({});
   const [matching, setMatching] = useState(false);
   const [matchMsg, setMatchMsg] = useState(null);
+  const [matchingWeb, setMatchingWeb] = useState(false);
+  const [webMatchMsg, setWebMatchMsg] = useState(null);
 
   const handleFile = (orientationId, file) => {
     if (!file) return;
@@ -760,16 +813,45 @@ function OrientationImages({ images, onChange, repo, lookupKey }) {
     }
   };
 
+  const matchFromWeb = async () => {
+    if (!upcLookup?.enabled || !upc) return;
+    setMatchingWeb(true);
+    setWebMatchMsg(null);
+    try {
+      const url = await lookupUpcApiImage(upc, upcLookup.apiKey);
+      if (url) {
+        onChange({ ...images, front: url });
+        setWebMatchMsg("Found a front image.");
+      } else {
+        setWebMatchMsg("No image found on the web for that UPC.");
+      }
+    } catch (e) {
+      setWebMatchMsg(e instanceof UpcApiRateLimitError ? "The UPC lookup API's rate limit was hit — try again in a bit." : "Couldn't reach the UPC lookup API.");
+    } finally {
+      setMatchingWeb(false);
+    }
+  };
+
   return (
     <div>
-      {repo?.enabled && (
-        <div className="flex items-center gap-2 mb-2">
-          <button type="button" className={btnGhost} disabled={matching || !lookupKey} onClick={matchFromRepo}>
-            {matching ? <RefreshCw size={13} className="animate-spin" /> : <Search size={13} />}
-            {matching ? "Matching…" : "Match from Repository"}
-          </button>
-          {!lookupKey && <span className="text-xs text-slate-400">Set a SKU/UPC first to enable lookup.</span>}
+      {(repo?.enabled || upcLookup?.enabled) && (
+        <div className="flex flex-wrap items-center gap-2 mb-2">
+          {repo?.enabled && (
+            <button type="button" className={btnGhost} disabled={matching || !lookupKey} onClick={matchFromRepo}>
+              {matching ? <RefreshCw size={13} className="animate-spin" /> : <Search size={13} />}
+              {matching ? "Matching…" : "Match from Repository"}
+            </button>
+          )}
+          {upcLookup?.enabled && (
+            <button type="button" className={btnGhost} disabled={matchingWeb || !upc || !!images.front} onClick={matchFromWeb}>
+              {matchingWeb ? <RefreshCw size={13} className="animate-spin" /> : <Globe size={13} />}
+              {matchingWeb ? "Searching…" : images.front ? "Front already set" : "Find on Web (UPC)"}
+            </button>
+          )}
+          {repo?.enabled && !lookupKey && <span className="text-xs text-slate-400">Set a SKU/UPC first to enable repository lookup.</span>}
+          {upcLookup?.enabled && !upc && <span className="text-xs text-slate-400">Set a UPC first to enable web lookup.</span>}
           {matchMsg && <span className="text-xs text-slate-500">{matchMsg}</span>}
+          {webMatchMsg && <span className="text-xs text-slate-500">{webMatchMsg}</span>}
         </div>
       )}
       <div className="grid grid-cols-3 gap-3">
@@ -904,7 +986,7 @@ function MerchStylesEditor({ merchStyles, onChange }) {
   );
 }
 
-function ProductForm({ schema, initial, primaryKeyField, imageRepo, onSave, onCancel }) {
+function ProductForm({ schema, initial, primaryKeyField, imageRepo, upcLookup, onSave, onCancel }) {
   const [name, setName] = useState(initial?.name || "");
   const [sku, setSku] = useState(initial?.sku || "");
   const [dims, setDims] = useState(initial?.dims || { w: 3, h: 6, d: 3 });
@@ -917,6 +999,9 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, onSave, onCa
   const [pendingApproval, setPendingApproval] = useState(!!initial?.pendingApproval);
 
   const lookupKey = getPrimaryKeyValueRaw({ sku, attributes }, schema, imageRepo?.keyField || "upc");
+  // the web (UPC API) lookup always needs an actual UPC, independent of whatever field the
+  // Image Repository above is currently keyed on
+  const upcValue = (getAttrByLabel({ attributes }, schema, ["upc"]) || "").trim();
 
   const save = () => {
     if (!name.trim()) return;
@@ -1009,7 +1094,7 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, onSave, onCa
 
       <div>
         <label className={labelCls}>Orientation Images</label>
-        <OrientationImages images={images} onChange={setImages} repo={imageRepo} lookupKey={lookupKey} />
+        <OrientationImages images={images} onChange={setImages} repo={imageRepo} lookupKey={lookupKey} upcLookup={upcLookup} upc={upcValue} />
       </div>
 
       <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
@@ -1419,7 +1504,7 @@ function ProductColumnsPopover({ schema, visibleColumns, onToggle, onReorder, on
   );
 }
 
-function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate, onUpdate, onDelete }) {
+function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLookup, onCreate, onUpdate, onDelete }) {
   const [editing, setEditing] = useState(null); // null | "new" | product
   const [importStatus, setImportStatus] = useState(null); // {type:'ok'|'error', message}
   const [importing, setImporting] = useState(false);
@@ -1427,6 +1512,9 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate
   const [matchingRepo, setMatchingRepo] = useState(false);
   const [matchProgress, setMatchProgress] = useState(null);
   const [matchStatus, setMatchStatus] = useState(null);
+  const [matchingWeb, setMatchingWeb] = useState(false);
+  const [webMatchProgress, setWebMatchProgress] = useState(null);
+  const [webMatchStatus, setWebMatchStatus] = useState(null);
   const [viewMode, setViewMode] = useState("grid"); // grid | list
   const [visibleColumns, setVisibleColumns] = useState(DEFAULT_PRODUCT_LIST_COLUMNS);
   const [columnsPickerOpen, setColumnsPickerOpen] = useState(false);
@@ -1559,6 +1647,45 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate
     });
   };
 
+  // Backfills the "front" image (the only view a UPC-lookup API can reliably return) for every
+  // product that's missing one and has a UPC on file — the case that motivated this: images
+  // aren't always ready when a planogram is first built, so this fills the gaps after the fact,
+  // same as "Match Images from Repository" does for the internal repo.
+  const matchAllFromWeb = async () => {
+    if (!upcLookup?.enabled) return;
+    const targets = products.filter((p) => !p.images?.front && (getAttrByLabel(p, schema, ["upc"]) || "").trim());
+    if (targets.length === 0) { setWebMatchStatus({ type: "ok", message: "Every product either already has a front image or has no UPC to look up." }); return; }
+    setMatchingWeb(true);
+    setWebMatchStatus(null);
+    setWebMatchProgress({ current: 0, total: targets.length });
+    let productsMatched = 0;
+    let stoppedEarly = null;
+    for (let i = 0; i < targets.length; i++) {
+      const p = targets[i];
+      try {
+        const { images, matched } = await matchProductImageFromUpcApi(p, schema, upcLookup.apiKey);
+        if (matched) { onUpdate({ ...p, images }); productsMatched++; }
+      } catch (e) {
+        stoppedEarly = e instanceof UpcApiRateLimitError ? "the API's rate limit was hit" : "the API couldn't be reached";
+        break;
+      }
+      setWebMatchProgress({ current: i + 1, total: targets.length });
+      // the free trial endpoint is rate-limited per minute — a short delay between requests keeps
+      // a bulk backfill from tripping that limit after just a handful of products
+      if (i < targets.length - 1) await new Promise((res) => setTimeout(res, 1200));
+    }
+    setMatchingWeb(false);
+    setWebMatchProgress(null);
+    setWebMatchStatus({
+      type: stoppedEarly ? "error" : "ok",
+      message: stoppedEarly
+        ? `Matched ${productsMatched} image${productsMatched !== 1 ? "s" : ""} before stopping — ${stoppedEarly}. Products still missing an image were left alone, so running this again later picks up where it left off.`
+        : productsMatched > 0
+          ? `Matched ${productsMatched} front image${productsMatched !== 1 ? "s" : ""} from the web.`
+          : "No matches found on the web for any product missing a front image.",
+    });
+  };
+
   const handleFileChosen = async (file) => {
     if (!file) return;
     setImporting(true);
@@ -1618,6 +1745,7 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate
         initial={editing === "new" ? null : editing}
         primaryKeyField={primaryKeyField}
         imageRepo={imageRepo}
+        upcLookup={upcLookup}
         onCancel={() => setEditing(null)}
         onSave={(p) => {
           editing === "new" ? onCreate(p) : onUpdate(p);
@@ -1681,11 +1809,22 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, onCreate
               {matchingRepo && matchProgress ? `Matching ${matchProgress.current}/${matchProgress.total}…` : "Match Images from Repository"}
             </button>
           )}
+          {upcLookup?.enabled && (
+            <button className={btnGhost} disabled={matchingWeb} onClick={matchAllFromWeb}>
+              {matchingWeb ? <RefreshCw size={14} className="animate-spin" /> : <Globe size={14} />}
+              {matchingWeb && webMatchProgress ? `Searching ${webMatchProgress.current}/${webMatchProgress.total}…` : "Backfill Missing Images from Web"}
+            </button>
+          )}
         </div>
       </div>
       {matchStatus && (
         <div className={`text-sm rounded-md px-3 py-2 mb-3 ${matchStatus.type === "ok" ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
           {matchStatus.message}
+        </div>
+      )}
+      {webMatchStatus && (
+        <div className={`text-sm rounded-md px-3 py-2 mb-3 ${webMatchStatus.type === "ok" ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
+          {webMatchStatus.message}
         </div>
       )}
       <p className="text-xs text-slate-400 mb-3 flex items-center gap-1.5">
@@ -4159,6 +4298,13 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
     >
       <div
         draggable={!readOnly}
+        // a product is natively draggable (HTML5 DnD) unconditionally, which — if a Ctrl/Cmd+drag
+        // for rubberband-select happens to start on/over a product, as it usually will on a
+        // tightly-packed shelf — hijacks the gesture into a native drag before our own
+        // mousemove/mouseup listeners ever see it, silently swallowing the rubberband. Suppressing
+        // the native drag start specifically while Ctrl/Cmd is held lets the mousedown fall
+        // through normally instead, so the section's rubberband handler gets it.
+        onMouseDown={readOnly ? undefined : (e) => { if (e.ctrlKey || e.metaKey) e.preventDefault(); }}
         onDragStart={readOnly ? undefined : (e) => { e.stopPropagation(); onDragStartPlacement(e, placement); }}
         onDragEnd={readOnly ? undefined : (e) => { e.stopPropagation(); onDragEndPlacement(); }}
         onClick={readOnly ? undefined : (e) => { e.stopPropagation(); onSelect(placement.id); }}
@@ -4264,6 +4410,10 @@ function FixtureBar({
         } else {
           onDragCommit(d.currentNotch);
         }
+        // a completed drag — grouped or not — ends the current multi-select; leaving it set would
+        // keep showing a stale blue ring on whatever was last grouped, even once the user moves on
+        // to selecting/dragging something else entirely
+        onClearGroupSelection && onClearGroupSelection();
         onSelectFixture(fx.id);
       } else {
         onSelectFixture(fx.id);
@@ -4542,6 +4692,9 @@ function PegboardPanel({
       if (d.moved) {
         if (groupSelected && onDragCommitGroup) onDragCommitGroup(d.currentNotch - d.startNotch);
         else onDragCommit(d.currentNotch);
+        // a completed drag — grouped or not — ends the current multi-select; leaving it set would
+        // keep showing a stale blue ring on whatever was last grouped
+        onClearGroupSelection && onClearGroupSelection();
         onSelectFixture(fx.id);
       } else onSelectFixture(fx.id);
     }
@@ -7845,6 +7998,7 @@ function AppContent({ session }) {
   const [fixtureSchema, setFixtureSchema] = useState(DEFAULT_FIXTURE_SCHEMA);
   const [primaryKeyField, setPrimaryKeyField] = useState("sku"); // "sku" | "upc" — global product matching key
   const [imageRepo, setImageRepo] = useState(DEFAULT_IMAGE_REPO);
+  const [upcLookup, setUpcLookup] = useState(DEFAULT_UPC_LOOKUP);
   const [capacityWarningsEnabled, setCapacityWarningsEnabled] = useState(true);
   const [products, setProducts] = useState([]);
   const [fixtures, setFixtures] = useState([]);
@@ -7878,11 +8032,12 @@ function AppContent({ session }) {
 
     (async () => {
       try {
-        const [pSchema, fSchema, pkField, imgRepo, capWarn, prods, fixs, pogs, perf, strs, savedMode, savedStoreId, savedEvents, savedEventTypes, savedTaskTypes] = await Promise.all([
+        const [pSchema, fSchema, pkField, imgRepo, upcLk, capWarn, prods, fixs, pogs, perf, strs, savedMode, savedStoreId, savedEvents, savedEventTypes, savedTaskTypes] = await Promise.all([
           safeGet("schema:product"),
           safeGet("schema:fixture"),
           safeGet("settings:primaryKeyField"),
           safeGet("settings:imageRepo"),
+          safeGet("settings:upcLookup"),
           safeGet("settings:capacityWarnings"),
           loadIndexed("product"),
           loadIndexed("fixture"),
@@ -7900,6 +8055,7 @@ function AppContent({ session }) {
         if (fSchema) setFixtureSchema(JSON.parse(fSchema));
         if (pkField) setPrimaryKeyField(pkField);
         if (imgRepo) setImageRepo({ ...DEFAULT_IMAGE_REPO, ...JSON.parse(imgRepo) });
+        if (upcLk) setUpcLookup({ ...DEFAULT_UPC_LOOKUP, ...JSON.parse(upcLk) });
         if (capWarn !== null) setCapacityWarningsEnabled(capWarn === "true");
         if (savedMode) setAppModeState(savedMode);
         if (savedStoreId) setSelectedStoreIdState(savedStoreId);
@@ -7961,6 +8117,13 @@ function AppContent({ session }) {
     setImageRepo((prev) => {
       const next = { ...prev, ...patch };
       safeSet("settings:imageRepo", JSON.stringify(next));
+      return next;
+    });
+  };
+  const updateUpcLookup = (patch) => {
+    setUpcLookup((prev) => {
+      const next = { ...prev, ...patch };
+      safeSet("settings:upcLookup", JSON.stringify(next));
       return next;
     });
   };
@@ -8491,6 +8654,7 @@ function AppContent({ session }) {
             products={products}
             primaryKeyField={primaryKeyField}
             imageRepo={imageRepo}
+            upcLookup={upcLookup}
             onCreate={createProduct}
             onUpdate={updateProductEntity}
             onDelete={deleteProductEntity}
@@ -8642,6 +8806,36 @@ function AppContent({ session }) {
               </p>
               <p className="text-[11px] text-slate-400 mt-1">
                 Local folder: drop image files into this project's <code>public/product-images/</code> folder — Vite serves everything there automatically at <code>/product-images/…</code>. Cloud: set Base URL to any public HTTPS location using the same naming convention.
+              </p>
+            </div>
+
+            <div className="bg-white rounded-lg border border-slate-200 p-4">
+              <div className="flex items-center justify-between mb-1">
+                <h3 className="font-bold text-slate-800 text-sm">Web Image Lookup (UPC API)</h3>
+                <label className="flex items-center gap-1.5 text-xs text-slate-600">
+                  <input type="checkbox" className="accent-amber-500 w-3.5 h-3.5" checked={upcLookup.enabled} onChange={(e) => updateUpcLookup({ enabled: e.target.checked })} />
+                  Enabled
+                </label>
+              </div>
+              <p className="text-xs text-slate-500 mb-3">
+                When a product has no image yet, look up its UPC against a public product database (UPCitemdb) and use whatever photo it returns. Unlike the Image Repository above, this only ever fills the <span className="font-semibold text-slate-600">Front</span> view — public lookups return one generic product photo, not per-orientation shots — so it's meant to get a usable image in place quickly, with the other five views still coming from the repository or a manual upload.
+              </p>
+              <Field label="API Key (optional)">
+                <input
+                  className={inputCls}
+                  value={upcLookup.apiKey}
+                  onChange={(e) => updateUpcLookup({ apiKey: e.target.value })}
+                  placeholder="Leave blank to use the free shared trial endpoint (rate-limited)"
+                />
+              </Field>
+              <p className="text-[11px] text-slate-400 mt-2">
+                Without a key, lookups go through UPCitemdb's free trial endpoint, which is rate-limited (a small number of lookups per day, shared across everyone using it without a key) — fine for occasional use or testing, but a bulk backfill across many products may run into that limit and stop partway through; run it again later to pick up where it left off. A paid API key removes that limit.
+              </p>
+              <p className="text-[11px] text-slate-400 mt-1">
+                The key is stored and used directly in the browser — this app has no backend server of its own to call the API from on its behalf, so anyone with browser access to this app can see it. Fine for a free-tier key; for a paid key, weigh that against how much exposure you're comfortable with.
+              </p>
+              <p className="text-[11px] text-slate-400 mt-1">
+                Both an "on save" lookup (in the product editor, next to Orientation Images) and a bulk "Backfill Missing Images from Web" action (in the Product Library toolbar) are available once this is enabled.
               </p>
             </div>
 
