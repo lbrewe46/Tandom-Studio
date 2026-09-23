@@ -331,6 +331,39 @@ const DEFAULT_UPC_LOOKUP = {
   extensions: "", // blank — this CDN serves the image directly at this path, no file extension
 };
 
+// Kroger's image CDN keys images by a 13-digit code: the 10-digit "item reference" core of a UPC,
+// zero-padded up front to 13. A standard 12-digit UPC-A is [number-system digit][10-digit item
+// reference][check digit], so getting to that 10-digit core means dropping the leading digit from
+// an 11-digit code, or both the leading and trailing digit from a 12-digit code. A 13-digit input
+// is assumed to already be in the CDN's expected form and is used as-is.
+function normalizeUpcForKrogerCdn(upc) {
+  const digits = (upc || "").replace(/\D/g, "");
+  if (!digits) return "";
+  if (digits.length === 13) return digits;
+  let core;
+  if (digits.length === 10) core = digits;
+  else if (digits.length === 11) core = digits.slice(1);
+  else if (digits.length === 12) core = digits.slice(1, -1);
+  else core = digits.length > 10 ? digits.slice(-10) : digits.padStart(10, "0"); // best-effort for anything else
+  return "000" + core;
+}
+
+// Same shape as matchProductImagesFromRepo, but always keyed on UPC (this CDN has no notion of a
+// SKU-based lookup) and runs the UPC through normalizeUpcForKrogerCdn first.
+async function matchProductImagesFromWebCdn(product, repo, schema) {
+  const rawUpc = getPrimaryKeyValueRaw(product, schema, "upc");
+  const key = normalizeUpcForKrogerCdn(rawUpc);
+  const images = { ...product.images };
+  let matchedCount = 0;
+  if (!key) return { images, matchedCount };
+  for (const o of ORIENTATIONS) {
+    if (images[o.id]) continue;
+    const found = await findRepositoryImage(repo, key, o.id);
+    if (found) { images[o.id] = found; matchedCount++; }
+  }
+  return { images, matchedCount };
+}
+
 const inputCls =
   "w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-amber-400 focus:border-amber-400";
 const labelCls = "block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1";
@@ -795,11 +828,12 @@ function OrientationImages({ images, onChange, repo, lookupKey, upcLookup, upc }
     setMatchingWeb(true);
     setWebMatchMsg(null);
     try {
+      const key = normalizeUpcForKrogerCdn(upc);
       const found = {};
       let count = 0;
       for (const o of ORIENTATIONS) {
         if (images[o.id]) continue;
-        const url = await findRepositoryImage(upcLookup, upc, o.id);
+        const url = await findRepositoryImage(upcLookup, key, o.id);
         if (url) { found[o.id] = url; count++; }
       }
       if (count > 0) onChange({ ...images, ...found });
@@ -1639,7 +1673,7 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
     let imagesMatched = 0;
     for (let i = 0; i < targets.length; i++) {
       const p = targets[i];
-      const { images, matchedCount } = await matchProductImagesFromRepo(p, upcLookup, schema);
+      const { images, matchedCount } = await matchProductImagesFromWebCdn(p, upcLookup, schema);
       if (matchedCount > 0) {
         onUpdate({ ...p, images });
         productsMatched++;
@@ -8823,9 +8857,12 @@ function AppContent({ session }) {
                 </div>
               </div>
               <p className="text-[11px] text-slate-400 mt-2">
-                Example: UPC <code>0001300000466</code>, Front view → tries
-                <code className="mx-1">{upcLookup.baseUrl}{(upcLookup.pattern || "{orientation}/{key}").replace("{key}", "0001300000466").replace("{orientation}", "front")}{(upcLookup.extensions || "").split(",")[0]?.trim() ? `.${upcLookup.extensions.split(",")[0].trim()}` : ""}</code>.
-                {ORIENTATIONS.length > 1 && " The same pattern is tried for all 6 orientations — front, back, top, bottom, left, right — filling in whichever ones the retailer happens to have."}
+                Example: 12-digit UPC <code>013000004668</code> normalizes to <code>{normalizeUpcForKrogerCdn("013000004668")}</code> (Kroger's CDN keys images by a 13-digit code — the UPC's number-system and check digits dropped, zero-padded back to 13), then Front view → tries
+                <code className="mx-1">{upcLookup.baseUrl}{(upcLookup.pattern || "{orientation}/{key}").replace("{key}", normalizeUpcForKrogerCdn("013000004668")).replace("{orientation}", "front")}{(upcLookup.extensions || "").split(",")[0]?.trim() ? `.${upcLookup.extensions.split(",")[0].trim()}` : ""}</code>.
+                {ORIENTATIONS.length > 1 && " The same normalized key is tried for all 6 orientations — front, back, top, bottom, left, right — filling in whichever ones the retailer happens to have."}
+              </p>
+              <p className="text-[11px] text-slate-400 mt-1">
+                This UPC-to-key normalization is specific to Kroger's own image CDN convention — if you point Base URL at a different retailer's pattern instead, this conversion may no longer be the right one.
               </p>
               <p className="text-[11px] text-slate-400 mt-1">
                 This is a best-effort guess at an undocumented URL pattern, not an official API — a retailer can change or block it at any time without notice. Worth keeping the Image Repository above as your primary, reliable source and treating this as a convenience for filling gaps.
