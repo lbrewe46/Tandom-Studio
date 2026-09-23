@@ -2945,6 +2945,270 @@ function CategoryAnalysisModule({ products, planograms, stores, performance, pro
   );
 }
 
+// Which planogram categories currently have Live coverage at which stores — one row per
+// Category (as set on the planogram itself, not the product), counting how many of the store
+// list currently have at least one Live planogram of that category assigned.
+function buildCategoryCoverageRows(planograms, stores) {
+  const categories = Array.from(new Set(planograms.map((p) => (p.category || "").trim()).filter(Boolean))).sort();
+  const liveStoreIdsByCategory = {};
+  planograms.forEach((pg) => {
+    if (effectivePlanogramStatus(pg) !== "live") return;
+    const cat = (pg.category || "").trim();
+    if (!cat) return;
+    if (!liveStoreIdsByCategory[cat]) liveStoreIdsByCategory[cat] = new Set();
+    (pg.storeIds || []).forEach((id) => liveStoreIdsByCategory[cat].add(id));
+  });
+  return categories.map((category) => {
+    const coveredIds = liveStoreIdsByCategory[category] || new Set();
+    const missingStores = stores.filter((s) => !coveredIds.has(s.id));
+    return {
+      category,
+      totalStores: stores.length,
+      coveredCount: stores.length - missingStores.length,
+      missingCount: missingStores.length,
+      coveragePct: stores.length > 0 ? ((stores.length - missingStores.length) / stores.length) * 100 : 0,
+      missingStores,
+    };
+  });
+}
+
+// Products that don't appear in a single placement on any planogram whose effective status is
+// Live, Pending, or WIP (Approved and Historical don't count) — i.e. sitting in the library
+// completely unused right now.
+function buildOrphanProducts(planograms, products) {
+  const activeStatuses = new Set(["live", "pending", "wip"]);
+  const usedIds = new Set();
+  planograms.forEach((pg) => {
+    if (!activeStatuses.has(effectivePlanogramStatus(pg))) return;
+    (pg.sections || []).forEach((section) => {
+      (section.fixtures || []).forEach((fx) => {
+        (fx.placements || []).forEach((pl) => usedIds.add(pl.productId));
+      });
+    });
+  });
+  return products.filter((p) => !usedIds.has(p.id));
+}
+
+function CoverageGapsModule({ products, planograms, stores, productSchema }) {
+  const [storeSearch, setStoreSearch] = useState("");
+  const [expandedCategory, setExpandedCategory] = useState(null);
+  const [productSearch, setProductSearch] = useState("");
+  const [productSortKey, setProductSortKey] = useState("name");
+  const [productSortDir, setProductSortDir] = useState("asc");
+
+  const liveCountByStore = React.useMemo(() => {
+    const map = {};
+    planograms.forEach((pg) => {
+      if (effectivePlanogramStatus(pg) !== "live") return;
+      (pg.storeIds || []).forEach((id) => { map[id] = (map[id] || 0) + 1; });
+    });
+    return map;
+  }, [planograms]);
+
+  const storesByRegion = React.useMemo(() => {
+    const q = storeSearch.trim().toLowerCase();
+    const filtered = stores.filter((s) => !q || s.name.toLowerCase().includes(q) || (s.storeNumber || "").toLowerCase().includes(q));
+    const groups = {};
+    filtered.forEach((s) => {
+      const region = s.region || "(No Region)";
+      if (!groups[region]) groups[region] = [];
+      groups[region].push(s);
+    });
+    return Object.entries(groups)
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([region, list]) => ({ region, stores: [...list].sort((a, b) => a.name.localeCompare(b.name)) }));
+  }, [stores, storeSearch]);
+
+  const coverageRows = React.useMemo(() => buildCategoryCoverageRows(planograms, stores), [planograms, stores]);
+
+  const orphanProducts = React.useMemo(() => buildOrphanProducts(planograms, products), [planograms, products]);
+
+  const filteredOrphans = React.useMemo(() => {
+    const q = productSearch.trim().toLowerCase();
+    let rows = orphanProducts.map((p) => ({
+      product: p,
+      category: getAttrByLabel(p, productSchema, ["category"]) || "(Uncategorized)",
+      brand: getAttrByLabel(p, productSchema, ["brand"]) || "",
+    }));
+    if (q) {
+      rows = rows.filter((r) =>
+        r.product.name.toLowerCase().includes(q) ||
+        (r.product.sku || "").toLowerCase().includes(q) ||
+        r.category.toLowerCase().includes(q) ||
+        r.brand.toLowerCase().includes(q)
+      );
+    }
+    rows.sort((a, b) => {
+      const av = productSortKey === "category" ? a.category : productSortKey === "brand" ? a.brand : a.product.name;
+      const bv = productSortKey === "category" ? b.category : productSortKey === "brand" ? b.brand : b.product.name;
+      const cmp = String(av).localeCompare(String(bv));
+      return productSortDir === "asc" ? cmp : -cmp;
+    });
+    return rows;
+  }, [orphanProducts, productSearch, productSortKey, productSortDir, productSchema]);
+
+  const toggleProductSort = (key) => {
+    if (productSortKey === key) setProductSortDir(productSortDir === "asc" ? "desc" : "asc");
+    else { setProductSortKey(key); setProductSortDir("asc"); }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white rounded-lg border border-slate-200 p-4">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <h2 className="font-bold text-slate-800 text-base">Store List by Region</h2>
+          <input className={inputCls + " w-auto text-xs py-1 max-w-[220px]"} placeholder="Search stores…" value={storeSearch} onChange={(e) => setStoreSearch(e.target.value)} />
+        </div>
+        <p className="text-xs text-slate-500 mt-0.5 mb-3">{stores.length} store{stores.length !== 1 ? "s" : ""} total, grouped by Region. The badge shows how many Live planograms are currently assigned to each store.</p>
+        <div className="space-y-4">
+          {storesByRegion.map(({ region, stores: list }) => (
+            <div key={region}>
+              <div className="text-xs font-bold uppercase tracking-wide text-slate-500 mb-1.5">
+                {region} <span className="text-slate-300 font-normal">({list.length})</span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-1.5">
+                {list.map((s) => (
+                  <div key={s.id} className="flex items-center justify-between text-xs rounded-md border border-slate-200 px-2.5 py-1.5">
+                    <span className="truncate">
+                      <span className="font-medium text-slate-700">{s.name}</span>
+                      {s.storeNumber && <span className="text-slate-400"> · #{s.storeNumber}</span>}
+                    </span>
+                    <span className={`ml-2 shrink-0 rounded-full px-1.5 py-0.5 font-semibold ${(liveCountByStore[s.id] || 0) === 0 ? "bg-red-50 text-red-500" : "bg-slate-100 text-slate-500"}`}>
+                      {liveCountByStore[s.id] || 0} live
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+          {storesByRegion.length === 0 && <div className="text-sm text-slate-400 italic text-center py-4">No stores match.</div>}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-lg border border-slate-200 p-4">
+        <h2 className="font-bold text-slate-800 text-base">Stores With No Live Planogram, by Category</h2>
+        <p className="text-xs text-slate-500 mt-0.5 mb-3">For each planogram Category, how many of your {stores.length} stores currently have a Live planogram of that category assigned. Click a row to see which stores are missing it.</p>
+        {coverageRows.length === 0 ? (
+          <div className="text-sm text-slate-400 italic text-center py-4">No planograms have a Category set yet — add one in the planogram editor to track coverage here.</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 border-b border-slate-200">
+                <tr>
+                  <th className="text-left px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Category</th>
+                  <th className="text-right px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Covered</th>
+                  <th className="text-right px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Missing</th>
+                  <th className="text-right px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">Coverage</th>
+                </tr>
+              </thead>
+              <tbody>
+                {coverageRows.map((r) => (
+                  <React.Fragment key={r.category}>
+                    <tr
+                      onClick={() => setExpandedCategory(expandedCategory === r.category ? null : r.category)}
+                      className="border-b border-slate-100 hover:bg-amber-50 cursor-pointer"
+                    >
+                      <td className="px-3 py-2 font-medium text-slate-800 whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1">
+                          {expandedCategory === r.category ? <ChevronDown size={12} className="text-slate-400" /> : <ChevronRight size={12} className="text-slate-300" />}
+                          {r.category}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-right font-mono">{r.coveredCount} / {r.totalStores}</td>
+                      <td className={`px-3 py-2 text-right font-mono font-semibold ${r.missingCount > 0 ? "text-red-500" : "text-emerald-600"}`}>{r.missingCount}</td>
+                      <td className="px-3 py-2 text-right font-mono">{r.coveragePct.toFixed(0)}%</td>
+                    </tr>
+                    {expandedCategory === r.category && (
+                      <tr className="border-b border-slate-100 bg-slate-50">
+                        <td colSpan={4} className="px-3 py-2.5">
+                          {r.missingStores.length === 0 ? (
+                            <div className="text-xs text-emerald-600">Every store has a Live "{r.category}" planogram.</div>
+                          ) : (
+                            <div className="flex flex-wrap gap-1.5">
+                              {r.missingStores.map((s) => (
+                                <span key={s.id} className="text-xs rounded-full px-2 py-0.5 border border-red-200 bg-red-50 text-red-600">
+                                  {s.name}{s.region ? ` · ${s.region}` : ""}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="bg-white rounded-lg border border-slate-200 p-4">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <h2 className="font-bold text-slate-800 text-base">Products Not on Any Active Planogram</h2>
+          <input className={inputCls + " w-auto text-xs py-1 max-w-[220px]"} placeholder="Search products…" value={productSearch} onChange={(e) => setProductSearch(e.target.value)} />
+        </div>
+        <p className="text-xs text-slate-500 mt-0.5 mb-3">
+          {orphanProducts.length} of {products.length} product{products.length !== 1 ? "s" : ""} aren't placed on any Live, Pending, or WIP planogram.
+        </p>
+        {filteredOrphans.length === 0 ? (
+          <div className="text-sm text-slate-400 italic text-center py-4">{orphanProducts.length === 0 ? "Every product is placed on at least one active planogram." : "No matches."}</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 border-b border-slate-200">
+                <tr>
+                  <th className="text-left px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide cursor-pointer select-none whitespace-nowrap" onClick={() => toggleProductSort("name")}>Product</th>
+                  <th className="text-left px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide cursor-pointer select-none whitespace-nowrap" onClick={() => toggleProductSort("category")}>Category</th>
+                  <th className="text-left px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide cursor-pointer select-none whitespace-nowrap" onClick={() => toggleProductSort("brand")}>Brand</th>
+                  <th className="text-left px-3 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">SKU</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredOrphans.map(({ product, category, brand }) => (
+                  <tr key={product.id} className="border-b border-slate-100 last:border-0 hover:bg-slate-50">
+                    <td className="px-3 py-2 font-medium text-slate-800 whitespace-nowrap">{product.name}</td>
+                    <td className="px-3 py-2 text-slate-600 whitespace-nowrap">{category}</td>
+                    <td className="px-3 py-2 text-slate-600 whitespace-nowrap">{brand || "—"}</td>
+                    <td className="px-3 py-2 text-slate-500 font-mono text-xs whitespace-nowrap">{product.sku || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AnalysisModule({ products, planograms, stores, performance, productSchema }) {
+  const [view, setView] = useState("performance"); // "performance" | "coverage"
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-1.5">
+        <button
+          onClick={() => setView("performance")}
+          className={`text-xs rounded-full px-3 py-1.5 border font-medium ${view === "performance" ? "bg-slate-800 border-slate-800 text-white" : "border-slate-300 text-slate-600 hover:bg-slate-50"}`}
+        >
+          Category Performance
+        </button>
+        <button
+          onClick={() => setView("coverage")}
+          className={`text-xs rounded-full px-3 py-1.5 border font-medium ${view === "coverage" ? "bg-slate-800 border-slate-800 text-white" : "border-slate-300 text-slate-600 hover:bg-slate-50"}`}
+        >
+          Coverage &amp; Gaps
+        </button>
+      </div>
+      {view === "performance" ? (
+        <CategoryAnalysisModule products={products} planograms={planograms} stores={stores} performance={performance} productSchema={productSchema} />
+      ) : (
+        <CoverageGapsModule products={products} planograms={planograms} stores={stores} productSchema={productSchema} />
+      )}
+    </div>
+  );
+}
+
 function PerformanceModule({ products, performance, stores, productSchema, primaryKeyField, onSaveProductPerformance, onDeleteProductPerformance, onClearAllPerformance }) {
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [importStatus, setImportStatus] = useState(null);
@@ -3353,6 +3617,18 @@ const HELP_SECTIONS = [
       { type: "p", text: "**Sales/Space Index** = %Sales ÷ %Space × 100. Above 100 means that row is selling more than its shelf space would suggest; below 100 means it's over-spaced relative to its sales — a quick flag for space that could be reallocated." },
       { type: "p", text: "**Click any row** to drill into its products — a summary of current-period Sales, Units, and Gross Profit versus the same period one year earlier, with a callout for the biggest gainer and decliner, and a sortable per-product table showing each one's own year-over-year change. Clicking a Store row, for example, drills into that store's own products; clicking a Category row (while grouped by something else) drills into that category across whichever stores it appeared in." },
       { type: "note", text: "%Space is estimated from each placed product's width × facings (× squeeze factor), summed across every Live planogram's assigned stores — the same footprint math the shelf editor itself uses. Pegboard and Hook Rail placements use the same width-based estimate since they don't pack linearly the way a shelf does, so treat their %Space as a close approximation rather than an exact footprint." },
+    ],
+  },
+  {
+    id: "coverageGaps",
+    title: "Analysis — Coverage & Gaps",
+    blocks: [
+      { type: "p", text: "A second view inside the **Analysis** tab (switch to it with the \"Coverage & Gaps\" toggle at the top) for spotting holes rather than measuring performance — three panels:" },
+      { type: "ul", items: [
+        "**Store List by Region** — every store grouped by Region, with a badge showing how many Live planograms are currently assigned to it (a red \"0 live\" badge is easy to spot).",
+        "**Stores With No Live Planogram, by Category** — for each planogram Category, how many of your stores currently have a Live planogram of that category assigned. Click a row to see exactly which stores are missing it.",
+        "**Products Not on Any Active Planogram** — every product that isn't placed on a single Live, Pending, or WIP planogram (Approved and Historical don't count) — a quick way to find items sitting unused in the library.",
+      ] },
     ],
   },
   {
@@ -9492,7 +9768,7 @@ function AppContent({ session }) {
             onClearAllPerformance={clearAllPerformance}
           />
         ) : tab === "analysis" ? (
-          <CategoryAnalysisModule
+          <AnalysisModule
             products={products}
             planograms={planograms}
             stores={stores}
