@@ -2257,6 +2257,23 @@ function FixtureLibrary({ schema, fixtures, onCreate, onUpdate, onDelete }) {
 
 const STORE_FORMATS = ["Supercenter", "Standard Grocery", "Express", "Fuel & Convenience", "Warehouse"];
 
+// A store's operational status — distinct from a planogram's lifecycle status (Live/Pending
+// there mean something else entirely: whether a specific layout has gone into effect). Here
+// it's whether the store itself is trading normally, about to open, mid-remodel, etc. Existing
+// stores saved before this field existed have no status at all, so they're always treated as
+// "Live" (storeEffectiveStatus below) rather than silently dropping out of an "Live only" filter.
+const STORE_STATUSES = ["Live", "Inactive", "Pending", "Closed", "Remodel"];
+const STORE_STATUS_COLORS = {
+  Live: "bg-emerald-50 text-emerald-700 border-emerald-200",
+  Inactive: "bg-slate-100 text-slate-500 border-slate-200",
+  Pending: "bg-amber-50 text-amber-700 border-amber-200",
+  Closed: "bg-red-50 text-red-600 border-red-200",
+  Remodel: "bg-blue-50 text-blue-600 border-blue-200",
+};
+function storeEffectiveStatus(s) {
+  return s.status || "Live";
+}
+
 function StoreForm({ initial, onSave, onCancel }) {
   const [name, setName] = useState(initial?.name || "");
   const [storeNumber, setStoreNumber] = useState(initial?.storeNumber || "");
@@ -2264,6 +2281,7 @@ function StoreForm({ initial, onSave, onCancel }) {
   const [region, setRegion] = useState(initial?.region || "");
   const [format, setFormat] = useState(initial?.format || STORE_FORMATS[0]);
   const [squareFootage, setSquareFootage] = useState(initial?.squareFootage || "");
+  const [status, setStatus] = useState(initial ? storeEffectiveStatus(initial) : "Live");
 
   const save = () => {
     if (!name.trim()) return;
@@ -2275,6 +2293,7 @@ function StoreForm({ initial, onSave, onCancel }) {
       region: region.trim(),
       format,
       squareFootage: Number(squareFootage) || 0,
+      status,
     });
   };
 
@@ -2294,6 +2313,20 @@ function StoreForm({ initial, onSave, onCancel }) {
         </Field>
         <Field label="Sq Footage"><input type="number" className={inputCls} value={squareFootage} onChange={(e) => setSquareFootage(e.target.value)} /></Field>
       </div>
+      <Field label="Status">
+        <div className="grid grid-cols-5 gap-1.5">
+          {STORE_STATUSES.map((st) => (
+            <button
+              key={st}
+              type="button"
+              onClick={() => setStatus(st)}
+              className={`text-xs rounded-md py-1.5 border font-medium ${status === st ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}
+            >
+              {st}
+            </button>
+          ))}
+        </div>
+      </Field>
       <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
         <button className={btnGhost} onClick={onCancel}>Cancel</button>
         <button className={btnPrimary} onClick={save}><Save size={14} /> Save Store</button>
@@ -2306,6 +2339,7 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
   const [editing, setEditing] = useState(null);
   const [query, setQuery] = useState("");
   const [viewMode, setViewMode] = useState("grid"); // grid | list
+  const [statusFilter, setStatusFilter] = useState("All");
   if (editing) {
     return (
       <StoreForm
@@ -2316,9 +2350,12 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
     );
   }
   const q = query.trim().toLowerCase();
-  const filtered = !q ? stores : stores.filter((s) =>
+  const statusFiltered = statusFilter === "All" ? stores : stores.filter((s) => storeEffectiveStatus(s) === statusFilter);
+  const filtered = !q ? statusFiltered : statusFiltered.filter((s) =>
     [s.name, s.storeNumber, s.address, s.region, s.format].filter(Boolean).join(" ").toLowerCase().includes(q)
   );
+  const statusCounts = {};
+  stores.forEach((s) => { const st = storeEffectiveStatus(s); statusCounts[st] = (statusCounts[st] || 0) + 1; });
   return (
     <div>
       <div className="flex items-center justify-between mb-4">
@@ -2357,13 +2394,33 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
         </div>
       )}
 
+      {stores.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 mb-4">
+          <button
+            onClick={() => setStatusFilter("All")}
+            className={`text-xs rounded-full px-3 py-1 border font-medium ${statusFilter === "All" ? "bg-slate-800 border-slate-800 text-white" : "border-slate-300 text-slate-600 hover:bg-slate-50"}`}
+          >
+            All ({stores.length})
+          </button>
+          {STORE_STATUSES.map((st) => (
+            <button
+              key={st}
+              onClick={() => setStatusFilter(st)}
+              className={`text-xs rounded-full px-3 py-1 border font-medium ${statusFilter === st ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-300 text-slate-600 hover:bg-slate-50"}`}
+            >
+              {st} ({statusCounts[st] || 0})
+            </button>
+          ))}
+        </div>
+      )}
+
       {stores.length === 0 ? (
         <div className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-8 text-center">
           No stores yet. Add the stores you'll be assigning planograms to.
         </div>
       ) : filtered.length === 0 ? (
         <div className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-8 text-center">
-          No stores match "{query}".
+          No stores match{query ? ` "${query}"` : ""}{statusFilter !== "All" ? ` with status "${statusFilter}"` : ""}.
         </div>
       ) : viewMode === "list" ? (
         <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
@@ -2372,6 +2429,7 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
               <tr className="border-b border-slate-200 bg-slate-50">
                 <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Name</th>
                 <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Store #</th>
+                <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Status</th>
                 <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Format</th>
                 <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Address</th>
                 <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Region</th>
@@ -2384,6 +2442,9 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
                 <tr key={s.id} className="hover:bg-slate-50">
                   <td className="px-3 py-2 font-medium text-slate-800 whitespace-nowrap">{s.name}</td>
                   <td className="px-3 py-2 text-slate-500 font-mono whitespace-nowrap">#{s.storeNumber || "—"}</td>
+                  <td className="px-3 py-2 whitespace-nowrap">
+                    <span className={`text-[10px] uppercase tracking-wide rounded px-1.5 py-0.5 border ${STORE_STATUS_COLORS[storeEffectiveStatus(s)] || STORE_STATUS_COLORS.Live}`}>{storeEffectiveStatus(s)}</span>
+                  </td>
                   <td className="px-3 py-2 whitespace-nowrap"><span className="text-[10px] uppercase tracking-wide bg-slate-100 text-slate-500 rounded px-1.5 py-0.5">{s.format || "—"}</span></td>
                   <td className="px-3 py-2 text-slate-600 whitespace-nowrap max-w-[260px] truncate" title={s.address}>{s.address || "—"}</td>
                   <td className="px-3 py-2 text-slate-500 whitespace-nowrap">{s.region || "—"}</td>
@@ -2405,7 +2466,10 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
                 <div className="font-semibold text-sm text-slate-800">{s.name}</div>
                 <span className="text-[10px] uppercase tracking-wide bg-slate-100 text-slate-500 rounded px-1.5 py-0.5">{s.format}</span>
               </div>
-              <div className="text-xs text-slate-400 font-mono mt-0.5">#{s.storeNumber || "—"}</div>
+              <div className="flex items-center gap-1.5 mt-1">
+                <span className={`text-[10px] uppercase tracking-wide rounded px-1.5 py-0.5 border ${STORE_STATUS_COLORS[storeEffectiveStatus(s)] || STORE_STATUS_COLORS.Live}`}>{storeEffectiveStatus(s)}</span>
+                <span className="text-xs text-slate-400 font-mono">#{s.storeNumber || "—"}</span>
+              </div>
               <div className="text-xs text-slate-500 mt-1">{s.address}</div>
               <div className="text-xs text-slate-400 mt-1">{s.region}{s.squareFootage ? ` · ${s.squareFootage.toLocaleString()} sq ft` : ""}</div>
               <div className="flex gap-2 mt-1.5">
@@ -3577,7 +3641,8 @@ const HELP_SECTIONS = [
     id: "storeManagement",
     title: "Store Management",
     blocks: [
-      { type: "p", text: "A store record holds **Name**, **Store Number**, **Address**, **Region**, **Format** (Supercenter, Standard Grocery, Express, Fuel & Convenience, or Warehouse), and **Square Footage**." },
+      { type: "p", text: "A store record holds **Name**, **Store Number**, **Address**, **Region**, **Format** (Supercenter, Standard Grocery, Express, Fuel & Convenience, or Warehouse), **Square Footage**, and **Status**." },
+      { type: "p", text: "**Status** is the store's own operating status — separate from a planogram's Live/Pending lifecycle, which is about a layout, not the store itself. Options are **Live**, **Inactive**, **Pending**, **Closed**, and **Remodel**. A row of filter chips above the store list (All plus each status, with counts) narrows the list to just that status; a store saved before this field existed is treated as Live until you set it." },
       { type: "p", text: "Stores get linked to a planogram through an \"Assign Stores\" action on the planogram — that assignment is what makes a planogram appear in a given store's Store Assistant. The Store Library uses the same Grid/List and search pattern as Fixtures." },
     ],
   },
