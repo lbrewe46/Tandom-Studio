@@ -170,3 +170,143 @@ begin
     ', t);
   end loop;
 end $$;
+
+-- ------------------------------------------------------------------
+-- Phase 1: Roles & functional-area RLS
+-- ------------------------------------------------------------------
+-- Replaces the v1 "any authenticated user can do anything" model above with three roles:
+--   admin               — everything, including user/role management
+--   category_manager    — (aka "Space Planner" in the UI) everything merchandising- and
+--                          store-related; not user/role management
+--   store_associate     — read-only everywhere today. Store-specific WRITE actions (feedback,
+--                          tasks) don't exist as direct tables yet — when Store Feedback Triage
+--                          and similar agents are built, they go through the Proposal model
+--                          (agents only ever write a `proposals` row, never a table directly),
+--                          so no direct-write grant belongs here even once those agents exist.
+-- New signups default to 'store_associate' (least privilege); an Admin promotes from there —
+-- there's no in-app role management UI yet, so promoting a user means updating their `profiles`
+-- row directly (Supabase Studio's Table Editor, or a one-off SQL update).
+
+alter table profiles add column if not exists role text not null default 'store_associate';
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'profiles_role_check'
+  ) then
+    alter table profiles add constraint profiles_role_check
+      check (role in ('admin', 'category_manager', 'store_associate'));
+  end if;
+end $$;
+
+-- Reads a user's role without re-entering RLS on `profiles` (avoids recursive-policy issues
+-- when this is called from inside a `profiles` policy itself).
+create or replace function current_user_role()
+returns text
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select role from profiles where id = auth.uid()
+$$;
+
+-- An Admin may update any profile (to promote/demote a role); a user may still update their
+-- own profile (display_name etc.) via the existing "Users can update their own profile" policy,
+-- but the trigger below blocks a non-admin from changing their *own* role through that path.
+drop policy if exists "Admins can update any profile" on profiles;
+create policy "Admins can update any profile"
+  on profiles for update
+  to authenticated
+  using (current_user_role() = 'admin');
+
+create or replace function prevent_unauthorized_role_change()
+returns trigger as $$
+begin
+  if new.role is distinct from old.role and current_user_role() <> 'admin' then
+    raise exception 'Only an Admin can change a user''s role';
+  end if;
+  return new;
+end;
+$$ language plpgsql security definer set search_path = public;
+
+drop trigger if exists prevent_unauthorized_role_change on profiles;
+create trigger prevent_unauthorized_role_change
+  before update on profiles
+  for each row execute procedure prevent_unauthorized_role_change();
+
+-- Replace the v1 blanket "any authenticated user can write" policies with functional-area
+-- ones: everyone authenticated can still read (planograms, products, etc. need to be visible
+-- to Store Associates executing a reset in-store); only Admin and Category Manager can write.
+do $$
+declare
+  t text;
+begin
+  foreach t in array array['products', 'fixtures', 'planograms', 'stores', 'performance', 'app_settings']
+  loop
+    execute format('drop policy if exists "Authenticated users can read %1$s" on %1$s;', t);
+    execute format('drop policy if exists "Authenticated users can insert %1$s" on %1$s;', t);
+    execute format('drop policy if exists "Authenticated users can update %1$s" on %1$s;', t);
+    execute format('drop policy if exists "Authenticated users can delete %1$s" on %1$s;', t);
+    execute format('drop policy if exists "Any role can read %1$s" on %1$s;', t);
+    execute format('drop policy if exists "Admin and Category Manager can insert %1$s" on %1$s;', t);
+    execute format('drop policy if exists "Admin and Category Manager can update %1$s" on %1$s;', t);
+    execute format('drop policy if exists "Admin and Category Manager can delete %1$s" on %1$s;', t);
+
+    execute format('
+      create policy "Any role can read %1$s" on %1$s
+        for select to authenticated using (true);
+    ', t);
+    execute format('
+      create policy "Admin and Category Manager can insert %1$s" on %1$s
+        for insert to authenticated with check (current_user_role() in (''admin'', ''category_manager''));
+    ', t);
+    execute format('
+      create policy "Admin and Category Manager can update %1$s" on %1$s
+        for update to authenticated using (current_user_role() in (''admin'', ''category_manager''));
+    ', t);
+    execute format('
+      create policy "Admin and Category Manager can delete %1$s" on %1$s
+        for delete to authenticated using (current_user_role() in (''admin'', ''category_manager''));
+    ', t);
+  end loop;
+end $$;
+
+-- ------------------------------------------------------------------
+-- Phase 1: Agent actor type
+-- ------------------------------------------------------------------
+-- Agents are NOT Supabase Auth users — they never log in, so they don't get a `profiles` row.
+-- This is a static registry Edge Functions check against before acting, and the UI can use to
+-- show "who proposed this." Critically, agents get NO RLS grants of their own on any table
+-- above: an agent only ever writes a `proposals` row (Phase 3), through an Edge Function that
+-- runs with the service-role key. Scoping what an agent may touch is the Edge Function's own
+-- code, not a database grant — see the design doc for why.
+create table if not exists agents (
+  id text primary key,               -- e.g. 'reset-drafting-agent'
+  name text not null,
+  description text,
+  enabled boolean not null default true,
+  allowed_target_types text[] not null default '{}',  -- e.g. {'planogram_version'}
+  created_at timestamptz not null default now()
+);
+
+alter table agents enable row level security;
+
+drop policy if exists "Any authenticated user can read agents" on agents;
+create policy "Any authenticated user can read agents"
+  on agents for select
+  to authenticated
+  using (true);
+
+drop policy if exists "Admins manage agents" on agents;
+create policy "Admins manage agents"
+  on agents for all
+  to authenticated
+  using (current_user_role() = 'admin')
+  with check (current_user_role() = 'admin');
+
+insert into agents (id, name, description, allowed_target_types)
+values ('reset-drafting-agent', 'Reset Drafting Agent',
+        'Reads Performance history and drafts facing/deletion/addition changes for a planogram reset.',
+        array['planogram_version'])
+on conflict (id) do nothing;

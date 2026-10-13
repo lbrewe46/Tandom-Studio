@@ -10,6 +10,19 @@ function notifyPendingWriteListeners() { pendingWriteListeners.forEach((fn) => f
 function trackWriteStart() { pendingWrites++; notifyPendingWriteListeners(); }
 function trackWriteEnd() { pendingWrites = Math.max(0, pendingWrites - 1); notifyPendingWriteListeners(); }
 
+// Resolves once no saves are in flight (or after timeoutMs, so a stuck save can't hang the UI).
+// Anything that asks the *server* to read data the user just edited — like the draft-reset Edge
+// Function — should wait on this first, or it will analyze the previous saved version.
+export function waitForPendingWrites(timeoutMs = 10000) {
+  if (pendingWrites === 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); pendingWriteListeners.delete(check); resolve(); };
+    const check = (n) => { if (n === 0) done(); };
+    const timer = setTimeout(done, timeoutMs);
+    pendingWriteListeners.add(check);
+  });
+}
+
 if (typeof window !== "undefined") {
   window.addEventListener("beforeunload", (e) => {
     if (pendingWrites > 0) {

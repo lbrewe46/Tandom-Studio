@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import {
   supabase, supabaseConfigured, pendingWriteListeners,
-  safeGet, safeSet, safeDelete, loadIndexed, saveIndexed, deleteIndexed,
+  safeGet, safeSet, safeDelete, loadIndexed, saveIndexed, deleteIndexed, waitForPendingWrites,
 } from "./lib/db.js";
 
 /* ------------------------------------------------------------------ */
@@ -5021,198 +5021,24 @@ function layoutFixtureBoxes(fixtureInst, fixtureDef, products) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Reset Drafting Agent (Phase 1) — reads Performance, flags weak and   */
-/* strong items on a planogram, and proposes facing changes/deletions   */
-/* with a plain-language reason for each. No new-item additions yet     */
-/* (that's Phase 2) — this only ever touches what's already placed.     */
+/* Reset Drafting Agent — the analysis itself (computeResetDraft, the   */
+/* fit check, the Draft Score) runs server-side in the draft-reset Edge */
+/* Function; only applying a returned draft lives in the browser.       */
 /* ------------------------------------------------------------------ */
 
-// A trial facing increase is only kept if every placement on that fixture still fits —
-// layoutFixtureBoxes already flags overflow per box, so re-running it on a cloned fixture
-// instance with one placement's facings bumped is the cheapest reliable fit check available.
-function facingIncreaseFits(fixtureInst, fixtureDef, products, placementId, newFacings) {
-  const trialFx = {
-    ...fixtureInst,
-    placements: (fixtureInst.placements || []).map((pl) => (pl.id === placementId ? { ...pl, facings: newFacings } : pl)),
-  };
-  const { boxes } = layoutFixtureBoxes(trialFx, fixtureDef, products);
-  return !boxes.some((b) => b.overflow);
-}
-
-// Draft Score (Phase 3): the share of everything the draft found worth touching that it was
-// actually able to apply cleanly. Only items that warranted a look (a change, or a skip for a
-// space/data reason) count toward the denominator — a planogram with nothing worth changing
-// scores 100, not because it was "reviewed", but because nothing was skipped either.
-function computeDraftScore(result) {
-  const total = (result.changes?.length || 0) + (result.skipped?.length || 0);
-  if (total === 0) return 100;
-  return Math.round((result.changes.length / total) * 100);
-}
-
-function computeResetDraft(planogram, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, storeId) {
-  const latestISO = getLatestWeekEnding(performance);
-  if (!latestISO) return { changes: [], skipped: [], startISO: null, endISO: null, lookbackWeeks };
-  const endISO = latestISO;
-  const startISO = getCutoffISO(latestISO, lookbackWeeks);
-  const { low, high } = getResetThreshold(planogram.category || "", resetThresholds);
-  const productById = Object.fromEntries(products.map((p) => [p.id, p]));
-
-  // every placement, with enough context to locate and mutate it later
-  const placementRefs = [];
-  (planogram.sections || []).forEach((section) => {
-    (section.fixtures || []).forEach((fixtureInst) => {
-      const fixtureDef = fixtures.find((f) => f.id === fixtureInst.fixtureId);
-      (fixtureInst.placements || []).forEach((placement) => {
-        placementRefs.push({ sectionId: section.id, fixtureInst, fixtureDef, placement });
-      });
-    });
-  });
-
-  // group by product — a product placed in more than one spot is judged once, as a whole
-  const groups = {};
-  let totalSpace = 0;
-  placementRefs.forEach((ref) => {
-    const product = productById[ref.placement.productId];
-    if (!product) return;
-    const space = getPlacementSpaceIn(product, ref.placement);
-    totalSpace += space;
-    if (!groups[ref.placement.productId]) groups[ref.placement.productId] = { product, refs: [], space: 0 };
-    groups[ref.placement.productId].refs.push(ref);
-    groups[ref.placement.productId].space += space;
-  });
-
-  const productIds = Object.keys(groups);
-  const perfByProduct = {};
-  productIds.forEach((pid) => {
-    perfByProduct[pid] = aggregateProductPerformanceRange(pid, performance, startISO, endISO, storeId);
-  });
-  const totalSales = productIds.reduce((s, pid) => s + (perfByProduct[pid].totalSales || 0), 0);
-
-  const changes = [];
-  const skipped = [];
-
-  productIds.forEach((pid) => {
-    const group = groups[pid];
-    const perf = perfByProduct[pid];
-
-    if (perf.weeksOfData < 4) {
-      skipped.push({ productId: pid, productName: group.product.name, reason: `Fewer than 4 weeks of performance data in this window — left unchanged.` });
-      return;
-    }
-
-    const isProtected = !!group.product.resetProtected;
-
-    if (perf.totalUnits === 0) {
-      if (isProtected) {
-        skipped.push({ productId: pid, productName: group.product.name, reason: `Core / Must-Carry — zero units over this window would normally delete it, but it's protected.` });
-        return;
-      }
-      group.refs.forEach((ref) => {
-        changes.push({
-          type: "delete", productId: pid, productName: group.product.name,
-          sectionId: ref.sectionId, fixtureInstId: ref.fixtureInst.id, placementId: ref.placement.id,
-          reason: `Deleted — zero units sold over the last ${lookbackWeeks} weeks.`,
-        });
-      });
-      return;
-    }
-
-    const pctSpace = totalSpace > 0 ? (group.space / totalSpace) * 100 : 0;
-    const pctSales = totalSales > 0 ? (perf.totalSales / totalSales) * 100 : 0;
-    const index = pctSpace > 0 ? (pctSales / pctSpace) * 100 : (pctSales > 0 ? Infinity : 0);
-
-    if (isProtected) {
-      if (index < low) skipped.push({ productId: pid, productName: group.product.name, reason: `Core / Must-Carry — Sales/Space Index ${index.toFixed(0)} is below ${low}, but it's protected from facing reductions.` });
-      return;
-    }
-
-    if (index < low) {
-      const target = [...group.refs].sort((a, b) => (b.placement.facings || 1) - (a.placement.facings || 1))[0];
-      const currentFacings = target.placement.facings || 1;
-      if (currentFacings > 1) {
-        changes.push({
-          type: "reduceFacings", productId: pid, productName: group.product.name,
-          sectionId: target.sectionId, fixtureInstId: target.fixtureInst.id, placementId: target.placement.id,
-          oldFacings: currentFacings, newFacings: currentFacings - 1,
-          reason: `Reduced from ${currentFacings} to ${currentFacings - 1} facings — Sales/Space Index ${index.toFixed(0)} over the last ${lookbackWeeks} weeks (below ${low}).`,
-        });
-      }
-    } else if (index > high) {
-      const target = [...group.refs].sort((a, b) => (b.placement.facings || 1) - (a.placement.facings || 1))[0];
-      const currentFacings = target.placement.facings || 1;
-      const newFacings = currentFacings + 1;
-      if (facingIncreaseFits(target.fixtureInst, target.fixtureDef, products, target.placement.id, newFacings)) {
-        changes.push({
-          type: "increaseFacings", productId: pid, productName: group.product.name,
-          sectionId: target.sectionId, fixtureInstId: target.fixtureInst.id, placementId: target.placement.id,
-          oldFacings: currentFacings, newFacings,
-          reason: `Increased from ${currentFacings} to ${newFacings} facings — Sales/Space Index ${index.toFixed(0)} over the last ${lookbackWeeks} weeks (above ${high}).`,
-        });
-      } else {
-        skipped.push({ productId: pid, productName: group.product.name, reason: `Sales/Space Index ${index.toFixed(0)} is a standout, but its fixture has no room for another facing.` });
-      }
-    }
-  });
-
-  // Missing-winner additions: products not currently on this planogram, in the same Category,
-  // performing well over the same window and at the same scope (store or chain-wide) as
-  // everything above — dropped into whatever room the reductions/deletions just freed up.
-  const planogramCategory = planogram.category || "";
-  if (planogramCategory) {
-    const placedProductIds = new Set(productIds);
-    const candidateScores = products
-      .filter((p) => !placedProductIds.has(p.id) && getAttrByLabel(p, productSchema, ["category"]) === planogramCategory)
-      .map((p) => ({ product: p, perf: aggregateProductPerformanceRange(p.id, performance, startISO, endISO, storeId) }))
-      .filter((c) => c.perf.weeksOfData >= 4 && c.perf.totalUnits > 0)
-      .sort((a, b) => b.perf.totalSales - a.perf.totalSales)
-      .slice(0, 10);
-
-    if (candidateScores.length > 0) {
-      const scopeLabel = storeId ? "this store" : "chain-wide";
-      // effective per-fixture placement list — the reductions/deletions already decided above,
-      // applied to a scratch copy so remaining room reflects the draft so far, not the original
-      const fixtureState = {};
-      placementRefs.forEach((ref) => {
-        if (fixtureState[ref.fixtureInst.id]) return;
-        const toDeleteIds = new Set(changes.filter((c) => c.type === "delete" && c.fixtureInstId === ref.fixtureInst.id).map((c) => c.placementId));
-        const facingEditsLocal = {};
-        changes.forEach((c) => { if ((c.type === "reduceFacings" || c.type === "increaseFacings") && c.fixtureInstId === ref.fixtureInst.id) facingEditsLocal[c.placementId] = c.newFacings; });
-        const effectivePlacements = (ref.fixtureInst.placements || [])
-          .filter((pl) => !toDeleteIds.has(pl.id))
-          .map((pl) => (facingEditsLocal[pl.id] !== undefined ? { ...pl, facings: facingEditsLocal[pl.id] } : pl));
-        fixtureState[ref.fixtureInst.id] = { fixtureInst: ref.fixtureInst, fixtureDef: ref.fixtureDef, sectionId: ref.sectionId, effectivePlacements };
-      });
-
-      const fixturesByRemainder = Object.values(fixtureState)
-        .map((fs) => {
-          const { boxes, totalWidth, widthIn } = layoutFixtureBoxes({ ...fs.fixtureInst, placements: fs.effectivePlacements }, fs.fixtureDef, products);
-          return { ...fs, remainder: boxes.some((b) => b.overflow) ? 0 : widthIn - totalWidth };
-        })
-        .filter((fs) => fs.remainder > 0.1)
-        .sort((a, b) => b.remainder - a.remainder);
-
-      candidateScores.forEach(({ product, perf }) => {
-        for (const fs of fixturesByRemainder) {
-          const newPlacement = { id: uid("pl"), productId: product.id, facings: 1, orientation: "front", rotation: 0, merchStyle: "unit" };
-          const trialFx = { ...fs.fixtureInst, placements: [...fs.effectivePlacements, newPlacement] };
-          const { boxes, totalWidth, widthIn } = layoutFixtureBoxes(trialFx, fs.fixtureDef, products);
-          if (!boxes.some((b) => b.overflow)) {
-            fs.effectivePlacements = [...fs.effectivePlacements, newPlacement];
-            fs.remainder = widthIn - totalWidth;
-            changes.push({
-              type: "addProduct", productId: product.id, productName: product.name,
-              sectionId: fs.sectionId, fixtureInstId: fs.fixtureInst.id, placementId: newPlacement.id,
-              newFacings: 1,
-              reason: `Added — a missing-winner performer ${scopeLabel} ($${Math.round(perf.totalSales).toLocaleString()} in sales over the last ${lookbackWeeks} weeks), not previously on this planogram.`,
-            });
-            break;
-          }
-        }
-      });
-    }
+// Asks the draft-reset Edge Function to analyze planograms. The analysis (thresholds, protection
+// rules, scoring) runs on the server against what is saved in the database, so any in-flight
+// save is allowed to land first. Returns [{planogramId, ok, score, result} | {planogramId, ok:false, error}].
+const DRAFT_RESET_CHUNK = 50; // mirrors MAX_PLANOGRAMS_PER_CALL in the Edge Function
+async function invokeDraftReset(planogramIds, lookbackWeeks) {
+  await waitForPendingWrites();
+  const { data, error } = await supabase.functions.invoke("draft-reset", { body: { planogramIds, lookbackWeeks } });
+  if (error) {
+    let message = error.message || "The draft-reset function couldn't be reached.";
+    try { const body = await error.context.json(); if (body?.error) message = body.error; } catch (e) { /* keep the generic message */ }
+    throw new Error(message);
   }
-
-  return { changes, skipped, startISO, endISO, lookbackWeeks };
+  return data.results;
 }
 
 // Applies a computed draft's changes to a plain sections array (old ids, not yet cloned) — used
@@ -9911,43 +9737,62 @@ function AppContent({ session }) {
     return created;
   };
 
-  // Reset Drafting Agent (Phase 1): analyzes `source` against Performance, builds the next
-  // version with the proposed changes already applied, and attaches the change list + reasons as
-  // `resetDraft` so PlanogramEditor shows the bundled review instead of the normal gondola builder
-  // until a Space Planner approves or discards it. Still an ordinary WIP version underneath —
-  // approving it is nothing more than clearing resetDraft.reviewed.
-  const draftResetForPlanogram = (source, lookbackWeeks) => {
+  // Reset Drafting Agent: the analysis runs server-side (draft-reset Edge Function); this builds
+  // the next version with the proposed changes already applied and attaches the change list +
+  // reasons as `resetDraft`, so PlanogramEditor shows the bundled review instead of the normal
+  // gondola builder until a Space Planner approves or discards it. Still an ordinary WIP version
+  // underneath — approving it is nothing more than clearing resetDraft.reviewed.
+  const buildDraftVersion = (source, draft, existingList) => {
+    const modifiedSections = applyResetDraftChanges(source.sections, draft.result.changes);
+    const next = buildPlanogramVersion({ ...source, sections: modifiedSections }, existingList);
+    next.resetDraft = { ...draft.result, sourceId: source.id, reviewed: false, score: draft.score, createdAt: new Date().toISOString() };
+    return next;
+  };
+
+  const draftResetForPlanogram = async (source, lookbackWeeks) => {
     setDraftingReset(true);
     try {
-      const result = computeResetDraft(source, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, null);
-      const modifiedSections = applyResetDraftChanges(source.sections, result.changes);
-      const next = buildPlanogramVersion({ ...source, sections: modifiedSections }, planograms);
-      next.resetDraft = { ...result, sourceId: source.id, reviewed: false, score: computeDraftScore(result), createdAt: new Date().toISOString() };
+      const [draft] = await invokeDraftReset([source.id], lookbackWeeks);
+      if (!draft?.ok) throw new Error(draft?.error || "No draft came back.");
+      const next = buildDraftVersion(source, draft, planograms);
       createPlanogram(next);
       setActivePlanogramId(next.id);
+    } catch (e) {
+      window.alert(`Couldn't draft a reset: ${e.message}`);
     } finally {
       setDraftingReset(false);
     }
   };
 
-  // Phase 3: the same draft logic, run across every selected planogram at once (a cluster or a
-  // whole chain's worth of resets in one go). Each draft lands as its own WIP version with its
-  // own Draft Score, rather than navigating into any one of them — the Review Queue (sorted by
+  // Phase 3: the same draft, run across every selected planogram at once (a cluster or a whole
+  // chain's worth of resets in one go). Each draft lands as its own WIP version with its own
+  // Draft Score, rather than navigating into any one of them — the Review Queue (sorted by
   // score, lowest first) is where a Space Planner works through the results afterward.
-  const draftResetForPlanogramsBulk = (sources, lookbackWeeks) => {
+  const draftResetForPlanogramsBulk = async (sources, lookbackWeeks) => {
     setDraftingReset(true);
+    let created = 0;
+    const failures = [];
     try {
       let workingList = planograms;
-      sources.forEach((source) => {
-        const result = computeResetDraft(source, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, null);
-        const modifiedSections = applyResetDraftChanges(source.sections, result.changes);
-        const next = buildPlanogramVersion({ ...source, sections: modifiedSections }, workingList);
-        next.resetDraft = { ...result, sourceId: source.id, reviewed: false, score: computeDraftScore(result), createdAt: new Date().toISOString() };
-        createPlanogram(next);
-        workingList = [...workingList, next];
-      });
+      for (let i = 0; i < sources.length; i += DRAFT_RESET_CHUNK) {
+        const chunk = sources.slice(i, i + DRAFT_RESET_CHUNK);
+        const drafts = await invokeDraftReset(chunk.map((s) => s.id), lookbackWeeks);
+        chunk.forEach((source) => {
+          const draft = drafts.find((d) => d.planogramId === source.id);
+          if (!draft?.ok) { failures.push(`${source.name}: ${draft?.error || "no result"}`); return; }
+          const next = buildDraftVersion(source, draft, workingList);
+          createPlanogram(next);
+          workingList = [...workingList, next];
+          created++;
+        });
+      }
+    } catch (e) {
+      failures.push(e.message);
     } finally {
       setDraftingReset(false);
+    }
+    if (failures.length > 0) {
+      window.alert(`${created} of ${sources.length} drafted.\n\nCouldn't finish:\n${failures.slice(0, 5).join("\n")}${failures.length > 5 ? `\n…and ${failures.length - 5} more` : ""}`);
     }
   };
 

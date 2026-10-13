@@ -67,11 +67,27 @@ weekly performance rows — that would mean normalizing the `performance` table 
 which is an isolated follow-up affecting only that one table and `src/lib/db.js`, not the rest
 of the app.
 
-## Access model (v1)
+## Access model
 
-Any authenticated user can read and write everything — a single shared workspace. There's no
-per-role permission system yet (e.g. a "viewer" who can't edit). That's a layer that can be
-added later purely in `supabase/schema.sql`'s RLS policies, without touching the app.
+Three roles, stored in `profiles.role` and enforced by Row Level Security in `supabase/schema.sql`:
+
+| Role | Can do |
+| --- | --- |
+| `admin` | Everything, including changing users' roles |
+| `category_manager` (Space Planner) | Read and write all merchandising and store data; run the AI agents |
+| `store_associate` | Read everything; no direct writes. May only trigger Store Assistant functions (not built yet) |
+
+New signups start as `store_associate`. There is no role-management screen yet — to promote
+someone, edit their row in Supabase Studio (Table Editor → `profiles` → `role`). The very first
+Admin has to be set from the SQL editor (`update profiles set role = 'admin' where email = '...';`),
+because only an Admin can change roles. A signed-in user can never change their own role.
+
+## Edge Functions (AI agents)
+
+The Reset Drafting Agent's analysis runs in a Supabase Edge Function, not in the browser, so its
+thresholds, protection rules and scoring never ship to users. Deploying it is a separate step from
+the database schema — see [`supabase/functions/README.md`](supabase/functions/README.md). Until it
+is deployed, the **Draft Reset with AI** buttons show an error and nothing else in the app is affected.
 
 ## Backup & Restore still works
 
