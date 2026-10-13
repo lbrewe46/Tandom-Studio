@@ -5,7 +5,7 @@ import {
   RotateCw, X, Layers, Package, Boxes, Ruler, ArrowLeft, Check, Grid3x3,
   Pencil, Save, AlertTriangle, RefreshCw, Download, Upload, FileSpreadsheet, CalendarDays, TrendingUp,
   Maximize2, Minimize2, Store, ChevronDown, ChevronUp, AlignLeft, AlignCenter, AlignRight, Search, Eye, Printer, Copy,
-  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe, HelpCircle, BarChart3
+  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe, HelpCircle, BarChart3, Sparkles
 } from "lucide-react";
 import {
   supabase, supabaseConfigured, pendingWriteListeners,
@@ -539,7 +539,7 @@ function AttrInput({ field, value, onChange }) {
   );
 }
 
-function TabButton({ active, onClick, icon: Icon, children }) {
+function TabButton({ active, onClick, icon: Icon, badge, children }) {
   return (
     <button
       onClick={onClick}
@@ -549,6 +549,7 @@ function TabButton({ active, onClick, icon: Icon, children }) {
     >
       <Icon size={16} />
       {children}
+      {!!badge && <span className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full bg-amber-500 text-white text-[10px] font-bold">{badge}</span>}
     </button>
   );
 }
@@ -1008,6 +1009,7 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, upcLookup, o
   const [merchStyles, setMerchStyles] = useState(initial?.merchStyles || {});
   const [merchStylesOpen, setMerchStylesOpen] = useState(Object.keys(initial?.merchStyles || {}).length > 0);
   const [pendingApproval, setPendingApproval] = useState(!!initial?.pendingApproval);
+  const [resetProtected, setResetProtected] = useState(!!initial?.resetProtected);
 
   const lookupKey = getPrimaryKeyValueRaw({ sku, attributes }, schema, imageRepo?.keyField || "upc");
   // the web (UPC API) lookup always needs an actual UPC, independent of whatever field the
@@ -1027,6 +1029,7 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, upcLookup, o
       squeezeFactor: clamp((Number(squeezePct) || 100) / 100, 0.5, 1),
       merchStyles,
       pendingApproval,
+      resetProtected,
       importSource: initial?.importSource,
     });
   };
@@ -1075,6 +1078,11 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, upcLookup, o
           Overhang: how far this product can safely hang past the shelf edge before it's flagged as overflow (e.g. a bag of chips). Squeeze: how tightly it packs against neighbors for space calculations — 100% = no compression, doesn't change how it renders.
         </p>
       </div>
+
+      <label className="flex items-center gap-2 text-sm text-slate-700">
+        <input type="checkbox" checked={resetProtected} onChange={(e) => setResetProtected(e.target.checked)} />
+        Core / Must-Carry — the Reset Drafting Agent never reduces, deletes, or substitutes this item, regardless of performance.
+      </label>
 
       <div>
         <button
@@ -2553,6 +2561,15 @@ function getPlacementSpaceIn(product, placement) {
   const nominalW = (rotated ? effectiveDims.h : effectiveDims.w) || 1;
   const squeeze = product.squeezeFactor ?? 1;
   return nominalW * squeeze * (placement.facings || 1);
+}
+
+// Reset Drafting Agent — Sales/Space Index thresholds. A planogram's own Category (the field set
+// in its toolbar, not a per-product attribute) selects the threshold row; chains without an
+// override for that category fall back to the chain-wide default.
+const DEFAULT_RESET_THRESHOLDS = { low: 70, high: 130 };
+function getResetThreshold(category, resetThresholds) {
+  const entry = (resetThresholds || []).find((t) => t.category === category);
+  return entry ? { low: entry.low, high: entry.high } : DEFAULT_RESET_THRESHOLDS;
 }
 
 // Rolls up every product placed in a Live, store-assigned planogram against imported
@@ -4588,9 +4605,10 @@ function NewPlanogramForm({ existingCategories, onCreate, onCancel }) {
   );
 }
 
-function PlanogramList({ planograms, stores, products, fixtures, productSchema, onCreate, onOpen, onDelete, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace }) {
+function PlanogramList({ planograms, stores, products, fixtures, productSchema, onCreate, onOpen, onDelete, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace, onDraftResetBulk, draftingReset }) {
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [bulkLookbackWeeks, setBulkLookbackWeeks] = useState(13);
   const [query, setQuery] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("All");
   const [storeFilter, setStoreFilter] = useState("All");
@@ -4647,6 +4665,10 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
     onCreateVersions(planograms.filter((p) => selectedIds.has(p.id)));
     setSelectedIds(new Set());
   };
+  const bulkDraftReset = () => {
+    onDraftResetBulk(planograms.filter((p) => selectedIds.has(p.id)), bulkLookbackWeeks);
+    setSelectedIds(new Set());
+  };
 
   // Groups the already-filtered-and-sorted list by version family (master + its versions), each
   // group internally ordered by version number — for the nested List view. A family's position
@@ -4698,6 +4720,8 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
           onImport={(payload) => { onImportProSpace(payload); setImporting(false); }}
         />
       )}
+
+      <ResetDraftQueue planograms={planograms} onOpenDraft={onOpen} />
 
       {planograms.length > 0 && (
         <div className="bg-white border border-slate-200 rounded-lg p-3 mb-4 space-y-3">
@@ -4776,6 +4800,25 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
         <div className="flex items-center gap-3 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3">
           <span className="text-xs font-semibold text-amber-800">{selectedCount} selected</span>
           <button className={btnGhost} onClick={bulkCreateVersions}><Copy size={13} /> Create Versions</button>
+          {onDraftResetBulk && (
+            <>
+              <select
+                className="text-xs border border-slate-300 rounded-md px-1.5 py-1 bg-white"
+                value={bulkLookbackWeeks}
+                onChange={(e) => setBulkLookbackWeeks(Number(e.target.value))}
+                title="Lookback window for performance data"
+              >
+                <option value={4}>4 weeks</option>
+                <option value={8}>8 weeks</option>
+                <option value={13}>13 weeks</option>
+                <option value={26}>26 weeks</option>
+                <option value={52}>52 weeks</option>
+              </select>
+              <button className={btnGhost} disabled={draftingReset} onClick={bulkDraftReset}>
+                <Sparkles size={13} /> {draftingReset ? "Drafting…" : "Draft Reset with AI (Bulk)"}
+              </button>
+            </>
+          )}
           <button className="text-xs text-slate-500 hover:underline ml-auto" onClick={() => setSelectedIds(new Set())}>Clear selection</button>
         </div>
       )}
@@ -4817,6 +4860,7 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
                     <span className="font-medium text-sm text-slate-800 truncate" style={{ maxWidth: 260 }}>{p.name}</span>
                     {p.masterId && <span className="text-[10px] font-mono font-semibold text-slate-400 border border-slate-200 rounded px-1 shrink-0">v{p.versionNumber || 1}</span>}
                     <PlanogramStatusBadge status={effectivePlanogramStatus(p)} className="shrink-0" />
+                    {p.resetDraft && !p.resetDraft.reviewed && <span className="text-[10px] font-semibold uppercase tracking-wide rounded-full px-2 py-0.5 shrink-0 bg-blue-50 text-blue-700 border border-blue-200 flex items-center gap-1"><Sparkles size={10} /> AI Draft Ready</span>}
                     {p.category && <span className="text-[10px] font-semibold uppercase tracking-wide rounded-full px-2 py-0.5 shrink-0" style={{ background: hashColor(p.category) + "33", color: hashColor(p.category) }}>{p.category}</span>}
                     {p.eventDate && <span className="text-xs text-slate-400 flex items-center gap-1 shrink-0"><CalendarDays size={11} /> {p.eventDate}</span>}
                     <span className="text-xs text-slate-400 shrink-0">{(p.storeIds || []).length} store{(p.storeIds || []).length !== 1 ? "s" : ""}</span>
@@ -4858,6 +4902,7 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
                 </div>
                 <div className="shrink-0 flex items-center gap-1.5">
                   <PlanogramStatusBadge status={effectivePlanogramStatus(p)} />
+                  {p.resetDraft && !p.resetDraft.reviewed && <span className="text-[10px] font-semibold uppercase tracking-wide rounded-full px-2 py-0.5 bg-blue-50 text-blue-700 border border-blue-200 flex items-center gap-1"><Sparkles size={10} /> AI Draft Ready</span>}
                   {p.category && <span className="text-[10px] font-semibold uppercase tracking-wide rounded-full px-2 py-0.5" style={{ background: hashColor(p.category) + "33", color: hashColor(p.category) }}>{p.category}</span>}
                 </div>
               </div>
@@ -4973,6 +5018,227 @@ function layoutFixtureBoxes(fixtureInst, fixtureDef, products) {
   }
 
   return { boxes, totalWidth: totalContentWidth, widthIn };
+}
+
+/* ------------------------------------------------------------------ */
+/* Reset Drafting Agent (Phase 1) — reads Performance, flags weak and   */
+/* strong items on a planogram, and proposes facing changes/deletions   */
+/* with a plain-language reason for each. No new-item additions yet     */
+/* (that's Phase 2) — this only ever touches what's already placed.     */
+/* ------------------------------------------------------------------ */
+
+// A trial facing increase is only kept if every placement on that fixture still fits —
+// layoutFixtureBoxes already flags overflow per box, so re-running it on a cloned fixture
+// instance with one placement's facings bumped is the cheapest reliable fit check available.
+function facingIncreaseFits(fixtureInst, fixtureDef, products, placementId, newFacings) {
+  const trialFx = {
+    ...fixtureInst,
+    placements: (fixtureInst.placements || []).map((pl) => (pl.id === placementId ? { ...pl, facings: newFacings } : pl)),
+  };
+  const { boxes } = layoutFixtureBoxes(trialFx, fixtureDef, products);
+  return !boxes.some((b) => b.overflow);
+}
+
+// Draft Score (Phase 3): the share of everything the draft found worth touching that it was
+// actually able to apply cleanly. Only items that warranted a look (a change, or a skip for a
+// space/data reason) count toward the denominator — a planogram with nothing worth changing
+// scores 100, not because it was "reviewed", but because nothing was skipped either.
+function computeDraftScore(result) {
+  const total = (result.changes?.length || 0) + (result.skipped?.length || 0);
+  if (total === 0) return 100;
+  return Math.round((result.changes.length / total) * 100);
+}
+
+function computeResetDraft(planogram, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, storeId) {
+  const latestISO = getLatestWeekEnding(performance);
+  if (!latestISO) return { changes: [], skipped: [], startISO: null, endISO: null, lookbackWeeks };
+  const endISO = latestISO;
+  const startISO = getCutoffISO(latestISO, lookbackWeeks);
+  const { low, high } = getResetThreshold(planogram.category || "", resetThresholds);
+  const productById = Object.fromEntries(products.map((p) => [p.id, p]));
+
+  // every placement, with enough context to locate and mutate it later
+  const placementRefs = [];
+  (planogram.sections || []).forEach((section) => {
+    (section.fixtures || []).forEach((fixtureInst) => {
+      const fixtureDef = fixtures.find((f) => f.id === fixtureInst.fixtureId);
+      (fixtureInst.placements || []).forEach((placement) => {
+        placementRefs.push({ sectionId: section.id, fixtureInst, fixtureDef, placement });
+      });
+    });
+  });
+
+  // group by product — a product placed in more than one spot is judged once, as a whole
+  const groups = {};
+  let totalSpace = 0;
+  placementRefs.forEach((ref) => {
+    const product = productById[ref.placement.productId];
+    if (!product) return;
+    const space = getPlacementSpaceIn(product, ref.placement);
+    totalSpace += space;
+    if (!groups[ref.placement.productId]) groups[ref.placement.productId] = { product, refs: [], space: 0 };
+    groups[ref.placement.productId].refs.push(ref);
+    groups[ref.placement.productId].space += space;
+  });
+
+  const productIds = Object.keys(groups);
+  const perfByProduct = {};
+  productIds.forEach((pid) => {
+    perfByProduct[pid] = aggregateProductPerformanceRange(pid, performance, startISO, endISO, storeId);
+  });
+  const totalSales = productIds.reduce((s, pid) => s + (perfByProduct[pid].totalSales || 0), 0);
+
+  const changes = [];
+  const skipped = [];
+
+  productIds.forEach((pid) => {
+    const group = groups[pid];
+    const perf = perfByProduct[pid];
+
+    if (perf.weeksOfData < 4) {
+      skipped.push({ productId: pid, productName: group.product.name, reason: `Fewer than 4 weeks of performance data in this window — left unchanged.` });
+      return;
+    }
+
+    const isProtected = !!group.product.resetProtected;
+
+    if (perf.totalUnits === 0) {
+      if (isProtected) {
+        skipped.push({ productId: pid, productName: group.product.name, reason: `Core / Must-Carry — zero units over this window would normally delete it, but it's protected.` });
+        return;
+      }
+      group.refs.forEach((ref) => {
+        changes.push({
+          type: "delete", productId: pid, productName: group.product.name,
+          sectionId: ref.sectionId, fixtureInstId: ref.fixtureInst.id, placementId: ref.placement.id,
+          reason: `Deleted — zero units sold over the last ${lookbackWeeks} weeks.`,
+        });
+      });
+      return;
+    }
+
+    const pctSpace = totalSpace > 0 ? (group.space / totalSpace) * 100 : 0;
+    const pctSales = totalSales > 0 ? (perf.totalSales / totalSales) * 100 : 0;
+    const index = pctSpace > 0 ? (pctSales / pctSpace) * 100 : (pctSales > 0 ? Infinity : 0);
+
+    if (isProtected) {
+      if (index < low) skipped.push({ productId: pid, productName: group.product.name, reason: `Core / Must-Carry — Sales/Space Index ${index.toFixed(0)} is below ${low}, but it's protected from facing reductions.` });
+      return;
+    }
+
+    if (index < low) {
+      const target = [...group.refs].sort((a, b) => (b.placement.facings || 1) - (a.placement.facings || 1))[0];
+      const currentFacings = target.placement.facings || 1;
+      if (currentFacings > 1) {
+        changes.push({
+          type: "reduceFacings", productId: pid, productName: group.product.name,
+          sectionId: target.sectionId, fixtureInstId: target.fixtureInst.id, placementId: target.placement.id,
+          oldFacings: currentFacings, newFacings: currentFacings - 1,
+          reason: `Reduced from ${currentFacings} to ${currentFacings - 1} facings — Sales/Space Index ${index.toFixed(0)} over the last ${lookbackWeeks} weeks (below ${low}).`,
+        });
+      }
+    } else if (index > high) {
+      const target = [...group.refs].sort((a, b) => (b.placement.facings || 1) - (a.placement.facings || 1))[0];
+      const currentFacings = target.placement.facings || 1;
+      const newFacings = currentFacings + 1;
+      if (facingIncreaseFits(target.fixtureInst, target.fixtureDef, products, target.placement.id, newFacings)) {
+        changes.push({
+          type: "increaseFacings", productId: pid, productName: group.product.name,
+          sectionId: target.sectionId, fixtureInstId: target.fixtureInst.id, placementId: target.placement.id,
+          oldFacings: currentFacings, newFacings,
+          reason: `Increased from ${currentFacings} to ${newFacings} facings — Sales/Space Index ${index.toFixed(0)} over the last ${lookbackWeeks} weeks (above ${high}).`,
+        });
+      } else {
+        skipped.push({ productId: pid, productName: group.product.name, reason: `Sales/Space Index ${index.toFixed(0)} is a standout, but its fixture has no room for another facing.` });
+      }
+    }
+  });
+
+  // Missing-winner additions: products not currently on this planogram, in the same Category,
+  // performing well over the same window and at the same scope (store or chain-wide) as
+  // everything above — dropped into whatever room the reductions/deletions just freed up.
+  const planogramCategory = planogram.category || "";
+  if (planogramCategory) {
+    const placedProductIds = new Set(productIds);
+    const candidateScores = products
+      .filter((p) => !placedProductIds.has(p.id) && getAttrByLabel(p, productSchema, ["category"]) === planogramCategory)
+      .map((p) => ({ product: p, perf: aggregateProductPerformanceRange(p.id, performance, startISO, endISO, storeId) }))
+      .filter((c) => c.perf.weeksOfData >= 4 && c.perf.totalUnits > 0)
+      .sort((a, b) => b.perf.totalSales - a.perf.totalSales)
+      .slice(0, 10);
+
+    if (candidateScores.length > 0) {
+      const scopeLabel = storeId ? "this store" : "chain-wide";
+      // effective per-fixture placement list — the reductions/deletions already decided above,
+      // applied to a scratch copy so remaining room reflects the draft so far, not the original
+      const fixtureState = {};
+      placementRefs.forEach((ref) => {
+        if (fixtureState[ref.fixtureInst.id]) return;
+        const toDeleteIds = new Set(changes.filter((c) => c.type === "delete" && c.fixtureInstId === ref.fixtureInst.id).map((c) => c.placementId));
+        const facingEditsLocal = {};
+        changes.forEach((c) => { if ((c.type === "reduceFacings" || c.type === "increaseFacings") && c.fixtureInstId === ref.fixtureInst.id) facingEditsLocal[c.placementId] = c.newFacings; });
+        const effectivePlacements = (ref.fixtureInst.placements || [])
+          .filter((pl) => !toDeleteIds.has(pl.id))
+          .map((pl) => (facingEditsLocal[pl.id] !== undefined ? { ...pl, facings: facingEditsLocal[pl.id] } : pl));
+        fixtureState[ref.fixtureInst.id] = { fixtureInst: ref.fixtureInst, fixtureDef: ref.fixtureDef, sectionId: ref.sectionId, effectivePlacements };
+      });
+
+      const fixturesByRemainder = Object.values(fixtureState)
+        .map((fs) => {
+          const { boxes, totalWidth, widthIn } = layoutFixtureBoxes({ ...fs.fixtureInst, placements: fs.effectivePlacements }, fs.fixtureDef, products);
+          return { ...fs, remainder: boxes.some((b) => b.overflow) ? 0 : widthIn - totalWidth };
+        })
+        .filter((fs) => fs.remainder > 0.1)
+        .sort((a, b) => b.remainder - a.remainder);
+
+      candidateScores.forEach(({ product, perf }) => {
+        for (const fs of fixturesByRemainder) {
+          const newPlacement = { id: uid("pl"), productId: product.id, facings: 1, orientation: "front", rotation: 0, merchStyle: "unit" };
+          const trialFx = { ...fs.fixtureInst, placements: [...fs.effectivePlacements, newPlacement] };
+          const { boxes, totalWidth, widthIn } = layoutFixtureBoxes(trialFx, fs.fixtureDef, products);
+          if (!boxes.some((b) => b.overflow)) {
+            fs.effectivePlacements = [...fs.effectivePlacements, newPlacement];
+            fs.remainder = widthIn - totalWidth;
+            changes.push({
+              type: "addProduct", productId: product.id, productName: product.name,
+              sectionId: fs.sectionId, fixtureInstId: fs.fixtureInst.id, placementId: newPlacement.id,
+              newFacings: 1,
+              reason: `Added — a missing-winner performer ${scopeLabel} ($${Math.round(perf.totalSales).toLocaleString()} in sales over the last ${lookbackWeeks} weeks), not previously on this planogram.`,
+            });
+            break;
+          }
+        }
+      });
+    }
+  }
+
+  return { changes, skipped, startISO, endISO, lookbackWeeks };
+}
+
+// Applies a computed draft's changes to a plain sections array (old ids, not yet cloned) — used
+// right before buildPlanogramVersion, which clones whatever sections it's given with fresh ids.
+// Deletions and facing edits both key off placement id, so order between them doesn't matter.
+function applyResetDraftChanges(sections, changes) {
+  const next = JSON.parse(JSON.stringify(sections));
+  const toDelete = new Set();
+  const facingEdits = {}; // placementId -> newFacings
+  const additions = []; // addProduct changes, applied per-fixture below
+  changes.forEach((c) => {
+    if (c.type === "delete") toDelete.add(c.placementId);
+    else if (c.type === "reduceFacings" || c.type === "increaseFacings") facingEdits[c.placementId] = c.newFacings;
+    else if (c.type === "addProduct") additions.push(c);
+  });
+  next.forEach((section) => {
+    (section.fixtures || []).forEach((fixtureInst) => {
+      fixtureInst.placements = (fixtureInst.placements || [])
+        .filter((pl) => !toDelete.has(pl.id))
+        .map((pl) => (facingEdits[pl.id] !== undefined ? { ...pl, facings: facingEdits[pl.id] } : pl));
+      additions.filter((a) => a.fixtureInstId === fixtureInst.id).forEach((a) => {
+        fixtureInst.placements.push({ id: a.placementId, productId: a.productId, facings: a.newFacings, orientation: "front", rotation: 0, merchStyle: "unit" });
+      });
+    });
+  });
+  return next;
 }
 
 // Pegboards use a true 2D peg grid (1-inch holes) rather than the 1D linear packing every other
@@ -6883,10 +7149,160 @@ function PlanogramIssuesBar({ planogram, onResolveIssue }) {
   );
 }
 
-function PlanogramVersionsBar({ planogram, allPlanograms, onCreateVersion, onOpenVersion }) {
+// Bundled review of an AI-drafted reset: every proposed change, grouped by kind, each with its
+// one-sentence reason. Phase 1 review is all-or-nothing (accept the whole draft or discard it) —
+// per-change accept/reject is a later phase. "Keep as WIP" just marks the draft reviewed so this
+// panel stops intercepting the editor; the planogram is already an ordinary WIP version at that
+// point and goes through the normal Approve → Pending → Live path from there.
+// Draft Score bands, matching the design doc's review guidance: a high score needs only a
+// spot-check, a mid score means something was skipped and worth a look, a low score means the
+// agent mostly couldn't finish the job on its own.
+function resetDraftScoreBand(score) {
+  if (score >= 95) return { label: "Spot-check", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" };
+  if (score >= 80) return { label: "Review skipped items", cls: "bg-amber-50 text-amber-700 border-amber-200" };
+  return { label: "Review in full", cls: "bg-red-50 text-red-700 border-red-200" };
+}
+
+// Every unreviewed AI draft, across every planogram, sorted lowest score first — the stores that
+// most needed a human to finish the job float to the top, rather than a Space Planner working
+// through a bulk run in whatever order the planograms happen to list in.
+function ResetDraftQueue({ planograms, onOpenDraft }) {
+  const pending = planograms
+    .filter((p) => p.resetDraft && !p.resetDraft.reviewed)
+    .sort((a, b) => (a.resetDraft.score ?? 100) - (b.resetDraft.score ?? 100));
+
+  if (pending.length === 0) return null;
+
+  return (
+    <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+      <h3 className="text-sm font-semibold text-blue-900 flex items-center gap-1.5 mb-1"><Sparkles size={15} /> AI Draft Review Queue ({pending.length})</h3>
+      <p className="text-xs text-blue-700 mb-3">Sorted lowest score first — these are the drafts that most needed a human to finish the job.</p>
+      <div className="divide-y divide-blue-100 bg-white rounded-md border border-blue-100">
+        {pending.map((p) => {
+          const score = p.resetDraft.score ?? 100;
+          const band = resetDraftScoreBand(score);
+          return (
+            <button key={p.id} onClick={() => onOpenDraft(p.id)} className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-slate-50">
+              <span className={`text-xs font-bold rounded-full px-2 py-0.5 border shrink-0 ${band.cls}`}>{score}%</span>
+              <span className="flex-1 text-sm font-medium text-slate-800 truncate">{p.name}</span>
+              {p.category && <span className="text-[10px] text-slate-400 shrink-0">{p.category}</span>}
+              <span className="text-[10px] text-slate-400 shrink-0">{(p.resetDraft.changes || []).length} changes, {(p.resetDraft.skipped || []).length} skipped</span>
+              <span className={`text-[10px] font-medium rounded-full px-2 py-0.5 border shrink-0 ${band.cls}`}>{band.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ResetDraftReviewPanel({ planogram, onApprove, onDiscard, onBack }) {
+  const draft = planogram.resetDraft || {};
+  const changes = draft.changes || [];
+  const skipped = draft.skipped || [];
+  const reduced = changes.filter((c) => c.type === "reduceFacings");
+  const increased = changes.filter((c) => c.type === "increaseFacings");
+  const deleted = changes.filter((c) => c.type === "delete");
+  const added = changes.filter((c) => c.type === "addProduct");
+
+  const Group = ({ title, icon: Icon, colorCls, items }) => {
+    if (items.length === 0) return null;
+    return (
+      <div className="bg-white rounded-lg border border-slate-200 p-4 mb-4">
+        <h3 className={`text-sm font-semibold flex items-center gap-1.5 mb-2 ${colorCls}`}><Icon size={15} /> {title} ({items.length})</h3>
+        <div className="divide-y divide-slate-100">
+          {items.map((c, i) => (
+            <div key={i} className="py-2 text-sm">
+              <div className="font-medium text-slate-800">{c.productName}</div>
+              <div className="text-xs text-slate-500">{c.reason}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="max-w-3xl mx-auto">
+      <div className="flex items-center gap-2 mb-4">
+        <button className={btnGhost} onClick={onBack}><ArrowLeft size={14} /> Back</button>
+        <h2 className="text-lg font-bold text-slate-800 flex items-center gap-1.5"><Sparkles size={17} className="text-amber-500" /> AI Draft Review — {planogram.name}</h2>
+      </div>
+      <p className="text-sm text-slate-600 mb-4">
+        Drafted from the last {draft.lookbackWeeks} weeks of performance ({draft.startISO} to {draft.endISO}). {changes.length} change{changes.length === 1 ? "" : "s"} proposed{skipped.length ? `, ${skipped.length} item${skipped.length === 1 ? "" : "s"} skipped` : ""}.
+      </p>
+      {changes.length === 0 && (
+        <p className="text-sm text-slate-500 mb-4">No changes met the thresholds for this window — nothing was proposed.</p>
+      )}
+      <Group title="Missing-Winner Additions" icon={Sparkles} colorCls="text-blue-700" items={added} />
+      <Group title="Facing Reductions" icon={Minus} colorCls="text-amber-700" items={reduced} />
+      <Group title="Facing Increases" icon={Plus} colorCls="text-emerald-700" items={increased} />
+      <Group title="Deletions" icon={Trash2} colorCls="text-red-700" items={deleted} />
+      <Group title="Skipped" icon={AlertTriangle} colorCls="text-slate-500" items={skipped} />
+      <div className="flex items-center gap-2 mt-6">
+        <button className={btnDanger} onClick={onDiscard}><Trash2 size={13} /> Discard Draft</button>
+        <button className={btnPrimary + " ml-auto"} onClick={onApprove}><Check size={14} /> Keep as WIP — Continue to Approve</button>
+      </div>
+    </div>
+  );
+}
+
+// Settings panel for the Reset Drafting Agent's per-category Sales/Space Index thresholds. Lists
+// every Category value found on a planogram (planogram.category — the field set in its own
+// toolbar, not a per-product attribute); a category with no row here uses the chain-wide default.
+function ResetThresholdsEditor({ planograms, resetThresholds, onChange }) {
+  const categories = React.useMemo(() => {
+    const set = new Set();
+    (planograms || []).forEach((p) => { if (p.category) set.add(p.category); });
+    return [...set].sort();
+  }, [planograms]);
+
+  const getRow = (cat) => resetThresholds.find((t) => t.category === cat) || { category: cat, low: DEFAULT_RESET_THRESHOLDS.low, high: DEFAULT_RESET_THRESHOLDS.high };
+
+  const updateRow = (cat, field, value) => {
+    const num = Number(value);
+    if (Number.isNaN(num)) return;
+    const row = getRow(cat);
+    const rest = resetThresholds.filter((t) => t.category !== cat);
+    onChange([...rest, { ...row, [field]: num }]);
+  };
+
+  if (categories.length === 0) {
+    return <p className="text-sm text-slate-500">Set a Category on a planogram to configure Reset Drafting thresholds for it.</p>;
+  }
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="min-w-full text-sm">
+        <thead>
+          <tr className="text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500 border-b border-slate-200">
+            <th className="py-1.5 pr-3">Category</th>
+            <th className="py-1.5 pr-3">Underperform below</th>
+            <th className="py-1.5 pr-3">Standout above</th>
+          </tr>
+        </thead>
+        <tbody>
+          {categories.map((cat) => {
+            const row = getRow(cat);
+            return (
+              <tr key={cat} className="border-b border-slate-100">
+                <td className="py-1.5 pr-3 text-slate-700">{cat}</td>
+                <td className="py-1.5 pr-3"><input type="number" className={inputCls + " w-24"} value={row.low} onChange={(e) => updateRow(cat, "low", e.target.value)} /></td>
+                <td className="py-1.5 pr-3"><input type="number" className={inputCls + " w-24"} value={row.high} onChange={(e) => updateRow(cat, "high", e.target.value)} /></td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function PlanogramVersionsBar({ planogram, allPlanograms, onCreateVersion, onOpenVersion, onDraftReset, draftingReset }) {
   const members = getFamilyMembers(planogram, allPlanograms);
   const isMaster = !planogram.masterId;
   const master = isMaster ? planogram : allPlanograms.find((p) => p.id === planogram.masterId);
+  const [resetWeeks, setResetWeeks] = useState(13);
 
   return (
     <div className="flex flex-wrap items-center gap-3 bg-white border border-slate-200 rounded-lg p-3 mb-4 no-print">
@@ -6908,12 +7324,24 @@ function PlanogramVersionsBar({ planogram, allPlanograms, onCreateVersion, onOpe
           ))}
         </div>
       )}
-      <button className={btnGhost + " ml-auto"} onClick={() => onCreateVersion(planogram)}><Copy size={13} /> Create Version</button>
+      <div className="ml-auto flex items-center gap-2">
+        {onDraftReset && (
+          <>
+            <select className={inputCls + " w-24 py-1"} value={resetWeeks} onChange={(e) => setResetWeeks(Number(e.target.value))} title="Performance lookback window">
+              {[4, 13, 26, 52].map((w) => <option key={w} value={w}>{w} weeks</option>)}
+            </select>
+            <button className={btnGhost} disabled={draftingReset} onClick={() => onDraftReset(planogram, resetWeeks)} title="Reads Performance for this planogram and drafts the next version as a new WIP, with a reason attached to every change.">
+              <Sparkles size={13} /> {draftingReset ? "Drafting…" : "Draft Reset with AI"}
+            </button>
+          </>
+        )}
+        <button className={btnGhost} onClick={() => onCreateVersion(planogram)}><Copy size={13} /> Create Version</button>
+      </div>
     </div>
   );
 }
 
-function PlanogramEditor({ planogram, products, fixtures, performance, productSchema, stores, capacityWarningsEnabled, onAssignStores, onUpdate, onBack, allPlanograms, onCreateVersion, onOpenVersion, onMakeLive, onResolveIssue }) {
+function PlanogramEditor({ planogram, products, fixtures, performance, productSchema, resetThresholds, stores, capacityWarningsEnabled, onAssignStores, onUpdate, onBack, allPlanograms, onCreateVersion, onOpenVersion, onMakeLive, onResolveIssue, onDraftReset, draftingReset, onDiscardResetDraft }) {
   const [presentMode, setPresentMode] = useState(false);
   const [hideImages, setHideImages] = useState(false); // session-only view toggle, not saved with the planogram
   const [highlightField, setHighlightField] = useState(null); // attribute field id, or null = off
@@ -7397,6 +7825,23 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
     fixtures,
   ]);
 
+  // An AI-drafted reset lands as an ordinary WIP version, but one that needs a bundled human
+  // review before anyone works with it in the gondola builder — show that review in place of the
+  // normal editor until it's been Approved or Discarded, rather than inserting it as one more
+  // panel among the rest.
+  if (planogram.resetDraft && !planogram.resetDraft.reviewed) {
+    return (
+      <div className="p-6 max-w-[1400px] mx-auto">
+        <ResetDraftReviewPanel
+          planogram={planogram}
+          onBack={onBack}
+          onApprove={() => onUpdate({ ...planogram, resetDraft: { ...planogram.resetDraft, reviewed: true } })}
+          onDiscard={() => onDiscardResetDraft(planogram)}
+        />
+      </div>
+    );
+  }
+
   // find fixture currently selected for the toolbar (position editing / quick add)
   let fixtureCtx = null;
   if (selectedFixtureId) {
@@ -7432,7 +7877,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
       </div>
 
       {!presentMode && <PlanogramIssuesBar planogram={planogram} onResolveIssue={onResolveIssue} />}
-      {!presentMode && <PlanogramVersionsBar planogram={planogram} allPlanograms={allPlanograms} onCreateVersion={onCreateVersion} onOpenVersion={onOpenVersion} />}
+      {!presentMode && <PlanogramVersionsBar planogram={planogram} allPlanograms={allPlanograms} onCreateVersion={onCreateVersion} onOpenVersion={onOpenVersion} onDraftReset={onDraftReset} draftingReset={draftingReset} />}
       {!presentMode && <PlanogramLifecycleBar planogram={planogram} onUpdate={onUpdate} onMakeLive={onMakeLive} />}
 
       {!presentMode && (
@@ -9159,6 +9604,8 @@ function AppContent({ session }) {
   const [events, setEvents] = useState([]); // Event Planner — reset/promo/etc events
   const [eventTypes, setEventTypes] = useState(DEFAULT_EVENT_TYPES); // customizable event type list
   const [taskTypes, setTaskTypes] = useState(DEFAULT_TASK_TYPES); // customizable Store Assistant task type list
+  const [resetThresholds, setResetThresholds] = useState([]); // [{category, low, high}] — Reset Drafting Agent's Sales/Space Index bounds, per planogram category
+  const [draftingReset, setDraftingReset] = useState(false);
 
   useEffect(() => {
     pendingWriteListeners.add(setPendingSaveCount);
@@ -9177,7 +9624,7 @@ function AppContent({ session }) {
 
     (async () => {
       try {
-        const [pSchema, fSchema, pkField, imgRepo, upcLk, capWarn, prods, fixs, pogs, perf, strs, savedMode, savedStoreId, savedEvents, savedEventTypes, savedTaskTypes] = await Promise.all([
+        const [pSchema, fSchema, pkField, imgRepo, upcLk, capWarn, prods, fixs, pogs, perf, strs, savedMode, savedStoreId, savedEvents, savedEventTypes, savedTaskTypes, savedResetThresholds] = await Promise.all([
           safeGet("schema:product"),
           safeGet("schema:fixture"),
           safeGet("settings:primaryKeyField"),
@@ -9194,6 +9641,7 @@ function AppContent({ session }) {
           safeGet("settings:events"),
           safeGet("schema:eventType"),
           safeGet("schema:taskType"),
+          safeGet("schema:resetThresholds"),
         ]);
         if (settled) return; // the timeout already fired and the app moved on — don't clobber state after the fact
         if (pSchema) setProductSchema(JSON.parse(pSchema));
@@ -9207,6 +9655,7 @@ function AppContent({ session }) {
         if (savedEvents) setEvents(JSON.parse(savedEvents));
         if (savedEventTypes) setEventTypes(JSON.parse(savedEventTypes));
         if (savedTaskTypes) setTaskTypes(JSON.parse(savedTaskTypes));
+        if (savedResetThresholds) setResetThresholds(JSON.parse(savedResetThresholds));
         setProducts(prods);
         setFixtures(fixs);
         setPlanograms(pogs);
@@ -9376,6 +9825,10 @@ function AppContent({ session }) {
     setTaskTypes(next);
     safeSet("schema:taskType", JSON.stringify(next));
   };
+  const updateResetThresholds = (next) => {
+    setResetThresholds(next);
+    safeSet("schema:resetThresholds", JSON.stringify(next));
+  };
 
 
   const createPlanogram = (p) => { setPlanograms((prev) => [...prev, p]); saveIndexed("planogram", p); };
@@ -9456,6 +9909,52 @@ function AppContent({ session }) {
       created.push(next);
     });
     return created;
+  };
+
+  // Reset Drafting Agent (Phase 1): analyzes `source` against Performance, builds the next
+  // version with the proposed changes already applied, and attaches the change list + reasons as
+  // `resetDraft` so PlanogramEditor shows the bundled review instead of the normal gondola builder
+  // until a Space Planner approves or discards it. Still an ordinary WIP version underneath —
+  // approving it is nothing more than clearing resetDraft.reviewed.
+  const draftResetForPlanogram = (source, lookbackWeeks) => {
+    setDraftingReset(true);
+    try {
+      const result = computeResetDraft(source, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, null);
+      const modifiedSections = applyResetDraftChanges(source.sections, result.changes);
+      const next = buildPlanogramVersion({ ...source, sections: modifiedSections }, planograms);
+      next.resetDraft = { ...result, sourceId: source.id, reviewed: false, score: computeDraftScore(result), createdAt: new Date().toISOString() };
+      createPlanogram(next);
+      setActivePlanogramId(next.id);
+    } finally {
+      setDraftingReset(false);
+    }
+  };
+
+  // Phase 3: the same draft logic, run across every selected planogram at once (a cluster or a
+  // whole chain's worth of resets in one go). Each draft lands as its own WIP version with its
+  // own Draft Score, rather than navigating into any one of them — the Review Queue (sorted by
+  // score, lowest first) is where a Space Planner works through the results afterward.
+  const draftResetForPlanogramsBulk = (sources, lookbackWeeks) => {
+    setDraftingReset(true);
+    try {
+      let workingList = planograms;
+      sources.forEach((source) => {
+        const result = computeResetDraft(source, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, null);
+        const modifiedSections = applyResetDraftChanges(source.sections, result.changes);
+        const next = buildPlanogramVersion({ ...source, sections: modifiedSections }, workingList);
+        next.resetDraft = { ...result, sourceId: source.id, reviewed: false, score: computeDraftScore(result), createdAt: new Date().toISOString() };
+        createPlanogram(next);
+        workingList = [...workingList, next];
+      });
+    } finally {
+      setDraftingReset(false);
+    }
+  };
+
+  const discardResetDraft = (draftPlanogram) => {
+    const sourceId = draftPlanogram.resetDraft?.sourceId;
+    deletePlanogramEntity(draftPlanogram.id);
+    if (sourceId) setActivePlanogramId(sourceId);
   };
 
   // Commits a ProSpace import: adds any schema fields it needed (e.g. a UPC field, if the
@@ -9749,7 +10248,7 @@ function AppContent({ session }) {
 
       {!activePlanogram && (
         <div className="bg-white border-b border-slate-200 px-6 flex gap-1">
-          <TabButton active={tab === "planograms"} onClick={() => setTab("planograms")} icon={Layers}>Planograms</TabButton>
+          <TabButton active={tab === "planograms"} onClick={() => setTab("planograms")} icon={Layers} badge={planograms.filter((p) => p.resetDraft && !p.resetDraft.reviewed).length}>Planograms</TabButton>
           <TabButton active={tab === "products"} onClick={() => setTab("products")} icon={Package}>Products</TabButton>
           <TabButton active={tab === "fixtures"} onClick={() => setTab("fixtures")} icon={Boxes}>Fixtures</TabButton>
           <TabButton active={tab === "stores"} onClick={() => setTab("stores")} icon={Store}>Stores</TabButton>
@@ -9769,6 +10268,7 @@ function AppContent({ session }) {
             fixtures={fixtures}
             performance={performance}
             productSchema={productSchema}
+            resetThresholds={resetThresholds}
             stores={stores}
             capacityWarningsEnabled={capacityWarningsEnabled}
             onAssignStores={(storeIds) => assignStoresToPlanogram(activePlanogram.id, storeIds)}
@@ -9779,6 +10279,9 @@ function AppContent({ session }) {
             onOpenVersion={setActivePlanogramId}
             onMakeLive={promoteToLive}
             onResolveIssue={resolvePlanogramIssue}
+            onDraftReset={draftResetForPlanogram}
+            draftingReset={draftingReset}
+            onDiscardResetDraft={discardResetDraft}
           />
         ) : tab === "planograms" ? (
           <PlanogramList
@@ -9794,6 +10297,8 @@ function AppContent({ session }) {
             onCreateVersion={(source) => { const v = createPlanogramVersion(source); setActivePlanogramId(v.id); }}
             onCreateVersions={createPlanogramVersionsBulk}
             onImportProSpace={importProSpaceResults}
+            onDraftResetBulk={draftResetForPlanogramsBulk}
+            draftingReset={draftingReset}
           />
         ) : tab === "products" ? (
           <ProductLibrary
@@ -10026,6 +10531,12 @@ function AppContent({ session }) {
 
             <SchemaEditor title="Product Attribute Fields" schema={productSchema} onChange={updateProductSchema} max={200} />
             <SchemaEditor title="Fixture Attribute Fields" schema={fixtureSchema} onChange={updateFixtureSchema} max={50} />
+
+            <div className="bg-white rounded-lg border border-slate-200 p-4 mt-6">
+              <h3 className="text-sm font-semibold text-slate-800 mb-1 flex items-center gap-1.5"><Sparkles size={15} className="text-amber-500" /> Reset Drafting Thresholds</h3>
+              <p className="text-xs text-slate-500 mb-3">Sales/Space Index bounds the Reset Drafting Agent uses to flag under- and over-performers, by planogram Category. Default {DEFAULT_RESET_THRESHOLDS.low} / {DEFAULT_RESET_THRESHOLDS.high} applies until a category is set here.</p>
+              <ResetThresholdsEditor planograms={planograms} resetThresholds={resetThresholds} onChange={updateResetThresholds} />
+            </div>
           </div>
         )}
       </div>
