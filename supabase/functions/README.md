@@ -10,7 +10,13 @@ protection, scoring and all performance data are read here with the service-role
 ## Deploy
 
 1. Apply `supabase/schema.sql` first (roles and the `agents` table must exist).
-2. With the [Supabase CLI](https://supabase.com/docs/guides/cli):
+2. **Without a local CLI (GitHub Action):** `.github/workflows/deploy-functions.yml` deploys on every push
+   that touches `supabase/functions/`, or on demand. Add two repository secrets once —
+   `SUPABASE_ACCESS_TOKEN` (Supabase dashboard → Account → Access Tokens) and `SUPABASE_PROJECT_ID`
+   (Project Settings → General → Reference ID) — then run it from GitHub → Actions → *Deploy Edge
+   Functions* → *Run workflow*. The `.github` folder must sit at the repository root.
+
+   **Or with the [Supabase CLI](https://supabase.com/docs/guides/cli):**
 
    ```bash
    supabase login
@@ -18,7 +24,7 @@ protection, scoring and all performance data are read here with the service-role
    supabase functions deploy draft-reset
    ```
 
-   No secrets to set: `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are injected into every Edge
+   No Supabase secrets to set: `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are injected into every Edge
    Function automatically. Leave JWT verification on (the default). The handler also checks the
    caller's session and role itself. (An Anthropic API key will be needed by the first agent that
    makes a model call — `supabase secrets set ANTHROPIC_API_KEY=...` — but this one is deterministic.)
