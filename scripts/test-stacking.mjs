@@ -64,6 +64,13 @@ test("mounted-on-pegboard fixtures report unlimited headroom", () => {
   const section = { fixtures: [fxAt("s1", 5, [], { mountedOnId: "p" })] };
   assert.equal(getShelfClearanceIn(pog, section, section.fixtures[0], defs), Infinity);
 });
+test("a shelf's own merchandise height: tightens the gap to a shelf above, replaces the bay height at the top", () => {
+  const section = { fixtures: [fxAt("s1", 0, [], { merchHeightIn: 8 }), fxAt("s2", 20), fxAt("s3", 40, [], { merchHeightIn: 30 })] };
+  assert.equal(getShelfClearanceIn(pog, section, section.fixtures[0], defs), 8);       // 19in gap, 8in merch height
+  assert.equal(getShelfClearanceIn(pog, section, section.fixtures[2], defs), 30);      // nothing above: 30in, not the 15in left in the bay
+  const loose = { fixtures: [fxAt("s1", 0, [], { merchHeightIn: 99 }), fxAt("s2", 20)] };
+  assert.equal(getShelfClearanceIn(pog, loose, loose.fixtures[0], defs), 19 + 1);       // never more than the gap plus the 1in rounding allowance
+});
 test("height problem: fits / too tall / unknown clearance", () => {
   assert.equal(getStackHeightProblem(A, { high: 3 }, products, 15), null);
   assert.match(getStackHeightProblem(A, { high: 4 }, products, 15), /20in tall.*only has 15in/);

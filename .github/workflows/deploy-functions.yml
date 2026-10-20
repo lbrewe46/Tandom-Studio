@@ -32,3 +32,13 @@ jobs:
           test -n "$SUPABASE_PROJECT_ID" || { echo "Missing repository secret SUPABASE_PROJECT_ID"; exit 1; }
       - run: supabase functions deploy draft-reset --project-ref "$SUPABASE_PROJECT_ID"
       - run: supabase functions deploy apply-proposal --project-ref "$SUPABASE_PROJECT_ID"
+      - run: supabase functions deploy ask-tandom --project-ref "$SUPABASE_PROJECT_ID"
+      - name: Set the Ask Tandom model API key (only if the repository secret exists)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            supabase secrets set ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" --project-ref "$SUPABASE_PROJECT_ID"
+          else
+            echo "No ANTHROPIC_API_KEY repository secret — Ask Tandom will answer 'not set up yet' until you add one."
+          fi

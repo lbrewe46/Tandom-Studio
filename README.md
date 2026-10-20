@@ -67,6 +67,20 @@ weekly performance rows — that would mean normalizing the `performance` table 
 which is an isolated follow-up affecting only that one table and `src/lib/db.js`, not the rest
 of the app.
 
+## Editor tabs
+
+Analyze, Planogram Attributes, Lifecycle and Versions are tabs across the top of the planogram editor instead of bars stacked
+above the shelf. Planogram Attributes holds Category, Department, Cluster, Event Date, Stores, Section Count (read-only), size and base; new versions carry Department and Cluster over (the event date starts blank). Nothing is open until you pick a tab, and picking the open tab again closes it. The Analyze tab shows an amber
+dot when the selected period has more weeks than there is data for.
+
+## Product Library and the planogram stay in sync
+
+Selecting a product on the shelf highlights and scrolls to it in the Product Library; clicking a product in the library
+selects its placement on the planogram (and scrolls to it), cycling through them when it is placed more than once. Every
+facing of the linked product draws a blue outline, and a green count on each library row shows how many places it holds on
+this planogram. Double-clicking a library product opens a summary window: attributes, case pack and days-of-supply target,
+performance for the analysis window, and where and how it sits on this planogram (stack, units, days of supply, pack-out).
+
 ## Stacking and capping (ProSpace meanings)
 
 A placement now carries the full ProSpace position: **Facings Wide** (`facings`), **Facings High**
@@ -88,7 +102,10 @@ every existing planogram loads unchanged as 1 high x 1 deep, uncapped. There is 
 - **Depth is enforced too.** Deep x the unit's depth must fit the shelf's depth (12 deep x 2in = 24in on a 24in shelf
   is fine, 13 is refused). A cap lying flat reaches further back than a standing unit, so only as many cap units fit
   front-to-back as the stack below is deep: 10in-long caps over a 24in stack count 2 deep, not 12.
-- ProSpace import reads Facings High and Deep. Caps are not imported yet (their field positions are not mapped).
+- ProSpace import reads Facings High and Deep, caps on top (Y caps: count and orientation) and each shelf's
+  maximum merchandise height. That height is the shelf's own limit: it can tighten the gap to the shelf above, and
+  on a top shelf it replaces the bay height (ProSpace lets a top shelf run past the bay). It can be edited on the
+  fixture. Caps beside or behind the stack (X / Z caps) are not imported and the import says so.
 - The Reset Drafting Agent keeps stacks intact. When a standout product has no room for another facing, it
   proposes stacking one higher if that still clears the shelf above, and new products it adds must clear it too.
 - Sales/Space Index still counts linear width only, so stacking does not change a product's space share.
@@ -192,3 +209,15 @@ which never gets uploaded).
 - **Data isn't showing up / "permission denied" errors in the console** — most likely the SQL
   schema wasn't run, or wasn't run completely. Re-run `supabase/schema.sql` in the SQL Editor —
   it's safe to run more than once.
+
+## Product Library bulk delete (admin only)
+
+Users whose `profiles.role` is `admin` see a checkbox on every product (grid and list), a **Select All (n)** button (selects everything the current search/filter shows) and **Delete Selected (n)**, which asks "Are you sure…" before deleting. Other roles don't see these controls. This is a UI gate; the database's own delete policy (admin and category manager) is unchanged, so no `schema.sql` change is needed.
+
+## Users & Roles (admin only)
+
+Settings → **Users & Roles** lists every signed-up user with a role dropdown (Admin, Category Manager, Store Associate). You can't change your own role, and the last remaining Admin can't be demoted. The database still enforces who may change roles (admin-only policy + trigger); no `schema.sql` change. New sign-ups start as Store Associate. The very first Admin still has to be set once in Supabase: `update profiles set role = 'admin' where email = '...';`.
+
+## Ask Tandom
+
+A chat assistant (Edge Function `ask-tandom`): planners get an **Ask Tandom** button at the bottom right; store associates get an **Ask Tandom** item in the Store Assistant menu. It answers from your data (where products go, what changes in a reset, tasks, issues, case packs, the help guide) and can mark a store task open/completed after the person confirms. See `supabase/functions/README.md` for setup (`ANTHROPIC_API_KEY` repository secret, then re-run `schema.sql`).

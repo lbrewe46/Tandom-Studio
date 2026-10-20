@@ -11,6 +11,44 @@ const ORIENTATIONS = [
 ];
 
 
+// how far ahead of the event date an Approved planogram publishes to Pending, giving stores a
+// window to mark down items that are being discontinued in the reset
+const PENDING_LEAD_DAYS = 21;
+
+
+function todayISO() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+
+// Adds (or subtracts, with a negative count) whole days to an ISO date string, staying entirely
+// in UTC so this can't drift a day off depending on the browser's local timezone.
+function addDaysISO(dateISO, days) {
+  const [y, m, d] = dateISO.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
+
+
+// The status actually in force right now, applying both auto-transition rules in sequence —
+// both driven off the single Event Date, no separate field needed:
+// (1) Approved automatically publishes to Pending 3 weeks before the event date, so stores can
+//     see what's coming and start marking down items being removed.
+// (2) Pending automatically becomes Live exactly on the event date.
+// WIP→Approved and Live→Historical are always explicit, manual actions.
+// This is a pure function so it can be used identically for display and for the persisted-write
+// check below; it never mutates anything itself. The two checks are sequential (not else-if) so
+// a planogram that's gone unchecked long enough can correctly cascade through both in one pass.
+function effectivePlanogramStatus(p) {
+  let status = p.status || "wip";
+  const today = todayISO();
+  if (status === "approved" && p.eventDate && today >= addDaysISO(p.eventDate, -PENDING_LEAD_DAYS)) status = "pending";
+  if (status === "pending" && p.eventDate && today >= p.eventDate) status = "live";
+  return status;
+}
+
+
 // Planogram Versioning: the very first WIP a planogram is created as is its "master". Any copy
 // made from it (or from one of its later versions) is linked back to that SAME master via
 // masterId — a flat family, not a chain, so every version always points directly at the
@@ -18,6 +56,22 @@ const ORIENTATIONS = [
 function getFamilyMasterId(p) {
   return p.masterId || p.id;
 }
+
+function getFamilyMembers(p, allPlanograms) {
+  const masterId = getFamilyMasterId(p);
+  return allPlanograms
+    .filter((x) => getFamilyMasterId(x) === masterId)
+    .sort((a, b) => (a.versionNumber || 1) - (b.versionNumber || 1));
+}
+
+
+// The Live sibling this planogram will replace (or already replaced), used to compute what's
+// actually changing in the reset — the basis for the Store Assistant's New/Deleted/Keep items.
+function getPredecessorPlanogram(planogram, allPlanograms) {
+  const masterId = getFamilyMasterId(planogram);
+  return allPlanograms.find((p) => p.id !== planogram.id && getFamilyMasterId(p) === masterId && (p.status || "wip") === "live") || null;
+}
+
 
 // Deep-clones a planogram's merchandising content (sections → fixtures → placements) with
 // entirely fresh ids at every level, so a new version can never accidentally share a live
@@ -163,6 +217,220 @@ function getResetThreshold(category, resetThresholds) {
 }
 
 
+const HELP_SECTIONS = [
+  {
+    id: "overview",
+    title: "Overview",
+    blocks: [
+      { type: "p", text: "Tandom Studio is an enterprise retail space-planning platform, used several ways. A separate **Event Planner** module coordinates resets, promos, and campaigns across the calendar that drives all planning and execution for merchandising planograms." },
+      { type: "p", text: "Once Events are planned, Space Planners can create planograms that can be store-specific or cluster planograms, then publish to **Store Assistant** so store associates can track and execute a reset once it reaches their store." },
+      { type: "p", text: "This guide walks through every screen, roughly in the order you'd use them. Use the search box on the left to jump straight to a topic." },
+    ],
+  },
+  {
+    id: "askTandom",
+    title: "Ask Tandom",
+    blocks: [
+      { type: "p", text: "**Ask Tandom** is a chat assistant. Planners and admins open it with the **Ask Tandom** button at the bottom right of the screen; store associates find it in the Store Assistant menu." },
+      { type: "ul", items: [
+        "Ask where a product goes, what changes in the next reset (new, deleted and changed items), which tasks are open, what a product's case pack is, or how to do something in the app.",
+        "Store associates only see their own store's planograms, tasks and issues. Planners and admins can ask about anything.",
+        "Ask it to mark a task complete (or reopen it) and it shows a confirmation card; the task only changes when you press **Confirm**.",
+        "It looks answers up in your data rather than guessing, and says so when it can't find something. It can't edit planograms or products.",
+      ] },
+    ],
+  },
+  {
+    id: "eventPlanner",
+    title: "Event Planner",
+    blocks: [
+      { type: "p", text: "A separate full-screen module, reached from the top bar (**Event Planner** button), showing a monthly calendar of resets, promos, and campaigns with month/year navigation, search, and filter-by-type. Event types are fully customizable (defaults: Reset, Promo, Loyalty Campaign, Line Review, Vendor Collaboration, Clearance, Competitor Event, Line Extensions), each with its own label and color." },
+      { type: "p", text: "Creating an event captures **Name**, **Type**, **Owner**, **Start/End Date**, **Lead Time** (in weeks), an optional list of linked planograms, and a **Category**." },
+      { type: "ul", items: [
+        "The **supplier deadline** — Start Date minus Lead Time — is computed live and flagged on the calendar as an alert for anything due within two weeks.",
+        "**Promo conflict detection** flags pairs of Promo-type events in the same category whose date ranges overlap.",
+      ] },
+    ],
+  },
+  {
+    id: "lifecycle",
+    title: "Planogram Lifecycle & Versioning",
+    blocks: [
+      { type: "p", text: "Every planogram moves through five statuses: **WIP → Approved → Pending → Live → Historical.**" },
+      { type: "p", text: "WIP and the Approved step are manual (an explicit \"Approve\" action); the two middle transitions run automatically off a single **Event Date** field: an Approved planogram becomes Pending 21 days before its Event Date, giving stores time to start markdown on items being discontinued, and a Pending planogram becomes Live exactly on the Event Date. Promoting to Live automatically retires any other Live member of the same version family to Historical in the same step, so exactly one Live layout exists per family at a time — a store marking its execution \"Completed\" also triggers this promotion." },
+      { type: "p", text: "Versioning uses a flat family model: the first WIP a planogram is created as becomes that family's master, and every later copy points directly at the master rather than at whichever version it was copied from. \"Create Version\" clones the planogram (sections, fixtures, placements) with a new WIP status and no Event Date." },
+      { type: "p", text: "The **Versions bar** atop the editor lists every family member as a clickable version pill with its own status badge; the planogram list also supports bulk multi-select with a \"Create Versions\" action to version several planograms at once, and nests non-master versions under their master in List view." },
+    ],
+  },
+  {
+    id: "editorBasics",
+    title: "Planogram Editor Basics",
+    blocks: [
+      { type: "p", text: "A planogram is organized into **sections**, each holding a vertical stack of **fixtures** — Shelf, Pegboard, Hook Rail, Basket, or Divider Bar — snapped to 1-inch notches. Drag a fixture from the library into a section to add it, and drag it up or down to reslot it to a new notch position." },
+      { type: "p", text: "Products come from the Product Library and are placed by dragging them onto a fixture. On a shelf, products pack left to right; on a pegboard, drop a product onto an open peg position." },
+      { type: "p", text: "Each product's **Overhang Allowance** controls how far it can extend past a shelf's edge before being flagged as overflow, and its **Squeeze Factor** controls how tightly it can be compressed against neighbors when space is tight — both are set per product in the Product Library." },
+    ],
+  },
+  {
+    id: "multiSelect",
+    title: "Multi-Select & Group Move",
+    blocks: [
+      { type: "p", text: "Hold **Ctrl** (**Cmd** on Mac) and drag anywhere in a section to draw a selection box. Anything the box touches gets selected:" },
+      { type: "ul", items: [
+        "Individual products, on any fixture — a shelf or a pegboard.",
+        "Whole fixture bars — shelves and pegboards — if the box touches the bar itself.",
+      ] },
+      { type: "p", text: "Once something's selected:" },
+      { type: "ul", items: [
+        "Drag any selected product onto a different fixture, and the whole group moves together, in the order they were selected.",
+        "Drag any selected fixture bar up or down, and every selected fixture moves together by the same amount, each one clamped to its own valid range.",
+      ] },
+      { type: "p", text: "Click anywhere empty to clear the selection — selecting something new also clears any previous group automatically." },
+      { type: "p", text: "**Known limitations:**" },
+      { type: "ul", items: [
+        "Moving a group of pegboard-placed products to a *different* pegboard doesn't preserve their relative spacing — they're spread out from the drop point instead.",
+        "Fixtures mounted directly onto a pegboard (the \"shelf on a pegboard backdrop\" pattern) aren't included in the selection box's hit-test yet — select those individually.",
+      ] },
+    ],
+  },
+  {
+    id: "remainingSpace",
+    title: "Remaining Space Label",
+    blocks: [
+      { type: "p", text: "The \"X in left\" / \"X in overhang\" badge on a shelf or pegboard bar only shows when you hover over or select that fixture, instead of always being visible — a cleaner canvas, especially when presenting to retailers. The red \"Over capacity\" warning is unaffected and still always shows. Turn this off entirely (along with capacity warnings generally) in Settings." },
+    ],
+  },
+  {
+    id: "psaImports",
+    title: "PSA Imports from Blue Yonder",
+    blocks: [
+      { type: "p", text: "Planograms can be imported from Blue Yonder .psa file format." },
+      { type: "p", text: "Products and fixtures brought in this way land flagged **Pending Approval**, the same as a manual import, and need review before they're fully part of the library — see Product Library Basics and Fixture Library below." },
+    ],
+  },
+  {
+    id: "productLibrary",
+    title: "Product Library Basics",
+    blocks: [
+      { type: "p", text: "Products created or imported from an external system (like a PSA import) land flagged **Pending Approval**; a filter chip shows the count, and bulk \"Approve All\" / \"Delete All\" actions clear the queue." },
+      { type: "p", text: "The library supports a **column picker** (toggle columns on/off, drag to reorder, drag to resize), Grid and List view toggles, full-text search across name/SKU/every attribute, and sortable columns." },
+      { type: "p", text: "Bulk import/export runs through an Excel workbook: **Download Template** generates a spreadsheet with columns matching your current attribute schema, and **Upload Products** reads a filled-in workbook back in, matching existing products by SKU or UPC (whichever is set as your Primary Key) and creating anything new." },
+    ],
+  },
+  {
+    id: "imageRepo",
+    title: "Product Images — Image Repository",
+    blocks: [
+      { type: "p", text: "Turn this on in Settings to have Tandom automatically find a product's orientation images from your own image server or CDN, matched by a filename pattern you define from the product's UPC or SKU. Configure:" },
+      { type: "ul", items: [
+        "**Lookup Key** — UPC or SKU",
+        "**Base URL** — where your images live (a local folder or a cloud/CDN URL)",
+        "**Filename Pattern** and **File Extensions** — how filenames are built from the key",
+      ] },
+      { type: "p", text: "Once enabled, a **Match from Repository** button appears in the product editor (fills in whichever of the 6 orientation views — Front, Back, Top, Bottom, Left, Right — it can find), and a **Match Images from Repository** bulk button appears in the Product Library toolbar to run it across every product still missing an image." },
+    ],
+  },
+  {
+    id: "webImageLookup",
+    title: "Product Images — Web Image Lookup",
+    blocks: [
+      { type: "p", text: "A second, independent image source for when the Image Repository above has nothing yet — useful right after import, before anyone has sourced images. Rather than a JSON lookup API (every provider we tried blocks browser calls via CORS), this works by guessing a retailer's own public product-image URL pattern and using it if it loads — for example, Kroger's product-image CDN." },
+      { type: "p", text: "Configure in Settings: **Base URL**, **Filename Pattern**, and **File Extensions**, the same shape as the Image Repository above. Retailer CDNs like Kroger's key their images by a specific 13-digit code rather than a raw UPC, so Tandom normalizes the UPC automatically before looking it up:" },
+      { type: "ul", items: [
+        "10-digit UPC → used as-is",
+        "11-digit UPC → drop the leading digit",
+        "12-digit UPC → drop the leading and trailing digit",
+        "13-digit UPC → used as-is",
+      ] },
+      { type: "p", text: "Each of these is then zero-padded to 13 digits, so different digit-lengths for the same product all resolve to the same lookup key." },
+      { type: "p", text: "Same two entry points as the Image Repository: **Find on Web (UPC)** in the product editor, and **Backfill Missing Images from Web** in the Product Library toolbar." },
+      { type: "note", text: "This is a best-effort guess at an undocumented URL pattern, not an official API — it only finds images for products the retailer actually carries, and the retailer could change or block the pattern without notice. Treat the Image Repository as your primary, reliable source and this as a convenience for filling gaps." },
+    ],
+  },
+  {
+    id: "fixtureLibrary",
+    title: "Fixture Library",
+    blocks: [
+      { type: "p", text: "A fixture is a reusable template: **Name**, **Type** (Shelf, Pegboard, Hook Rail, Basket, or Divider Bar), **Dimensions** (W × H × D in inches, snapped to 1\" notches), and any custom attributes from the Fixture Attribute Fields schema (configured in Settings)." },
+      { type: "p", text: "Fixtures imported from an external system land flagged Pending Approval, the same as products, and need to be approved — individually or in bulk — before they're fully part of the library. The library offers Grid/List views and search by name or type." },
+    ],
+  },
+  {
+    id: "storeManagement",
+    title: "Store Management",
+    blocks: [
+      { type: "p", text: "A store record holds **Name**, **Store Number**, **Address**, **Region**, **Format** (Supercenter, Standard Grocery, Express, Fuel & Convenience, or Warehouse), **Square Footage**, and **Status**." },
+      { type: "p", text: "**Status** is the store's own operating status — separate from a planogram's Live/Pending lifecycle, which is about a layout, not the store itself. Options are **Live**, **Inactive**, **Pending**, **Closed**, and **Remodel**. A row of filter chips above the store list (All plus each status, with counts) narrows the list to just that status; a store saved before this field existed is treated as Live until you set it." },
+      { type: "p", text: "Stores get linked to a planogram through an \"Assign Stores\" action on the planogram — that assignment is what makes a planogram appear in a given store's Store Assistant. The Store Library uses the same Grid/List and search pattern as Fixtures." },
+    ],
+  },
+  {
+    id: "storeAssistant",
+    title: "Store Assistant",
+    blocks: [
+      { type: "p", text: "A separate app mode for store-level associates, entered from the top bar (**Store Assistant** button). A store-selector screen stands in for login — just a searchable list of stores to \"become.\"" },
+      { type: "p", text: "The left-nav shell covers:" },
+      { type: "ul", items: [
+        "**My Store** — store profile and its assigned Live/Pending planograms",
+        "**My Activities** — those same planograms with an execution status badge",
+        "**Task Management**",
+        "**Store Feedback**",
+        "**Photo Collection**",
+      ] },
+      { type: "p", text: "Execution status runs **New → Reviewed → In Progress → Partially Completed / Completed / Rejected.** Opening a planogram's instructions auto-advances New to Reviewed; an associate can then mark it Complete, Partially Completed, or Reject (with a reason) — Completed also promotes the planogram to Live. A completed or rejected item can be reopened back to In Progress." },
+      { type: "p", text: "The **Execution Guide** steps an associate through the reset: it compares the planogram against whatever was previously Live and buckets every product into **New Items** (\"Get Inventory\"), **Deleted Items** (\"Remove from Shelf & Markdown\"), or **Keep Items** (\"No Action Needed\") — each a checkable row, with per-section badges showing which changes belong to that section." },
+      { type: "p", text: "**Store Feedback** reports a structured issue (Fixture Mismatch, Physical Obstruction, Shelf Overfilled, Delayed Shipment, Other) plus free text against a planogram." },
+      { type: "p", text: "**Task Management** is the store's own operational to-do list, with a customizable task-type set (defaults: Inventory Audit, Pricing Audit, Fronting and Facing, Restocking, Damaged Good Processing, Other)." },
+      { type: "p", text: "**Photo Collection** uploads a photo tagged with Category, \"Photo Represents\" (Compliance Photo, Issue, or Request), and Execution Date, browsable with a Grid/List toggle." },
+    ],
+  },
+  {
+    id: "performance",
+    title: "Performance",
+    blocks: [
+      { type: "p", text: "The Performance tab imports per-product, per-store sales data (its own Excel template and upload, matched by SKU or UPC) and feeds the sales, margin, and unit-profit figures used by Tandom's analysis tools." },
+    ],
+  },
+  {
+    id: "categoryAnalysis",
+    title: "Analysis — Category Analysis",
+    blocks: [
+      { type: "p", text: "Shows how a category is performing across the whole chain — **%Space**, **%Sales**, **%Units**, and **%Profit** — by joining every Live, store-assigned planogram against imported Performance data." },
+      { type: "p", text: "Pick a **Period** (4/13/26/52 weeks, or all available Performance history), then break the numbers down **By Category**, **By Brand**, **By Manufacturer**, **By Store**, **By Region**, or **By Store Format**. When breaking down by anything other than Category, an optional Category filter narrows the view to just that category." },
+      { type: "p", text: "**Sales/Space Index** = %Sales ÷ %Space × 100. Above 100 means that row is selling more than its shelf space would suggest; below 100 means it's over-spaced relative to its sales — a quick flag for space that could be reallocated." },
+      { type: "p", text: "**Click any row** to drill into its products — a summary of current-period Sales, Units, and Gross Profit versus the same period one year earlier, with a callout for the biggest gainer and decliner, and a sortable per-product table showing each one's own year-over-year change. Clicking a Store row, for example, drills into that store's own products; clicking a Category row (while grouped by something else) drills into that category across whichever stores it appeared in." },
+      { type: "note", text: "%Space is estimated from each placed product's width × facings (× squeeze factor), summed across every Live planogram's assigned stores — the same footprint math the shelf editor itself uses. Pegboard and Hook Rail placements use the same width-based estimate since they don't pack linearly the way a shelf does, so treat their %Space as a close approximation rather than an exact footprint." },
+    ],
+  },
+  {
+    id: "coverageGaps",
+    title: "Analysis — Coverage & Gaps",
+    blocks: [
+      { type: "p", text: "A second view inside the **Analysis** tab (switch to it with the \"Coverage & Gaps\" toggle at the top) for spotting holes rather than measuring performance — three panels:" },
+      { type: "ul", items: [
+        "**Store List by Region** — every store grouped by Region, with a badge showing how many Live planograms are currently assigned to it (a red \"0 live\" badge is easy to spot).",
+        "**Stores With No Live Planogram, by Category** — for each planogram Category, how many of your stores currently have a Live planogram of that category assigned. Click a row to see exactly which stores are missing it.",
+        "**Products Not on Any Active Planogram** — every product that isn't placed on a single Live, Pending, or WIP planogram (Approved and Historical don't count) — a quick way to find items sitting unused in the library.",
+      ] },
+    ],
+  },
+  {
+    id: "settingsReference",
+    title: "Settings Reference",
+    blocks: [
+      { type: "p", text: "The **Settings** tab in the top nav is the full settings screen:" },
+      { type: "ul", items: [
+        "**Backup/Restore** — export or import the entire data set (schemas, products, fixtures, planograms, performance, stores) as one file.",
+        "**Global Settings** — Product Primary Key (SKU or UPC, governs import/performance matching) and a Capacity Warnings toggle (controls the \"X in left/overhang\" badges and red \"Over capacity\" shelf warnings).",
+        "**Image Repository** — auto-match product images from your own server/CDN by UPC or SKU.",
+        "**Web Image Lookup (Retailer CDN)** — auto-match product images from a retailer's public image CDN, as a fallback when the Repository has nothing.",
+        "**Product Attribute Fields** and **Fixture Attribute Fields** — define the custom attribute schema used throughout the product and fixture forms, columns, and templates.",
+      ] },
+    ],
+  },
+];
+
+
 // Merchandising style support: a placement can be sold/displayed as something other than a
 // single "Unit" (e.g. a full Tray or Case), which usually has very different dimensions than
 // the base product. This resolves the dimensions that should actually drive layout/rendering
@@ -257,7 +525,7 @@ function getShelfClearanceIn(planogram, section, fixtureInst, fixtureDefs) {
   const def = defOf(fixtureInst);
   const w = def ? def.dims.w : 24;
   const top = (planogram?.base || 0) + (fixtureInst.notchY || 0) + (def ? def.dims.h : 2);
-  let ceiling = planogram?.dims?.h ?? Infinity;
+  let aboveBottom = null; // underside of the nearest overlapping fixture above, if any
   (section?.fixtures || []).forEach((o) => {
     if (o.id === fixtureInst.id || o.mountedOnId) return;
     const od = defOf(o);
@@ -265,9 +533,16 @@ function getShelfClearanceIn(planogram, section, fixtureInst, fixtureDefs) {
     const ow = od ? od.dims.w : 24;
     const overlaps = (o.xOffset || 0) < (fixtureInst.xOffset || 0) + w && (o.xOffset || 0) + ow > (fixtureInst.xOffset || 0);
     const bottom = (planogram?.base || 0) + (o.notchY || 0);
-    if (overlaps && bottom >= top - 1e-6) ceiling = Math.min(ceiling, bottom);
+    if (overlaps && bottom >= top - 1e-6) aboveBottom = aboveBottom === null ? bottom : Math.min(aboveBottom, bottom);
   });
-  return Math.max(0, ceiling - top);
+  // merchHeightIn is the shelf's own maximum merchandise height (ProSpace's fixture "Merch" setting, or set in
+  // the editor). It can only tighten the gap to a shelf above. With nothing above, it replaces the planogram
+  // height as the limit: ProSpace lets a top shelf run past the bay, and an imported one should not be flagged for it.
+  const merch = Number(fixtureInst.merchHeightIn) > 0 ? Number(fixtureInst.merchHeightIn) : 0;
+  // Imported notches are snapped to whole inches, which can move two shelves a combined inch apart from where the
+  // source had them; a shelf with a stated merchandise height gets that inch back so rounding is not reported as overflow.
+  if (aboveBottom !== null) return Math.max(0, merch ? Math.min(aboveBottom - top + 1, merch) : aboveBottom - top);
+  return Math.max(0, merch || (planogram?.dims?.h ?? Infinity) - top);
 }
 
 
@@ -438,4 +713,4 @@ function applyResetDraftChanges(sections, changes) {
 }
 
 
-export { ORIENTATIONS, getFamilyMasterId, cloneSectionsWithNewIds, makePlanogramVersion, uid, getAttrByLabel, getLatestWeekEnding, getCutoffISO, aggregateProductPerformanceRange, getPlacementSpaceIn, DOS_EXCESS_FACTOR, getDosTargetDays, getDaysOfSupply, getCasePackFill, DEFAULT_RESET_THRESHOLDS, getResetThreshold, getEffectiveDims, getOrientedFaceDims, getStackConfig, getStackDims, getShelfClearanceIn, getStackHeightProblem, getStackDepthProblem, AUTO_STACK_MAX, getAutoStackHigh, refitAutoStacks, layoutFixtureBoxes, applyResetDraftChanges };
+export { ORIENTATIONS, PENDING_LEAD_DAYS, todayISO, addDaysISO, effectivePlanogramStatus, getFamilyMasterId, getFamilyMembers, getPredecessorPlanogram, cloneSectionsWithNewIds, makePlanogramVersion, uid, getAttrByLabel, getLatestWeekEnding, getCutoffISO, aggregateProductPerformanceRange, getPlacementSpaceIn, DOS_EXCESS_FACTOR, getDosTargetDays, getDaysOfSupply, getCasePackFill, DEFAULT_RESET_THRESHOLDS, getResetThreshold, HELP_SECTIONS, getEffectiveDims, getOrientedFaceDims, getStackConfig, getStackDims, getShelfClearanceIn, getStackHeightProblem, getStackDepthProblem, AUTO_STACK_MAX, getAutoStackHigh, refitAutoStacks, layoutFixtureBoxes, applyResetDraftChanges };

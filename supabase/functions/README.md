@@ -4,6 +4,7 @@
 | --- | --- | --- |
 | `draft-reset` | Runs the Reset Drafting Agent over one or more planograms, saves each result as a pending Proposal (with an activity-log entry), and returns the proposed changes, reasons, Draft Score and `proposalId` | `admin`, `category_manager` |
 | `apply-proposal` | Approves a pending Proposal: builds the next WIP planogram version from it and commits the planogram, the Proposal's `applied` status and the activity entry in one transaction. Refuses if the proposal was already decided or the planogram was edited after the draft | `admin`, `category_manager` |
+| `ask-tandom` | Ask Tandom chat. Calls Claude with read-only lookup tools (planograms, reset changes, tasks, issues, products, help guide) scoped to the caller's role/store. Can queue a task status change; the change is written only by a second, confirmed request | `admin`, `category_manager`, `store_associate` |
 
 The browser sends only planogram ids and a lookback window. Thresholds, Core / Must-Carry
 protection, scoring and all performance data are read here with the service-role key.
@@ -24,6 +25,8 @@ protection, scoring and all performance data are read here with the service-role
    supabase link --project-ref <your-project-ref>
    supabase functions deploy draft-reset
    supabase functions deploy apply-proposal
+   supabase functions deploy ask-tandom
+   supabase secrets set ANTHROPIC_API_KEY=...   # Ask Tandom only
    ```
 
    No Supabase secrets to set: `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are injected into every Edge
@@ -81,3 +84,12 @@ Measured locally: 50 planograms against 5,000 products × 52 weekly records ≈ 
 under a second of CPU. Around 20,000 products the payload is ~80 MB and the memory ceiling is the
 likelier limit. Past that — or with per-store weekly records across many stores — performance data
 needs to be normalized into real rows and queried per product, which this function does not do yet.
+
+## Ask Tandom
+
+- Needs the **`ANTHROPIC_API_KEY`** secret. With the GitHub Action, add it once as a repository secret named `ANTHROPIC_API_KEY`; the workflow copies it into Supabase on each deploy (it never goes in the code). Without it the chat answers "isn't set up yet".
+- Optional secret `ASK_TANDOM_MODEL` (default `claude-sonnet-5-5`).
+- Run the latest `supabase/schema.sql` first: it registers the `ask-tandom` agent (`update agents set enabled = false where id = 'ask-tandom'` switches it off instantly).
+- **Scope:** a Store Associate must have a store selected and only sees that store's planograms (approved/pending/live), tasks and issues. Admins and Category Managers see everything. There is no user-to-store link yet, so a store associate's scope is the store selected in Store Assistant.
+- **Writes:** the model can never write. `propose_task_status_change` only queues a proposal; the app shows a confirmation card, and pressing Confirm sends a separate request that updates the task (open/completed) and records `task_status_changed` in the activity log.
+- Tests: `node scripts/test-ask-tandom.mjs` (in `npm run test:edge`).

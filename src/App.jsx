@@ -5,7 +5,7 @@ import {
   RotateCw, X, Layers, Package, Boxes, Ruler, ArrowLeft, Check, Grid3x3,
   Pencil, Save, AlertTriangle, RefreshCw, Download, Upload, FileSpreadsheet, CalendarDays, TrendingUp,
   Maximize2, Minimize2, Store, ChevronDown, ChevronUp, AlignLeft, AlignCenter, AlignRight, Search, Eye, Printer, Copy,
-  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe, HelpCircle, BarChart3, Sparkles
+  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe, HelpCircle, BarChart3, Sparkles, Users, Send
 } from "lucide-react";
 import {
   supabase, supabaseConfigured, pendingWriteListeners,
@@ -1613,7 +1613,7 @@ function ProductColumnsPopover({ schema, visibleColumns, onToggle, onReorder, on
   );
 }
 
-function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLookup, onCreate, onUpdate, onDelete }) {
+function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLookup, onCreate, onUpdate, onDelete, isAdmin }) {
   const [editing, setEditing] = useState(null); // null | "new" | product
   const [importStatus, setImportStatus] = useState(null); // {type:'ok'|'error', message}
   const [importing, setImporting] = useState(false);
@@ -1633,6 +1633,9 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
   const [query, setQuery] = useState("");
   const [pendingOnly, setPendingOnly] = useState(false);
   const pendingCount = React.useMemo(() => products.filter((p) => p.pendingApproval).length, [products]);
+  // Admin-only bulk delete: checkbox selection, Select All (everything the current search/filter shows), Delete Selected
+  const [selectedForDelete, setSelectedForDelete] = useState(() => new Set());
+  const toggleSelectedForDelete = (id) => setSelectedForDelete((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
   // matches against name, SKU, AND every attribute value — not just name — so typing anything
   // that appears anywhere on the product (a size, a vendor, a color) filters it in immediately
   const filteredProducts = React.useMemo(() => {
@@ -1717,6 +1720,18 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
     products.filter((p) => p.pendingApproval).forEach((p) => onUpdate({ ...p, pendingApproval: false }));
     // the pending-only filter would otherwise keep showing an empty grid once nothing left matches it
     setPendingOnly(false);
+  };
+  const selectedProductIds = isAdmin ? filteredProducts.filter((p) => selectedForDelete.has(p.id)).map((p) => p.id) : [];
+  const allShownSelected = filteredProducts.length > 0 && filteredProducts.every((p) => selectedForDelete.has(p.id));
+  const toggleSelectAll = () => setSelectedForDelete(allShownSelected ? new Set() : new Set(filteredProducts.map((p) => p.id)));
+  const deleteSelected = () => {
+    if (!isAdmin) return;
+    const ids = selectedProductIds;
+    if (ids.length === 0) return;
+    const msg = `Are you sure you want to delete ${ids.length === products.length ? "ALL " : ""}${ids.length} product${ids.length !== 1 ? "s" : ""} from the Product Library?\n\nThis can't be undone, and any placements of them on planograms will be affected.`;
+    if (!window.confirm(msg)) return;
+    ids.forEach((id) => onDelete(id));
+    setSelectedForDelete(new Set());
   };
   const deleteAllPending = () => {
     const targets = products.filter((p) => p.pendingApproval);
@@ -1998,6 +2013,25 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
               </button>
             </>
           )}
+          {isAdmin && (
+            <>
+              <button
+                onClick={toggleSelectAll}
+                title="Select every product the current search/filter shows"
+                className="inline-flex items-center gap-1 text-xs font-medium rounded-full px-3 py-1.5 border border-slate-300 text-slate-600 bg-white hover:bg-slate-50"
+              >
+                <Check size={12} /> {allShownSelected ? "Clear Selection" : `Select All (${filteredProducts.length})`}
+              </button>
+              {selectedProductIds.length > 0 && (
+                <button
+                  onClick={deleteSelected}
+                  className="inline-flex items-center gap-1 text-xs font-medium rounded-full px-3 py-1.5 border border-red-300 text-red-600 bg-red-50 hover:bg-red-100"
+                >
+                  <Trash2 size={12} /> Delete Selected ({selectedProductIds.length})
+                </button>
+              )}
+            </>
+          )}
         </div>
       )}
       {products.length === 0 ? (
@@ -2012,12 +2046,14 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
         <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
           <table className="text-xs" style={{ tableLayout: "fixed", width: "100%", minWidth: 480 + visibleColumns.length * 100 }}>
             <colgroup>
+              {isAdmin && <col style={{ width: 32 }} />}
               <col style={{ width: 40 }} />
               {visibleColumns.map((colId) => <col key={colId} style={{ width: columnWidths[colId] || 160 }} />)}
               <col style={{ width: 110 }} />
             </colgroup>
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50">
+                {isAdmin && <th className="pl-3 py-2"><input type="checkbox" className="accent-amber-500" checked={allShownSelected} onChange={toggleSelectAll} title="Select all shown" /></th>}
                 <th className="px-3 py-2"></th>
                 {visibleColumns.map((colId) => (
                   <th key={colId} className="relative text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 overflow-hidden">
@@ -2041,7 +2077,8 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
             </thead>
             <tbody className="divide-y divide-slate-100">
               {sortedProducts.map((p) => (
-                <tr key={p.id} className="hover:bg-slate-50">
+                <tr key={p.id} className={selectedForDelete.has(p.id) && isAdmin ? "bg-red-50" : "hover:bg-slate-50"}>
+                  {isAdmin && <td className="pl-3 py-2"><input type="checkbox" className="accent-amber-500" checked={selectedForDelete.has(p.id)} onChange={() => toggleSelectedForDelete(p.id)} /></td>}
                   <td className="px-3 py-2">
                     <div className="w-8 h-8 rounded bg-slate-50 border border-slate-200 flex items-center justify-center overflow-hidden">
                       {p.images?.front ? (
@@ -2068,7 +2105,8 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           {filteredProducts.map((p) => (
-            <div key={p.id} className="bg-white rounded-lg border border-slate-200 p-3 flex gap-3">
+            <div key={p.id} className={`bg-white rounded-lg border p-3 flex gap-3 ${isAdmin && selectedForDelete.has(p.id) ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"}`}>
+              {isAdmin && <input type="checkbox" className="accent-amber-500 self-start mt-1 shrink-0" checked={selectedForDelete.has(p.id)} onChange={() => toggleSelectedForDelete(p.id)} title="Select for deletion" />}
               <div className="w-14 h-14 rounded bg-slate-50 border border-slate-200 flex items-center justify-center overflow-hidden shrink-0">
                 {p.images?.front ? (
                   <img src={p.images.front} className="max-h-full max-w-full object-contain" />
@@ -3642,6 +3680,19 @@ const HELP_SECTIONS = [
     ],
   },
   {
+    id: "askTandom",
+    title: "Ask Tandom",
+    blocks: [
+      { type: "p", text: "**Ask Tandom** is a chat assistant. Planners and admins open it with the **Ask Tandom** button at the bottom right of the screen; store associates find it in the Store Assistant menu." },
+      { type: "ul", items: [
+        "Ask where a product goes, what changes in the next reset (new, deleted and changed items), which tasks are open, what a product's case pack is, or how to do something in the app.",
+        "Store associates only see their own store's planograms, tasks and issues. Planners and admins can ask about anything.",
+        "Ask it to mark a task complete (or reopen it) and it shows a confirmation card; the task only changes when you press **Confirm**.",
+        "It looks answers up in your data rather than guessing, and says so when it can't find something. It can't edit planograms or products.",
+      ] },
+    ],
+  },
+  {
     id: "eventPlanner",
     title: "Event Planner",
     blocks: [
@@ -4186,6 +4237,8 @@ function parsePSAFile(text) {
         y: psaConv(psaField(row, 5), metric) || 0,
         height: psaConv(psaField(row, 6), metric) || 1,
         depth: psaConv(psaField(row, 8), metric) || 1,
+        // ProSpace's per-fixture maximum merchandise height (Fixture field 22 in 2017 files, 23 in the 2008 dictionary); 0 = not set
+        merchHeight: psaConv(psaField(row, 22), metric) || 0,
         positions: [],
       };
       curPlanogram.fixtures.push(fx);
@@ -4203,10 +4256,17 @@ function parsePSAFile(text) {
         y: psaConv(psaField(row, 5), metric) - curFixture.y,
         merchStyle: PSA_MERCH_STYLE_MAP[psaField(row, 12)] || "unit",
         hFacings: Math.max(1, Math.round(psaNum(psaField(row, 13)) || 1)),
-        // Facings High / Deep (fields 14 and 15, verified against sample .psa totals). Capping lives in
-        // further Position fields that aren't mapped yet, so caps aren't imported.
+        // Facings High / Deep (fields 14 and 15, verified against sample .psa totals).
         vFacings: Math.max(1, Math.round(psaNum(psaField(row, 14)) || 1)),
         dFacings: Math.max(1, Math.round(psaNum(psaField(row, 15)) || 1)),
+        // Capping. Field numbers follow the ProSpace field dictionary (X cap num 16, Y cap num 20, Y cap
+        // orientation 23, Z cap num 24 in these files; checked against the orientation defaults 4 = Top
+        // at 23). A Y cap is units stacked on top of the position, the same product in its own orientation.
+        // X (beside) and Z (behind) caps are counted so the import can say they were left out.
+        yCap: Math.max(0, Math.round(psaNum(psaField(row, 20)) || 0)),
+        yCapFace: (PSA_ORIENTATION_MAP[psaNum(psaField(row, 23))] || ["top", 0])[0],
+        xCap: Math.max(0, Math.round(psaNum(psaField(row, 16)) || 0)),
+        zCap: Math.max(0, Math.round(psaNum(psaField(row, 24)) || 0)),
         orientation: face,
         rotation: rot,
       });
@@ -4303,6 +4363,8 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
 
   let placementCount = 0;
   let skippedPlacements = 0;
+  let sideCapPositions = 0; // positions with X (beside) or Z (behind) caps, which aren't imported
+  let merchHeightFixes = 0; // shelves whose source stacks run past the space above them
   const planogramDrafts = parsed.planograms.map((pg) => {
     // absolute-inch [start, end) range for every segment, used below to find which segment(s) a
     // fixture's physical footprint actually falls in — a real gondola shelf often runs
@@ -4362,6 +4424,8 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
         if (!isPegboard) {
           if (pos.vFacings > 1) placement.high = pos.vFacings;
           if (pos.dFacings > 1) placement.deep = pos.dFacings;
+          if (pos.yCap > 0) placement.cap = { productId: null, count: pos.yCap, orientation: pos.yCapFace };
+          if (pos.xCap > 0 || pos.zCap > 0) sideCapPositions++;
         }
         if (isPegboard) {
           // ProSpace's Position X is the item's LEFT edge on the panel — the same left-edge
@@ -4416,6 +4480,7 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
           notchY: Math.max(0, Math.round(fx.y)),
           xOffset: Math.max(0, Math.round(fx.relativeX)),
           alignment: "left",
+          ...(fx.merchHeight > 0 ? { merchHeightIn: fx.merchHeight } : {}),
           placements: allPlacements.map((p) => p.placement),
         });
         return;
@@ -4443,6 +4508,7 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
           xOffset: 0,
           alignment: "left",
           groupId,
+          ...(fx.merchHeight > 0 ? { merchHeightIn: fx.merchHeight } : {}),
           placements: memberPlacements,
         });
       });
@@ -4455,6 +4521,30 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
       fixtures: fixturesBySegment[segIdx],
       ...(segBackboardStyle[segIdx] ? { backboardStyle: segBackboardStyle[segIdx] } : {}),
     }));
+    // A source shelf may carry stacks taller than the space above it (ProSpace lets a top shelf run past
+    // the bay). Take the source as right: that shelf's merchandise height is set to its tallest stack, so it
+    // opens without red flags, and the height rule still applies to anything added afterwards.
+    {
+      const defs = [...(existingFixtures || []), ...newFixtures];
+      const prods = Object.values(productById);
+      const draftPog = { dims: { h: Math.round(pg.dims.h) || 84 }, base: 0, sections };
+      sections.forEach((sec) => sec.fixtures.forEach((fxi) => {
+        if (defs.find((d) => d.id === fxi.fixtureId)?.type === "Pegboard") return;
+        const clearance = getShelfClearanceIn(draftPog, sec, fxi, defs);
+        if (!Number.isFinite(clearance)) return;
+        let tallest = 0;
+        fxi.placements.forEach((pl) => {
+          const prod = productById[pl.productId];
+          if (prod) tallest = Math.max(tallest, getStackDims(prod, pl, prods).heightIn);
+        });
+        // only a shelf with nothing above it (clearance runs to the top of the bay) gets this; a stack that
+        // is too tall for the shelf above it would collide with that shelf, so it stays flagged
+        const def = defs.find((d) => d.id === fxi.fixtureId);
+        const topGap = draftPog.dims.h - ((fxi.notchY || 0) + (def ? def.dims.h : 2));
+        const nothingAbove = Math.abs(clearance - topGap) < 1e-6;
+        if (nothingAbove && tallest > clearance + 1e-6) { fxi.merchHeightIn = Math.ceil(tallest * 100) / 100; merchHeightFixes++; }
+      }));
+    }
     return {
       id: uid("pog"),
       name: pg.name,
@@ -4472,6 +4562,8 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
   });
 
   if (parsed.planograms.length === 0) warnings.push("No Planogram objects were found in this file.");
+  if (merchHeightFixes > 0) warnings.push(`${merchHeightFixes} top shel${merchHeightFixes === 1 ? "f" : "ves"} carried stacks taller than the bay in the source file (ProSpace allows that), so ${merchHeightFixes === 1 ? "its" : "their"} merchandise height was set to the tallest stack.`);
+  if (sideCapPositions > 0) warnings.push(`${sideCapPositions} position${sideCapPositions === 1 ? "" : "s"} had caps beside or behind the stack (X / Z caps), which aren't imported yet; caps on top are.`);
 
   return {
     planogramDrafts,
@@ -5163,7 +5255,7 @@ function getShelfClearanceIn(planogram, section, fixtureInst, fixtureDefs) {
   const def = defOf(fixtureInst);
   const w = def ? def.dims.w : 24;
   const top = (planogram?.base || 0) + (fixtureInst.notchY || 0) + (def ? def.dims.h : 2);
-  let ceiling = planogram?.dims?.h ?? Infinity;
+  let aboveBottom = null; // underside of the nearest overlapping fixture above, if any
   (section?.fixtures || []).forEach((o) => {
     if (o.id === fixtureInst.id || o.mountedOnId) return;
     const od = defOf(o);
@@ -5171,9 +5263,16 @@ function getShelfClearanceIn(planogram, section, fixtureInst, fixtureDefs) {
     const ow = od ? od.dims.w : 24;
     const overlaps = (o.xOffset || 0) < (fixtureInst.xOffset || 0) + w && (o.xOffset || 0) + ow > (fixtureInst.xOffset || 0);
     const bottom = (planogram?.base || 0) + (o.notchY || 0);
-    if (overlaps && bottom >= top - 1e-6) ceiling = Math.min(ceiling, bottom);
+    if (overlaps && bottom >= top - 1e-6) aboveBottom = aboveBottom === null ? bottom : Math.min(aboveBottom, bottom);
   });
-  return Math.max(0, ceiling - top);
+  // merchHeightIn is the shelf's own maximum merchandise height (ProSpace's fixture "Merch" setting, or set in
+  // the editor). It can only tighten the gap to a shelf above. With nothing above, it replaces the planogram
+  // height as the limit: ProSpace lets a top shelf run past the bay, and an imported one should not be flagged for it.
+  const merch = Number(fixtureInst.merchHeightIn) > 0 ? Number(fixtureInst.merchHeightIn) : 0;
+  // Imported notches are snapped to whole inches, which can move two shelves a combined inch apart from where the
+  // source had them; a shelf with a stated merchandise height gets that inch back so rounding is not reported as overflow.
+  if (aboveBottom !== null) return Math.max(0, merch ? Math.min(aboveBottom - top + 1, merch) : aboveBottom - top);
+  return Math.max(0, merch || (planogram?.dims?.h ?? Infinity) - top);
 }
 
 // null when the stack fits under the shelf above (or headroom is unknown), else a plain-English reason.
@@ -5798,8 +5897,14 @@ function computeJoinedGroupLayouts(planogram, fixtures, products) {
   return result;
 }
 
+// The product currently selected in the Product Library (or implied by the selected placement); every facing of it on
+// the planogram draws a blue outline so the library and the shelf point at the same thing.
+const LinkedProductContext = React.createContext(null);
+
 function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, schema, overlaySettings, onDragStartPlacement, onDragEndPlacement, dragging, readOnly, capacityWarningsEnabled, hideImages, highlightField, zoomLevel, pegYIn, stackProblem }) {
   const { placement, product, xIn, wIn, overflow, effectiveDims, stack } = box;
+  const linkedProductId = React.useContext(LinkedProductContext);
+  const linked = !!linkedProductId && linkedProductId === product.id;
   const dims = effectiveDims || product.dims;
   const img = hideImages ? null : product.images?.[placement.orientation];
   const rotation = placement.rotation || 0;
@@ -5908,8 +6013,9 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
 
   return (
     <div
+      data-placement-id={placement.id}
       className={`absolute ${hasPeg ? "" : "bottom-0"} ${selected ? "z-10" : ""}`}
-      style={{ left: xIn * scale, width: footprintWpx, height: stackHpx, bottom: hasPeg ? pegBottomPx : undefined, pointerEvents: "auto" }}
+      style={{ left: xIn * scale, width: footprintWpx, height: stackHpx, bottom: hasPeg ? pegBottomPx : undefined, pointerEvents: "auto", ...(linked && !selected ? { boxShadow: "0 0 0 2px #38bdf8", zIndex: 5 } : {}) }}
       title={`${product.name} · ${placement.orientation} · ${rotation}°${highCount > 1 ? ` · ${highCount} high` : ""}${deepCount > 1 ? ` · ${deepCount} deep` : ""}${cap ? ` · capped ${cap.count}× ${cap.sameProduct ? "same product" : cap.product.name}` : ""}`}
     >
       {Array.from({ length: highCount }, (_, layer) => renderUnit(layer))}
@@ -7180,11 +7286,111 @@ function PlacementInspector({ placement, product, metrics, weeks, onChange, onRe
   );
 }
 
-function ProductLibraryPanel({ products, schema }) {
+// Double-click a product in the library: everything about it in one place: details, how it sells, and where and
+// how it sits on this planogram (stack, units, days of supply, pack-out).
+function ProductSummaryModal({ product, schema, planogram, products, fixtures, performance, cutoffISO, storeId, dosTargets, weeks, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  const m = aggregateProductPerformance(product.id, performance, cutoffISO, storeId);
+  const where = [];
+  (planogram.sections || []).forEach((sec) => (sec.fixtures || []).forEach((fx) => (fx.placements || []).forEach((pl) => {
+    if (pl.productId !== product.id) return;
+    const def = fixtures.find((f) => f.id === fx.fixtureId);
+    where.push({ sec, fx, def, pl, st: getStackDims(product, pl, products) });
+  })));
+  const units = where.reduce((s, w) => s + w.st.units, 0);
+  const dos = m ? getDaysOfSupply(units, m.avgWeeklyUnits) : null;
+  const target = getDosTargetDays(planogram.category || "", dosTargets, product);
+  const fill = getCasePackFill(units, product.casePack);
+  const f1 = (n) => (Math.round(n * 10) / 10).toString();
+  const attrs = (schema || []).map((f) => [f.label, product.attributes?.[f.id]]).filter(([, v]) => v !== undefined && v !== null && String(v).trim() !== "");
+  const img = product.images?.front;
+  const Row = ({ k, v }) => (<><span className="text-slate-500">{k}</span><span className="text-right font-mono text-slate-800">{v}</span></>);
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-6 no-print" onClick={onClose}>
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-3xl max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-start gap-4 p-5 border-b border-slate-200">
+          <div className="w-20 h-20 rounded border border-slate-200 bg-white flex items-center justify-center overflow-hidden shrink-0">
+            {img ? <img src={img} alt={product.name} className="max-h-full max-w-full object-contain" /> : <div className="w-12 h-12 rounded" style={{ background: hashColor(product.name) }} />}
+          </div>
+          <div className="min-w-0 flex-1">
+            <h3 className="font-bold text-lg text-slate-800">{product.name}</h3>
+            <p className="text-xs text-slate-500 font-mono">{product.sku ? `SKU ${product.sku} · ` : ""}{product.dims.w} × {product.dims.h} × {product.dims.d} in (W × H × D)</p>
+            {product.resetProtected && <span className="inline-block mt-1 text-[10px] font-semibold uppercase tracking-wide rounded-full px-2 py-0.5 bg-sky-50 text-sky-700 border border-sky-200">Core / Must-Carry</span>}
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+        </div>
+        <div className="grid md:grid-cols-2 gap-5 p-5 text-sm">
+          <div className="space-y-4">
+            <div>
+              <h4 className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1.5">Product</h4>
+              {attrs.length === 0 ? <p className="text-xs text-slate-400 italic">No attributes filled in.</p> : (
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">{attrs.map(([k, v]) => <Row key={k} k={k} v={String(v)} />)}</div>
+              )}
+            </div>
+            <div>
+              <h4 className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1.5">Supply</h4>
+              <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
+                <Row k="Case pack" v={product.casePack ? `${product.casePack} units` : "not set"} />
+                <Row k="Days-of-supply target" v={target ? `${target} days${product.dosTargetDays ? " (product)" : ""}` : "not set"} />
+                <Row k="Squeeze / overhang" v={`${Math.round((product.squeezeFactor ?? 1) * 100)}% / ${product.overhangIn || 0}in`} />
+              </div>
+            </div>
+          </div>
+          <div className="space-y-4">
+            <div>
+              <h4 className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1.5">Performance, last {weeks} weeks</h4>
+              {m ? (
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
+                  <Row k="Revenue" v={money0(m.totalSales)} /><Row k="Gross profit" v={money0(m.grossProfit)} />
+                  <Row k="Margin" v={`${m.grossMarginPct.toFixed(1)}%`} /><Row k="Units / week" v={f1(m.avgWeeklyUnits)} />
+                </div>
+              ) : <p className="text-xs text-slate-400 italic">No performance data loaded for this product.</p>}
+            </div>
+            <div>
+              <h4 className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1.5">On this planogram</h4>
+              {where.length === 0 ? <p className="text-xs text-slate-400 italic">Not placed on this planogram.</p> : (
+                <>
+                  <div className="space-y-1.5 mb-2">
+                    {where.map((w) => (
+                      <div key={w.pl.id} className="text-xs bg-slate-50 border border-slate-200 rounded-md px-2 py-1.5">
+                        <div className="font-semibold text-slate-700">{w.sec.name} · {w.def?.name || "Fixture"}{w.def?.type === "Pegboard" ? "" : ` (${w.fx.notchY}in)`}</div>
+                        <div className="text-slate-500">{describeStack(product, w.pl, products)}{w.pl.autoStack ? " · auto-stack" : ""}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
+                    <Row k="Units on shelf" v={units} />
+                    {dos !== null && <Row k="Days of supply" v={`${f1(dos)}${target ? ` / ${target}` : ""}`} />}
+                    {fill && <Row k="Pack-out" v={`${Math.round(fill.cases * 100) / 100} case${fill.cases === 1 ? "" : "s"}${fill.exact ? "" : " (not case / half-case)"}`} />}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProductLibraryPanel({ products, schema, selectedId, placedCounts, onSelect, onOpenSummary }) {
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState(false);
   const filtered = products.filter((p) => p.name.toLowerCase().includes(query.toLowerCase()));
   const thumbRefs = useRef({});
+  const rowRefs = useRef({});
+
+  // keep the selected product visible: clear a search that hides it, then scroll its row into view
+  useEffect(() => {
+    if (!selectedId) return;
+    const p = products.find((x) => x.id === selectedId);
+    if (p && query && !p.name.toLowerCase().includes(query.toLowerCase())) { setQuery(""); return; }
+    rowRefs.current[selectedId]?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [selectedId, query]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className={`shrink-0 bg-white border border-slate-200 rounded-lg p-3 h-fit sticky top-4 flex flex-col transition-all ${expanded ? "w-80 max-h-[85vh]" : "w-56 max-h-[75vh]"}`}>
@@ -7194,7 +7400,7 @@ function ProductLibraryPanel({ products, schema }) {
           {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
         </button>
       </div>
-      <p className="text-[11px] text-slate-400 mb-2">Drag a product onto a shelf to merchandise it.</p>
+      <p className="text-[11px] text-slate-400 mb-2">Drag a product onto a shelf to merchandise it. Click one to find it on the planogram; double-click for its summary.</p>
       <input
         className={inputCls + " mb-2 text-xs"}
         placeholder="Search products…"
@@ -7215,6 +7421,9 @@ function ProductLibraryPanel({ products, schema }) {
           return (
             <div
               key={p.id}
+              ref={(el) => (rowRefs.current[p.id] = el)}
+              onClick={(e) => { if (e.detail <= 1) onSelect && onSelect(p.id); }}
+              onDoubleClick={() => onOpenSummary && onOpenSummary(p.id)}
               draggable
               onDragStart={(e) => {
                 e.dataTransfer.setData("text/plain", JSON.stringify({ kind: "product", productId: p.id }));
@@ -7230,8 +7439,8 @@ function ProductLibraryPanel({ products, schema }) {
                   if (thumb) e.dataTransfer.setDragImage(thumb, 0, 0);
                 } catch (err) {}
               }}
-              className="flex items-center gap-2 border border-slate-200 rounded-md px-2 py-1.5 bg-slate-50 hover:bg-amber-50 hover:border-amber-300 cursor-grab active:cursor-grabbing"
-              title="Drag onto a shelf"
+              className={`flex items-center gap-2 border rounded-md px-2 py-1.5 cursor-grab active:cursor-grabbing ${selectedId === p.id ? "border-sky-400 bg-sky-50 ring-1 ring-sky-300" : "border-slate-200 bg-slate-50 hover:bg-amber-50 hover:border-amber-300"}`}
+              title="Click to find it on the planogram · double-click for details · drag onto a shelf"
             >
               <div
                 ref={(el) => (thumbRefs.current[p.id] = el)}
@@ -7243,10 +7452,13 @@ function ProductLibraryPanel({ products, schema }) {
                   <div className="w-5 h-5 rounded" style={{ background: hashColor(p.name) }} />
                 )}
               </div>
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1">
                 <div className="text-xs font-semibold text-slate-700 truncate">{p.name}</div>
                 <div className="text-[10px] text-slate-400 font-mono">{tag || "—"}</div>
               </div>
+              {placedCounts && placedCounts[p.id] > 0 && (
+                <span className="shrink-0 text-[10px] font-semibold rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5" title={`On this planogram in ${placedCounts[p.id]} place${placedCounts[p.id] === 1 ? "" : "s"}`}>{placedCounts[p.id]}</span>
+              )}
             </div>
           );
         })}
@@ -7946,8 +8158,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false); // session-only, not saved
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false); // session-only, not saved
   const [topBarCollapsed, setTopBarCollapsed] = useState(false); // session-only, not saved
-  const [sectionToolbarCollapsed, setSectionToolbarCollapsed] = useState(false); // session-only, not saved
-  const [analyzeToolbarCollapsed, setAnalyzeToolbarCollapsed] = useState(false); // session-only, not saved
+  const [editorTab, setEditorTab] = useState(null); // which of Analyze / Planogram Attributes / Lifecycle / Versions is open; null = all closed (session-only)
   const canvasScrollRef = useRef(null);
   const recenterCanvas = () => {
     const el = canvasScrollRef.current;
@@ -8207,6 +8418,8 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   // high, or capped) are held to this on moves/drops — a lone tall product keeps its old behavior.
   const [stackNotice, setStackNotice] = useState("");
   const [supplyReportOpen, setSupplyReportOpen] = useState(false);
+  const [libraryProductId, setLibraryProductId] = useState(null); // product highlighted in the library and on the shelf
+  const [summaryProductId, setSummaryProductId] = useState(null);
   useEffect(() => {
     if (!stackNotice) return undefined;
     const t = setTimeout(() => setStackNotice(""), 6000);
@@ -8430,6 +8643,30 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
     }
   }
 
+  // Library <-> planogram sync. Selecting a placement points the library at its product; clicking a product in
+  // the library selects (and scrolls to) its next placement on the planogram, cycling when it is placed more than once.
+  useEffect(() => {
+    if (placementCtx?.product) setLibraryProductId(placementCtx.product.id);
+  }, [placementCtx?.product?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const placedCounts = React.useMemo(() => {
+    const counts = {};
+    planogram.sections.forEach((sec) => (sec.fixtures || []).forEach((fx) => (fx.placements || []).forEach((pl) => { counts[pl.productId] = (counts[pl.productId] || 0) + 1; })));
+    return counts;
+  }, [planogram]);
+  const selectLibraryProduct = (productId) => {
+    setLibraryProductId(productId);
+    const all = [];
+    planogram.sections.forEach((sec) => (sec.fixtures || []).forEach((fx) => (fx.placements || []).forEach((pl) => {
+      if (pl.productId === productId) all.push({ sectionId: sec.id, fixtureInstId: fx.id, placementId: pl.id });
+    })));
+    if (all.length === 0) { setSelectedPlacement(null); return; }
+    const at = selectedPlacement ? all.findIndex((x) => x.placementId === selectedPlacement.placementId) : -1;
+    const next = all[(at + 1) % all.length]; // not currently selected (-1) starts at the first
+    setSelectedPlacement(next);
+    setSelectedFixtureId(null);
+    requestAnimationFrame(() => document.querySelector(`[data-placement-id="${next.placementId}"]`)?.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" }));
+  };
+
   // arrow-key nudging for a selected pegboard placement — moves the peg itself, one real hole
   // at a time (a peg can't occupy a fractional position, so quarter-inch steps never made sense)
   useEffect(() => {
@@ -8506,6 +8743,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   }
 
   return (
+    <LinkedProductContext.Provider value={libraryProductId}>
     <div>
       <div className="flex items-center gap-3 mb-4 no-print">
         <button className={btnGhost} onClick={onBack}><ArrowLeft size={14} /> All Planograms</button>
@@ -8530,20 +8768,46 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
       </div>
 
       {!presentMode && <PlanogramIssuesBar planogram={planogram} onResolveIssue={onResolveIssue} />}
-      {!presentMode && <PlanogramVersionsBar planogram={planogram} allPlanograms={allPlanograms} onCreateVersion={onCreateVersion} onOpenVersion={onOpenVersion} onDraftReset={onDraftReset} draftingReset={draftingReset} />}
-      {!presentMode && <PlanogramLifecycleBar planogram={planogram} onUpdate={onUpdate} onMakeLive={onMakeLive} />}
 
       {!presentMode && (
         <>
-          {sectionToolbarCollapsed ? (
-            <div className="flex justify-center mb-2 no-print">
-              <button onClick={() => setSectionToolbarCollapsed(false)} className="text-slate-400 hover:text-slate-600 rounded-full border border-slate-200 bg-white px-3 py-0.5" title="Show planogram properties / add section">
-                <ChevronDown size={14} />
+          {/* The four panels that used to stack above the canvas are tabs now: nothing opens until it is picked,
+              and picking the open tab again closes it, so the shelf gets the room. */}
+          <div className="flex items-end gap-1 border-b border-slate-200 mb-3 no-print" role="tablist">
+            {[
+              { id: "analyze", label: "Analyze", icon: TrendingUp, warn: availableWeeks > 0 && analysisWeeks > availableWeeks },
+              { id: "attributes", label: "Planogram Attributes", icon: Ruler },
+              { id: "lifecycle", label: "Lifecycle", icon: CalendarDays },
+              { id: "versions", label: "Versions", icon: Layers },
+            ].map((t) => (
+              <button
+                key={t.id}
+                role="tab"
+                aria-selected={editorTab === t.id}
+                onClick={() => setEditorTab((cur) => (cur === t.id ? null : t.id))}
+                className={`-mb-px flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-t-md border border-b-0 ${editorTab === t.id ? "bg-white border-slate-200 text-slate-800" : "bg-transparent border-transparent text-slate-500 hover:text-slate-700 hover:bg-slate-100"}`}
+              >
+                <t.icon size={13} /> {t.label}
+                {t.warn && <span className="w-1.5 h-1.5 rounded-full bg-amber-500" title={`Only ${availableWeeks} of ${analysisWeeks} weeks selected have data loaded`} />}
               </button>
+            ))}
+          </div>
+          {editorTab === "versions" && (
+            <div className="mb-4">
+              <PlanogramVersionsBar planogram={planogram} allPlanograms={allPlanograms} onCreateVersion={onCreateVersion} onOpenVersion={onOpenVersion} onDraftReset={onDraftReset} draftingReset={draftingReset} />
             </div>
-          ) : (
+          )}
+          {editorTab === "lifecycle" && (
+            <div className="mb-4">
+              <PlanogramLifecycleBar planogram={planogram} onUpdate={onUpdate} onMakeLive={onMakeLive} />
+            </div>
+          )}
+
+          {editorTab === "attributes" && (
           <div className="flex flex-wrap items-end gap-3 mb-4 bg-white border border-slate-200 rounded-lg p-3">
             <Field label="Category"><DebouncedTextInput className={inputCls + " w-32"} value={planogram.category || ""} onCommit={(category) => onUpdate({ ...planogram, category })} placeholder="e.g. Beer" /></Field>
+            <Field label="Department"><DebouncedTextInput className={inputCls + " w-36"} value={planogram.department || ""} onCommit={(department) => onUpdate({ ...planogram, department })} placeholder="e.g. Grocery" /></Field>
+            <Field label="Cluster"><DebouncedTextInput className={inputCls + " w-36"} value={planogram.cluster || ""} onCommit={(cluster) => onUpdate({ ...planogram, cluster })} placeholder="e.g. Urban Large" /></Field>
             <Field label="Event Date"><input type="date" className={inputCls + " w-36"} value={planogram.eventDate || ""} onChange={(e) => onUpdate({ ...planogram, eventDate: e.target.value })} /></Field>
             <div className="relative">
               <label className={labelCls}>Stores</label>
@@ -8566,6 +8830,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                 />
               )}
             </div>
+            <Field label="Section Count"><div className={inputCls + " w-24 bg-slate-50 font-mono text-slate-700"} title="Add or remove sections with Add Section and each section's own controls">{planogram.sections.length}</div></Field>
             <Field label="Width (in)"><input type="number" className={inputCls + " w-24"} value={planogram.dims.w} onChange={(e) => onUpdate({ ...planogram, dims: { ...planogram.dims, w: Number(e.target.value) || 1 } })} /></Field>
             <Field label="Height (in)"><input type="number" className={inputCls + " w-24"} value={planogram.dims.h} onChange={(e) => onUpdate({ ...planogram, dims: { ...planogram.dims, h: Number(e.target.value) || 1 } })} /></Field>
             <Field label="Depth (in)"><input type="number" className={inputCls + " w-24"} value={planogram.dims.d} onChange={(e) => onUpdate({ ...planogram, dims: { ...planogram.dims, d: Number(e.target.value) || 1 } })} /></Field>
@@ -8574,24 +8839,10 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
               Sections used: {totalSectionsWidth} / {planogram.dims.w} in
             </div>
             <button className={btnPrimary + " ml-auto"} onClick={addSection}><Plus size={14} /> Add Section</button>
-            <button className={btnIcon} onClick={() => setSectionToolbarCollapsed(true)} title="Collapse this panel"><ChevronUp size={14} /></button>
           </div>
           )}
 
-          {analyzeToolbarCollapsed ? (
-            availableWeeks > 0 && analysisWeeks > availableWeeks ? (
-              <div className="flex items-center justify-between gap-3 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5 mb-2">
-                <span className="flex items-center gap-1.5"><AlertTriangle size={12} /> Only {availableWeeks} of {analysisWeeks} weeks selected have data loaded — figures reflect the {availableWeeks} week{availableWeeks !== 1 ? "s" : ""} available.</span>
-                <button onClick={() => setAnalyzeToolbarCollapsed(false)} className="text-amber-700 hover:text-amber-900 shrink-0 no-print" title="Show performance analysis toolbar"><ChevronDown size={14} /></button>
-              </div>
-            ) : (
-              <div className="flex justify-center mb-2 no-print">
-                <button onClick={() => setAnalyzeToolbarCollapsed(false)} className="text-slate-400 hover:text-slate-600 rounded-full border border-slate-200 bg-white px-3 py-0.5" title="Show performance analysis toolbar">
-                  <ChevronDown size={14} />
-                </button>
-              </div>
-            )
-          ) : (
+          {editorTab === "analyze" && (
           <>
           <div className="flex flex-wrap items-center justify-between gap-3 mb-4 bg-white border border-slate-200 rounded-lg p-3">
             <div className="flex items-center gap-1.5 relative">
@@ -8669,7 +8920,6 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
               ) : (
                 <span className="text-xs text-slate-400 italic">No performance data for the products on this planogram yet.</span>
               )}
-              <button className={btnIcon} onClick={() => setAnalyzeToolbarCollapsed(true)} title="Collapse this panel"><ChevronUp size={14} /></button>
             </div>
           </div>
           {availableWeeks > 0 && analysisWeeks > availableWeeks && (
@@ -8693,6 +8943,8 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                     {planogram.category}
                   </span>
                 )}
+                {planogram.department && <span className="text-xs font-semibold rounded-full px-2 py-0.5 bg-slate-100 text-slate-600 border border-slate-200">Dept: {planogram.department}</span>}
+                {planogram.cluster && <span className="text-xs font-semibold rounded-full px-2 py-0.5 bg-slate-100 text-slate-600 border border-slate-200">Cluster: {planogram.cluster}</span>}
               </div>
               <div className="text-sm text-slate-500 mt-1.5 flex items-center gap-4 flex-wrap">
                 <span className="font-mono">{planogram.dims.w}×{planogram.dims.h}×{planogram.dims.d} in · base {planogram.base}in</span>
@@ -8732,7 +8984,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
               >
                 <ChevronLeft size={12} className="text-slate-500" />
               </button>
-              <ProductLibraryPanel products={products} schema={productSchema} />
+              <ProductLibraryPanel products={products} schema={productSchema} selectedId={libraryProductId} placedCounts={placedCounts} onSelect={selectLibraryProduct} onOpenSummary={setSummaryProductId} />
             </div>
           )
         )}
@@ -8848,6 +9100,9 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
             <ChevronRight size={12} className="text-slate-500" />
           </button>
 
+          {summaryProductId && products.find((p) => p.id === summaryProductId) && (
+            <ProductSummaryModal product={products.find((p) => p.id === summaryProductId)} schema={productSchema} planogram={planogram} products={products} fixtures={fixtures} performance={performance} cutoffISO={cutoffISO} storeId={activeStoreId} dosTargets={dosTargets} weeks={analysisWeeks} onClose={() => setSummaryProductId(null)} />
+          )}
           {supplyReportOpen && (
             <SupplyReportModal planogram={planogram} products={products} performance={performance} cutoffISO={cutoffISO} storeId={activeStoreId} dosTargets={dosTargets} weeks={analysisWeeks} onClose={() => setSupplyReportOpen(false)} />
           )}
@@ -8900,6 +9155,15 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                 </Field>
               </div>
 
+              {!fixtureCtx.fx.mountedOnId && fixtures.find((f) => f.id === fixtureCtx.fx.fixtureId)?.type !== "Pegboard" && (
+                <Field label="Max merchandise height (in, blank = up to the shelf above)">
+                  <input
+                    type="number" min="0" step="0.5" className={inputCls}
+                    value={fixtureCtx.fx.merchHeightIn ?? ""}
+                    onChange={(e) => updateFixtureInst(fixtureCtx.section.id, fixtureCtx.fx.id, { merchHeightIn: Number(e.target.value) > 0 ? Number(e.target.value) : undefined })}
+                  />
+                </Field>
+              )}
               {!fixtureCtx.fx.mountedOnId && fixtures.find((f) => f.id === fixtureCtx.fx.fixtureId)?.type !== "Pegboard" && (
                 <button
                   className={btnGhost + " w-full justify-center"}
@@ -9021,6 +9285,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
         )}
       </div>
     </div>
+    </LinkedProductContext.Provider>
   );
 }
 
@@ -9835,15 +10100,153 @@ function PhotoCollectionView({ store, planograms, onAddPhoto, onDeletePhoto }) {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* Ask Tandom — chat assistant. Answers run server-side in the         */
+/* ask-tandom Edge Function (read-only lookups); the one thing it can  */
+/* do, mark a store task open/completed, is shown as a confirmation    */
+/* card and only happens when the person presses Confirm.              */
+/* ------------------------------------------------------------------ */
+
+const ASK_TANDOM_SUGGESTIONS_STORE = [
+  "What changes in my next reset?",
+  "Which tasks are open?",
+  "Where does the new product go?",
+];
+const ASK_TANDOM_SUGGESTIONS_PLANNER = [
+  "Which planograms go live soon?",
+  "How do planogram versions work?",
+  "What is the case pack for a product?",
+];
+
+function AskTandomPanel({ storeId, storeName, onTaskSynced, compact, onClose }) {
+  const [messages, setMessages] = useState([]); // [{role, content, actions?: [{...action, state: "pending"|"working"|"done"|"dismissed"|"error", error?}]}]
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const endRef = useRef(null);
+  useEffect(() => { endRef.current?.scrollIntoView({ block: "end" }); }, [messages, busy]);
+
+  const send = async (text) => {
+    const content = (text ?? input).trim();
+    if (!content || busy) return;
+    setError("");
+    const next = [...messages, { role: "user", content }];
+    setMessages(next);
+    setInput("");
+    setBusy(true);
+    try {
+      const data = await invokeEdgeFunction("ask-tandom", { messages: next.map((m) => ({ role: m.role, content: m.content })), storeId: storeId || undefined });
+      setMessages((prev) => [...prev, { role: "assistant", content: data.reply || "…", actions: (data.actions || []).map((a) => ({ ...a, state: "pending" })) }]);
+    } catch (e) {
+      setError(e?.message || "Ask Tandom couldn't answer just now.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const setActionState = (mi, ai, patch) => setMessages((prev) => prev.map((m, i) => (i !== mi ? m : { ...m, actions: m.actions.map((a, j) => (j !== ai ? a : { ...a, ...patch })) })));
+
+  const confirm = async (mi, ai) => {
+    const a = messages[mi].actions[ai];
+    setActionState(mi, ai, { state: "working", error: "" });
+    try {
+      const data = await invokeEdgeFunction("ask-tandom", { storeId: storeId || undefined, confirmAction: { type: a.type, storeId: a.storeId, taskId: a.taskId, status: a.toStatus } });
+      setActionState(mi, ai, { state: "done" });
+      if (onTaskSynced && data?.task) onTaskSynced(a.storeId, data.task);
+    } catch (e) {
+      setActionState(mi, ai, { state: "error", error: e?.message || "Couldn't update the task." });
+    }
+  };
+
+  const suggestions = storeId ? ASK_TANDOM_SUGGESTIONS_STORE : ASK_TANDOM_SUGGESTIONS_PLANNER;
+
+  return (
+    <div className={`flex flex-col bg-white ${compact ? "h-full" : "border border-slate-200 rounded-lg h-[calc(100vh-8rem)] min-h-[360px]"}`}>
+      <div className="px-4 py-3 border-b border-slate-200 flex items-center gap-2 shrink-0">
+        <Sparkles size={16} className="text-amber-500" />
+        <div className="flex-1 min-w-0">
+          <div className="font-bold text-sm text-slate-800">Ask Tandom</div>
+          <div className="text-[11px] text-slate-400 truncate">{storeName ? `Answering for ${storeName}` : "Answering across all planograms"}</div>
+        </div>
+        {messages.length > 0 && <button className="text-[11px] text-slate-400 hover:text-slate-600" onClick={() => { setMessages([]); setError(""); }}>New chat</button>}
+        {onClose && <button className="text-slate-400 hover:text-slate-600" onClick={onClose} title="Close"><X size={16} /></button>}
+      </div>
+      <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+        {messages.length === 0 && (
+          <div>
+            <p className="text-sm text-slate-500 mb-3">Ask about resets, where products go, tasks, case packs, or how to do something in Tandom.{storeId ? " I can also mark a task done when you ask." : ""}</p>
+            <div className="flex flex-wrap gap-2">
+              {suggestions.map((t) => (
+                <button key={t} onClick={() => send(t)} className="text-xs rounded-full border border-amber-300 bg-amber-50 text-amber-800 px-3 py-1.5 hover:bg-amber-100">{t}</button>
+              ))}
+            </div>
+          </div>
+        )}
+        {messages.map((m, mi) => (
+          <div key={mi} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>
+            <div className={`max-w-[85%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap ${m.role === "user" ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-800"}`}>
+              {m.content}
+              {(m.actions || []).map((a, ai) => (
+                <div key={ai} className="mt-2 rounded-md border border-amber-300 bg-amber-50 text-slate-800 p-2.5 text-xs whitespace-normal">
+                  <div className="font-semibold mb-0.5">Mark this task {a.toStatus === "completed" ? "completed" : "open"}?</div>
+                  <div className="text-slate-600 mb-2">{a.taskDescription}{a.storeName ? ` · ${a.storeName}` : ""}</div>
+                  {a.state === "pending" && (
+                    <div className="flex gap-2">
+                      <button className={btnPrimary + " !py-1 !text-xs"} onClick={() => confirm(mi, ai)}><Check size={12} /> Confirm</button>
+                      <button className={btnGhost + " !py-1 !text-xs"} onClick={() => setActionState(mi, ai, { state: "dismissed" })}>Cancel</button>
+                    </div>
+                  )}
+                  {a.state === "working" && <span className="text-slate-500 flex items-center gap-1"><RefreshCw size={11} className="animate-spin" /> Updating…</span>}
+                  {a.state === "done" && <span className="text-emerald-700 font-medium">Done — task is now {a.toStatus}.</span>}
+                  {a.state === "dismissed" && <span className="text-slate-400">Cancelled — nothing changed.</span>}
+                  {a.state === "error" && (
+                    <div className="text-red-600">{a.error} <button className="underline ml-1" onClick={() => confirm(mi, ai)}>Try again</button></div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+        {busy && <div className="flex justify-start"><div className="bg-slate-100 text-slate-500 rounded-lg px-3 py-2 text-sm flex items-center gap-2"><RefreshCw size={12} className="animate-spin" /> Looking that up…</div></div>}
+        {error && <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{error}</div>}
+        <div ref={endRef} />
+      </div>
+      <form className="px-3 py-3 border-t border-slate-200 flex gap-2 shrink-0" onSubmit={(e) => { e.preventDefault(); send(); }}>
+        <input className={inputCls} value={input} onChange={(e) => setInput(e.target.value)} placeholder="Ask a question…" disabled={busy} maxLength={1000} />
+        <button type="submit" className={btnPrimary} disabled={busy || !input.trim()} title="Send"><Send size={14} /></button>
+      </form>
+    </div>
+  );
+}
+
+// Planner-side launcher: a floating button that opens the same chat in a corner panel.
+function AskTandomLauncher({ onTaskSynced }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="no-print">
+      {open ? (
+        <div className="fixed bottom-4 right-4 z-40 w-[26rem] max-w-[calc(100vw-2rem)] h-[34rem] max-h-[calc(100vh-2rem)] rounded-lg shadow-2xl border border-slate-300 overflow-hidden">
+          <AskTandomPanel compact onClose={() => setOpen(false)} onTaskSynced={onTaskSynced} />
+        </div>
+      ) : (
+        <button onClick={() => setOpen(true)} className="fixed bottom-4 right-4 z-40 flex items-center gap-2 rounded-full bg-amber-500 text-slate-900 font-semibold text-sm px-4 py-2.5 shadow-lg hover:bg-amber-400">
+          <Sparkles size={16} /> Ask Tandom
+        </button>
+      )}
+    </div>
+  );
+}
+
 const STORE_ASSISTANT_NAV = [
   { id: "myStore", label: "My Store", icon: Store },
   { id: "myActivities", label: "My Activities", icon: Layers },
   { id: "taskManagement", label: "Task Management", icon: Check },
   { id: "storeFeedback", label: "Store Feedback", icon: AlertTriangle },
   { id: "photoCollection", label: "Photo Collection", icon: ImageIcon },
+  { id: "askTandom", label: "Ask Tandom", icon: Sparkles },
 ];
 
-function StoreAssistantModule({ stores, planograms, products, fixtures, selectedStoreId, onSelectStore, onExitToPlanner, onSetExecutionStatus, onCompleteExecution, onMarkReviewed, onToggleItemCheck, onAddIssue, onAddPhoto, onDeletePhoto, onAddTask, onUpdateTask, onDeleteTask, taskTypes, onUpdateTaskTypes }) {
+function StoreAssistantModule({ stores, planograms, products, fixtures, selectedStoreId, onSelectStore, onExitToPlanner, onSetExecutionStatus, onCompleteExecution, onMarkReviewed, onToggleItemCheck, onAddIssue, onAddPhoto, onDeletePhoto, onAddTask, onUpdateTask, onDeleteTask, onTaskSynced, taskTypes, onUpdateTaskTypes }) {
   const [section, setSection] = useState("myActivities");
   const store = stores.find((s) => s.id === selectedStoreId);
 
@@ -9888,6 +10291,7 @@ function StoreAssistantModule({ stores, planograms, products, fixtures, selected
         {section === "taskManagement" && <TaskManagementView store={store} taskTypes={taskTypes} onAddTask={onAddTask} onUpdateTask={onUpdateTask} onDeleteTask={onDeleteTask} onUpdateTaskTypes={onUpdateTaskTypes} />}
         {section === "storeFeedback" && <StoreFeedbackViewSA store={store} planograms={planograms} />}
         {section === "photoCollection" && <PhotoCollectionView store={store} planograms={planograms} onAddPhoto={onAddPhoto} onDeletePhoto={onDeletePhoto} />}
+        {section === "askTandom" && <AskTandomPanel storeId={store.id} storeName={store.name} onTaskSynced={onTaskSynced} />}
       </div>
     </div>
   );
@@ -10263,10 +10667,87 @@ function EventPlannerModule({ events, eventTypes, planograms, onCreateEvent, onU
   );
 }
 
+const USER_ROLES = [
+  { id: "admin", label: "Admin", hint: "Everything, including user roles" },
+  { id: "category_manager", label: "Category Manager", hint: "Edit planograms, products, fixtures, stores" },
+  { id: "store_associate", label: "Store Associate", hint: "View and execute resets; no editing" },
+];
+
+// Admin-only. Lists every profile with a role dropdown. The database already restricts role changes to
+// admins (RLS policy + trigger); the guards here just stop an admin locking themselves, or everyone, out.
+function UserRolesPanel({ currentUserId }) {
+  const [users, setUsers] = useState(null);
+  const [error, setError] = useState("");
+  const [savingId, setSavingId] = useState(null);
+
+  const load = useCallback(async () => {
+    const { data, error: err } = await supabase.from("profiles").select("id, email, display_name, role, created_at").order("created_at", { ascending: true });
+    if (err) { setError(`Couldn't load users: ${err.message}`); return; }
+    setUsers(data || []);
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const adminCount = (users || []).filter((u) => u.role === "admin").length;
+
+  const changeRole = async (user, role) => {
+    if (role === user.role) return;
+    setError("");
+    if (user.id === currentUserId) { setError("You can't change your own role — ask another admin."); return; }
+    if (user.role === "admin" && adminCount <= 1) { setError("There must always be at least one Admin."); return; }
+    setSavingId(user.id);
+    const { error: err } = await supabase.from("profiles").update({ role }).eq("id", user.id);
+    setSavingId(null);
+    if (err) { setError(`Couldn't update ${user.email || "user"}: ${err.message}`); return; }
+    setUsers((prev) => prev.map((u) => (u.id === user.id ? { ...u, role } : u)));
+  };
+
+  return (
+    <div className="bg-white rounded-lg border border-slate-200 p-4 mt-6">
+      <h3 className="text-sm font-semibold text-slate-800 mb-1 flex items-center gap-1.5"><Users size={15} className="text-amber-500" /> Users &amp; Roles</h3>
+      <p className="text-xs text-slate-500 mb-3">
+        New sign-ups start as Store Associate. {USER_ROLES.map((r) => `${r.label}: ${r.hint}`).join(" · ")}. Role changes take effect the next time that person loads the app.
+      </p>
+      {error && <div className="text-sm rounded-md px-3 py-2 mb-3 bg-red-50 text-red-700 border border-red-200">{error}</div>}
+      {users === null && !error && <p className="text-xs text-slate-400 italic">Loading users…</p>}
+      {users && (
+        <div className="divide-y divide-slate-100 border border-slate-200 rounded-md">
+          {users.map((u) => (
+            <div key={u.id} className="flex items-center gap-3 px-3 py-2">
+              <div className="flex-1 min-w-0">
+                <div className="text-sm text-slate-800 truncate">{u.display_name || u.email}{u.id === currentUserId && <span className="ml-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-400">You</span>}</div>
+                {u.display_name && u.display_name !== u.email && <div className="text-xs text-slate-400 truncate">{u.email}</div>}
+              </div>
+              <select
+                className={inputCls + " w-48"}
+                value={u.role || "store_associate"}
+                disabled={savingId === u.id || u.id === currentUserId}
+                title={u.id === currentUserId ? "You can't change your own role" : undefined}
+                onChange={(e) => changeRole(u, e.target.value)}
+              >
+                {USER_ROLES.map((r) => <option key={r.id} value={r.id}>{r.label}</option>)}
+              </select>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AppContent({ session }) {
   const [tab, setTab] = useState("planograms");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
+  const [userRole, setUserRole] = useState(null); // profiles.role: admin | category_manager | store_associate
+  useEffect(() => {
+    let cancelled = false;
+    if (!session?.user?.id) return undefined;
+    supabase.from("profiles").select("role").eq("id", session.user.id).maybeSingle()
+      .then(({ data }) => { if (!cancelled) setUserRole(data?.role || null); })
+      .catch(() => { if (!cancelled) setUserRole(null); });
+    return () => { cancelled = true; };
+  }, [session?.user?.id]);
+  const isAdmin = userRole === "admin";
 
   const [productSchema, setProductSchema] = useState(DEFAULT_PRODUCT_SCHEMA);
   const [fixtureSchema, setFixtureSchema] = useState(DEFAULT_FIXTURE_SCHEMA);
@@ -10485,6 +10966,10 @@ function AppContent({ session }) {
       saveIndexed("store", next);
       return next;
     }));
+  };
+  // The ask-tandom function already saved a confirmed task change; this only mirrors it into local state.
+  const syncStoreTask = (storeId, task) => {
+    setStores((prev) => prev.map((s) => (s.id !== storeId ? s : { ...s, tasks: (s.tasks || []).map((t) => (t.id === task.id ? task : t)) })));
   };
   const deleteStoreTask = (storeId, taskId) => {
     setStores((prev) => prev.map((s) => {
@@ -10919,6 +11404,7 @@ function AppContent({ session }) {
         onAddTask={addStoreTask}
         onUpdateTask={updateStoreTask}
         onDeleteTask={deleteStoreTask}
+        onTaskSynced={syncStoreTask}
         taskTypes={taskTypes}
         onUpdateTaskTypes={updateTaskTypes}
       />
@@ -10949,6 +11435,7 @@ function AppContent({ session }) {
           .print-area { border: none !important; box-shadow: none !important; }
         }
       `}</style>
+      <AskTandomLauncher onTaskSynced={syncStoreTask} />
       <div className="bg-slate-900 text-white px-6 py-3.5 flex items-center gap-3 no-print">
         <div className="w-7 h-7 rounded bg-amber-500 flex items-center justify-center text-slate-900 font-black text-sm">T</div>
         <span className="font-bold tracking-tight">Tandom Studio</span>
@@ -11078,6 +11565,7 @@ function AppContent({ session }) {
             onCreate={createProduct}
             onUpdate={updateProductEntity}
             onDelete={deleteProductEntity}
+            isAdmin={isAdmin}
           />
         ) : tab === "fixtures" ? (
           <FixtureLibrary
@@ -11314,6 +11802,8 @@ function AppContent({ session }) {
               <p className="text-xs text-slate-500 mb-3">Sales/Space Index bounds the Reset Drafting Agent uses to flag under- and over-performers, by planogram Category. Default {DEFAULT_RESET_THRESHOLDS.low} / {DEFAULT_RESET_THRESHOLDS.high} applies until a category is set here.</p>
               <ResetThresholdsEditor planograms={planograms} resetThresholds={resetThresholds} onChange={updateResetThresholds} />
             </div>
+
+            {isAdmin && <UserRolesPanel currentUserId={session?.user?.id} />}
 
             <div className="bg-white rounded-lg border border-slate-200 p-4 mt-6">
               <h3 className="text-sm font-semibold text-slate-800 mb-1 flex items-center gap-1.5"><Sparkles size={15} className="text-amber-500" /> Days of Supply Targets</h3>

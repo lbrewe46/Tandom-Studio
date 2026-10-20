@@ -311,6 +311,12 @@ values ('reset-drafting-agent', 'Reset Drafting Agent',
         array['planogram_version'])
 on conflict (id) do nothing;
 
+insert into agents (id, name, description, allowed_target_types)
+values ('ask-tandom', 'Ask Tandom',
+        'Answers store and planner questions about planograms, resets, tasks and products; can mark a store task open/completed after the person confirms.',
+        array['store_task'])
+on conflict (id) do nothing;
+
 -- ------------------------------------------------------------------
 -- Phase 3: Proposals + activity log
 -- ------------------------------------------------------------------

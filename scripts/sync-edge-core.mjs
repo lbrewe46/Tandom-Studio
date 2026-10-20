@@ -45,6 +45,11 @@ const ROOTS = [
   "getResetThreshold",
   "applyResetDraftChanges",
   "makePlanogramVersion",
+  "effectivePlanogramStatus",
+  "getFamilyMasterId",
+  "getFamilyMembers",
+  "getPredecessorPlanogram",
+  "HELP_SECTIONS",
 ];
 
 const lines = fs.readFileSync(appPath, "utf8").split("\n");
