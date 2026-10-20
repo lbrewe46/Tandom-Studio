@@ -2,14 +2,14 @@
 
 | Function | What it does | Who may call it |
 | --- | --- | --- |
-| `draft-reset` | Runs the Reset Drafting Agent over one or more planograms and returns the proposed changes, reasons and Draft Score | `admin`, `category_manager` |
+| `draft-reset` | Runs the Reset Drafting Agent over one or more planograms, saves each result as a pending Proposal (with an activity-log entry), and returns the proposed changes, reasons, Draft Score and `proposalId` | `admin`, `category_manager` |
 
 The browser sends only planogram ids and a lookback window. Thresholds, Core / Must-Carry
 protection, scoring and all performance data are read here with the service-role key.
 
 ## Deploy
 
-1. Apply `supabase/schema.sql` first (roles and the `agents` table must exist).
+1. Apply `supabase/schema.sql` first (roles, the `agents` table and the `proposals` / `activity_log` tables must exist — the function won't hand back a draft it couldn't record as a Proposal).
 2. **Without a local CLI (GitHub Action):** `.github/workflows/deploy-functions.yml` deploys on every push
    that touches `supabase/functions/`, or on demand. Add two repository secrets once —
    `SUPABASE_ACCESS_TOKEN` (Supabase dashboard → Account → Access Tokens) and `SUPABASE_PROJECT_ID`
@@ -39,7 +39,7 @@ protection, scoring and all performance data are read here with the service-role
      -d '{"planogramIds":["<a planogram id>"],"lookbackWeeks":13}'
    ```
 
-   Expect `200` with `results[0].ok: true`. The same call with a Store Associate's token must
+   Expect `200` with `results[0].ok: true` and a `results[0].proposalId` (a new pending row in `proposals`). The same call with a Store Associate's token must
    return `403`; with no token, `401`.
 
 ## Turning the agent off

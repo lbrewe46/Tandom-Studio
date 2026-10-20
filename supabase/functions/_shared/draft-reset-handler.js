@@ -5,8 +5,13 @@
 // Contract
 //   POST { planogramIds: string[] (1..MAX_PLANOGRAMS_PER_CALL), lookbackWeeks?: int, storeId?: string|null }
 //     (planogramId: string is accepted as shorthand for a one-element planogramIds)
-//   200 { results: [{ planogramId, ok: true, score, result: {changes, skipped, startISO, endISO, lookbackWeeks} }
+//   200 { results: [{ planogramId, ok: true, score, proposalId, result: {changes, skipped, startISO, endISO, lookbackWeeks} }
 //                 | { planogramId, ok: false, error }] }
+//
+// Phase 3: every successful draft is recorded as a pending row in `proposals` (what the agent
+// suggested, why, its Draft Score, who asked) and logged in `activity_log`, using the service-role
+// client. A draft that could not be recorded is reported as a failure — the app never gets a
+// draft it can't trace back to a Proposal.
 //   401 no/invalid JWT · 403 role not allowed or agent disabled · 400 bad input · 405 wrong method
 //
 // The caller never supplies thresholds, protection rules or data — those are read here, with
@@ -51,6 +56,48 @@ function parseSetting(value, fallback) {
   try { return JSON.parse(value); } catch { return fallback; }
 }
 
+function summarize(r) {
+  const { changes, skipped, startISO, endISO, lookbackWeeks } = r.result;
+  const n = changes.length;
+  const k = skipped.length;
+  return `${n} change${n === 1 ? "" : "s"} proposed${k ? `, ${k} skipped` : ""} from the last ${lookbackWeeks} weeks${startISO && endISO ? ` (${startISO} to ${endISO})` : ""}.`;
+}
+
+// Writes one pending Proposal per successful draft, then the matching activity rows. Mutates
+// `results` in place: a draft that couldn't be recorded becomes a failure (its proposal is the
+// audit trail), while a failed activity write is only logged — the Proposal itself is the record
+// of record and review_proposal() writes its own activity rows.
+async function recordProposals(db, results, requestedBy) {
+  const drafted = results.filter((r) => r.ok);
+  if (drafted.length === 0) return;
+  const rows = drafted.map((r) => ({
+    agent_id: AGENT_ID, target_type: TARGET_TYPE, target_id: r.planogramId,
+    proposed_change: r.result, reason: summarize(r), score: r.score, status: "pending", requested_by: requestedBy,
+  }));
+  let data, error;
+  try { ({ data, error } = await db.from("proposals").insert(rows).select("id, target_id")); }
+  catch (e) { error = { message: e?.message || String(e) }; }
+  if (error || !data) {
+    console.error("draft-reset: could not record proposals", error);
+    const why = `Couldn't record the proposal${error?.message ? ` (${error.message})` : ""} — has the latest supabase/schema.sql been run?`;
+    drafted.forEach((r) => { r.ok = false; r.error = why; delete r.result; delete r.score; });
+    return;
+  }
+  const idByTarget = Object.fromEntries(data.map((d) => [d.target_id, d.id]));
+  drafted.forEach((r) => { r.proposalId = idByTarget[r.planogramId]; });
+  try {
+    const { error: logError } = await db.from("activity_log").insert(
+      drafted.map((r) => ({
+        actor_type: "agent", actor_id: AGENT_ID, action: "proposal_created", target_type: TARGET_TYPE, target_id: r.planogramId,
+        detail: { proposalId: r.proposalId, score: r.score, changes: r.result.changes.length, skipped: r.result.skipped.length, lookbackWeeks: r.result.lookbackWeeks, requestedBy },
+      })),
+    );
+    if (logError) console.error("draft-reset: proposals saved but activity log write failed", logError);
+  } catch (e) {
+    console.error("draft-reset: proposals saved but activity log write threw", e);
+  }
+}
+
 export async function handleDraftReset(req, db) {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   if (req.method !== "POST") return json(405, { error: "Use POST" });
@@ -74,7 +121,8 @@ export async function handleDraftReset(req, db) {
   // --- input ---------------------------------------------------------------------------
   let body;
   try { body = await req.json(); } catch { return json(400, { error: "Body must be JSON" }); }
-  const ids = Array.isArray(body?.planogramIds) ? body.planogramIds : body?.planogramId ? [body.planogramId] : [];
+  const rawIds = Array.isArray(body?.planogramIds) ? body.planogramIds : body?.planogramId ? [body.planogramId] : [];
+  const ids = [...new Set(rawIds)]; // one proposal per planogram per call, even if an id is repeated
   if (ids.length === 0 || ids.some((id) => typeof id !== "string" || !id)) return json(400, { error: "planogramIds must be a non-empty array of ids" });
   if (ids.length > MAX_PLANOGRAMS_PER_CALL) return json(400, { error: `At most ${MAX_PLANOGRAMS_PER_CALL} planograms per call` });
   const lookbackWeeks = body.lookbackWeeks === undefined ? 13 : body.lookbackWeeks;
@@ -111,6 +159,7 @@ export async function handleDraftReset(req, db) {
         return { planogramId, ok: false, error: `Draft failed: ${e?.message || e}` };
       }
     });
+    await recordProposals(db, results, userData.user.id);
     return json(200, { results });
   } catch (e) {
     console.error("draft-reset failed", e);

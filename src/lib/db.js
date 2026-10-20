@@ -139,3 +139,69 @@ export async function deleteIndexed(kind, id) {
     trackWriteEnd();
   }
 }
+
+// -------------------------------------------------------------------
+// Proposals + activity log (Phase 3). Agents write Proposals through an
+// Edge Function; people only read them and record a decision through the
+// review_proposal() database function — there is no direct write path.
+// -------------------------------------------------------------------
+
+// Pending Proposals, newest first. `ok` is false when the table can't be read (e.g. the latest
+// schema.sql hasn't been run yet) so callers can fall back instead of treating it as "none".
+export async function loadPendingProposals() {
+  if (!supabase) return { ok: false, rows: [] };
+  try {
+    const { data, error } = await supabase
+      .from("proposals")
+      .select("id, agent_id, target_type, target_id, reason, score, status, requested_by, created_at")
+      .eq("status", "pending")
+      .order("created_at", { ascending: false })
+      .limit(1000);
+    if (error || !data) return { ok: false, rows: [] };
+    return { ok: true, rows: data };
+  } catch (e) {
+    return { ok: false, rows: [] };
+  }
+}
+
+// Records an Admin / Category Manager's decision ("approved" | "rejected"). Throws with the
+// database's message (wrong role, already decided differently, …) so the caller can show it.
+export async function reviewProposal(proposalId, decision, note) {
+  if (!supabase) throw new Error("Supabase isn't configured.");
+  const { data, error } = await supabase.rpc("review_proposal", { p_id: proposalId, p_decision: decision, p_note: note || null });
+  if (error) throw new Error(error.message);
+  return data;
+}
+
+// id -> display name (falls back to email) for the given user ids.
+export async function loadProfileNames(ids) {
+  const unique = [...new Set((ids || []).filter(Boolean))];
+  if (!supabase || unique.length === 0) return {};
+  try {
+    const { data, error } = await supabase.from("profiles").select("id, display_name, email").in("id", unique);
+    if (error || !data) return {};
+    return Object.fromEntries(data.map((p) => [p.id, p.display_name || p.email || "Someone"]));
+  } catch (e) {
+    return {};
+  }
+}
+
+// Newest-first activity for any of the given target ids (a planogram and the version it was
+// drafted from, say), with the people involved resolved to names.
+export async function loadActivity(targetIds, limit = 100) {
+  const ids = [...new Set((targetIds || []).filter(Boolean))];
+  if (!supabase || ids.length === 0) return { ok: true, rows: [], names: {} };
+  try {
+    const { data, error } = await supabase
+      .from("activity_log")
+      .select("id, actor_type, actor_id, action, target_type, target_id, detail, created_at")
+      .in("target_id", ids)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (error || !data) return { ok: false, rows: [], names: {}, error: error?.message };
+    const userIds = data.flatMap((r) => [r.actor_type === "user" ? r.actor_id : null, r.detail?.requestedBy]);
+    return { ok: true, rows: data, names: await loadProfileNames(userIds) };
+  } catch (e) {
+    return { ok: false, rows: [], names: {}, error: e?.message };
+  }
+}

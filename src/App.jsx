@@ -10,6 +10,7 @@ import {
 import {
   supabase, supabaseConfigured, pendingWriteListeners,
   safeGet, safeSet, safeDelete, loadIndexed, saveIndexed, deleteIndexed, waitForPendingWrites,
+  loadPendingProposals, reviewProposal, loadProfileNames, loadActivity,
 } from "./lib/db.js";
 
 /* ------------------------------------------------------------------ */
@@ -4605,7 +4606,7 @@ function NewPlanogramForm({ existingCategories, onCreate, onCancel }) {
   );
 }
 
-function PlanogramList({ planograms, stores, products, fixtures, productSchema, onCreate, onOpen, onDelete, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace, onDraftResetBulk, draftingReset }) {
+function PlanogramList({ planograms, stores, products, fixtures, productSchema, onCreate, onOpen, onDelete, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace, onDraftResetBulk, draftingReset, proposals, profileNames }) {
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
   const [bulkLookbackWeeks, setBulkLookbackWeeks] = useState(13);
@@ -4721,7 +4722,7 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
         />
       )}
 
-      <ResetDraftQueue planograms={planograms} onOpenDraft={onOpen} />
+      <ResetDraftQueue planograms={planograms} proposals={proposals} profileNames={profileNames} onOpenDraft={onOpen} />
 
       {planograms.length > 0 && (
         <div className="bg-white border border-slate-200 rounded-lg p-3 mb-4 space-y-3">
@@ -6989,13 +6990,26 @@ function resetDraftScoreBand(score) {
   return { label: "Review in full", cls: "bg-red-50 text-red-700 border-red-200" };
 }
 
-// Every unreviewed AI draft, across every planogram, sorted lowest score first — the stores that
-// most needed a human to finish the job float to the top, rather than a Space Planner working
-// through a bulk run in whatever order the planograms happen to list in.
-function ResetDraftQueue({ planograms, onOpenDraft }) {
-  const pending = planograms
+// The review queue: every AI draft still waiting on a person, lowest Draft Score first, so the
+// planograms that most needed a human to finish the job float to the top of a bulk run.
+// Membership and score come from the pending Proposals when they could be loaded; a draft whose
+// Proposal has already been decided (say, on another device) drops out, and a draft with no
+// Proposal at all (made before Proposals existed) still shows, so nothing is ever hidden just
+// because the proposals table couldn't be read.
+function buildResetDraftQueue(planograms, proposals) {
+  const pendingById = Object.fromEntries((proposals.rows || []).map((r) => [r.id, r]));
+  return planograms
     .filter((p) => p.resetDraft && !p.resetDraft.reviewed)
-    .sort((a, b) => (a.resetDraft.score ?? 100) - (b.resetDraft.score ?? 100));
+    .filter((p) => !(p.resetDraft.proposalId && proposals.loaded && !pendingById[p.resetDraft.proposalId]))
+    .map((p) => {
+      const proposal = pendingById[p.resetDraft.proposalId];
+      return { planogram: p, proposal, score: proposal?.score ?? p.resetDraft.score ?? 100 };
+    })
+    .sort((a, b) => a.score - b.score);
+}
+
+function ResetDraftQueue({ planograms, proposals, profileNames, onOpenDraft }) {
+  const pending = buildResetDraftQueue(planograms, proposals);
 
   if (pending.length === 0) return null;
 
@@ -7004,13 +7018,16 @@ function ResetDraftQueue({ planograms, onOpenDraft }) {
       <h3 className="text-sm font-semibold text-blue-900 flex items-center gap-1.5 mb-1"><Sparkles size={15} /> AI Draft Review Queue ({pending.length})</h3>
       <p className="text-xs text-blue-700 mb-3">Sorted lowest score first — these are the drafts that most needed a human to finish the job.</p>
       <div className="divide-y divide-blue-100 bg-white rounded-md border border-blue-100">
-        {pending.map((p) => {
-          const score = p.resetDraft.score ?? 100;
+        {pending.map(({ planogram: p, proposal, score }) => {
           const band = resetDraftScoreBand(score);
+          const requester = proposal?.requested_by ? profileNames[proposal.requested_by] : null;
           return (
             <button key={p.id} onClick={() => onOpenDraft(p.id)} className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-slate-50">
               <span className={`text-xs font-bold rounded-full px-2 py-0.5 border shrink-0 ${band.cls}`}>{score}%</span>
-              <span className="flex-1 text-sm font-medium text-slate-800 truncate">{p.name}</span>
+              <span className="flex-1 min-w-0">
+                <span className="block text-sm font-medium text-slate-800 truncate">{p.name}</span>
+                {proposal && <span className="block text-[10px] text-slate-400 truncate">{requester ? `Requested by ${requester} · ` : ""}{new Date(proposal.created_at).toLocaleString()}</span>}
+              </span>
               {p.category && <span className="text-[10px] text-slate-400 shrink-0">{p.category}</span>}
               <span className="text-[10px] text-slate-400 shrink-0">{(p.resetDraft.changes || []).length} changes, {(p.resetDraft.skipped || []).length} skipped</span>
               <span className={`text-[10px] font-medium rounded-full px-2 py-0.5 border shrink-0 ${band.cls}`}>{band.label}</span>
@@ -7124,13 +7141,81 @@ function ResetThresholdsEditor({ planograms, resetThresholds, onChange }) {
   );
 }
 
+// Names for agent actors in the Activity log (agents aren't users, so they have no profile row).
+const AGENT_DISPLAY_NAMES = { "reset-drafting-agent": "Reset Drafting Agent" };
+
+// One Activity row -> a sentence a person can read. Unknown actions still render (as the raw
+// action name) so a newer agent's entries don't vanish from an older build of the app.
+function describeActivity(row, names) {
+  const d = row.detail || {};
+  const actor = row.actor_type === "agent" ? (AGENT_DISPLAY_NAMES[row.actor_id] || row.actor_id) : (names[row.actor_id] || "A teammate");
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  if (row.action === "proposal_created") {
+    const requester = d.requestedBy ? names[d.requestedBy] : null;
+    return {
+      icon: Sparkles, cls: "text-blue-600 bg-blue-50",
+      title: `${actor} proposed ${plural(d.changes ?? 0, "change")}${d.skipped ? `, ${d.skipped} skipped` : ""}`,
+      sub: [d.score != null ? `Draft Score ${d.score}%` : null, d.lookbackWeeks ? `last ${d.lookbackWeeks} weeks` : null, requester ? `requested by ${requester}` : null].filter(Boolean).join(" · "),
+    };
+  }
+  if (row.action === "proposal_approved") return { icon: Check, cls: "text-emerald-600 bg-emerald-50", title: `${actor} approved the AI draft`, sub: d.note || "" };
+  if (row.action === "proposal_rejected") return { icon: X, cls: "text-red-600 bg-red-50", title: `${actor} rejected the AI draft`, sub: d.note || "" };
+  return { icon: AlertTriangle, cls: "text-slate-500 bg-slate-100", title: `${actor}: ${row.action}`, sub: "" };
+}
+
+// The Activity panel on a planogram: who (or which agent) did what to it, newest first. Reads the
+// append-only activity_log; it covers this planogram and, for an AI draft, the version it was
+// drafted from, since that is what the agent's proposal was recorded against.
+function PlanogramActivity({ planogram }) {
+  const ids = [planogram.id, planogram.resetDraft?.sourceId].filter(Boolean);
+  const idsKey = ids.join("|");
+  const [state, setState] = useState({ status: "loading", rows: [], names: {} });
+  const load = useCallback(async () => {
+    setState((prev) => ({ ...prev, status: "loading" }));
+    const result = await loadActivity(idsKey.split("|"));
+    setState(result.ok ? { status: "ready", rows: result.rows, names: result.names } : { status: "error", rows: [], names: {} });
+  }, [idsKey]);
+  useEffect(() => { load(); }, [load]);
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-lg p-4 mb-4 no-print">
+      <div className="flex items-center gap-2 mb-2">
+        <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-1.5"><TrendingUp size={14} /> Activity</h3>
+        <button className={btnGhost + " ml-auto"} onClick={load} disabled={state.status === "loading"}><RefreshCw size={12} /> Refresh</button>
+      </div>
+      {state.status === "error" && <p className="text-sm text-amber-700">Activity couldn't be loaded. If the latest <code>supabase/schema.sql</code> hasn't been run yet, run it in the Supabase SQL Editor.</p>}
+      {state.status === "loading" && state.rows.length === 0 && <p className="text-sm text-slate-400">Loading…</p>}
+      {state.status === "ready" && state.rows.length === 0 && <p className="text-sm text-slate-500">Nothing recorded for this planogram yet. AI drafts and the decisions made on them will show up here.</p>}
+      {state.rows.length > 0 && (
+        <ul className="divide-y divide-slate-100">
+          {state.rows.map((row) => {
+            const { icon: Icon, cls, title, sub } = describeActivity(row, state.names);
+            return (
+              <li key={row.id} className="flex items-start gap-3 py-2">
+                <span className={`mt-0.5 w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${cls}`}><Icon size={13} /></span>
+                <span className="flex-1 min-w-0">
+                  <span className="block text-sm text-slate-800">{title}</span>
+                  {sub && <span className="block text-xs text-slate-500">{sub}</span>}
+                </span>
+                <span className="text-[11px] text-slate-400 shrink-0">{new Date(row.created_at).toLocaleString()}</span>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function PlanogramVersionsBar({ planogram, allPlanograms, onCreateVersion, onOpenVersion, onDraftReset, draftingReset }) {
   const members = getFamilyMembers(planogram, allPlanograms);
   const isMaster = !planogram.masterId;
   const master = isMaster ? planogram : allPlanograms.find((p) => p.id === planogram.masterId);
   const [resetWeeks, setResetWeeks] = useState(13);
+  const [showActivity, setShowActivity] = useState(false); // session-only view toggle
 
   return (
+    <>
     <div className="flex flex-wrap items-center gap-3 bg-white border border-slate-200 rounded-lg p-3 mb-4 no-print">
       <span className="text-xs font-semibold text-slate-500">
         Version {planogram.versionNumber || 1}{!isMaster && master ? ` of "${master.name}"` : " (master)"}:
@@ -7162,12 +7247,15 @@ function PlanogramVersionsBar({ planogram, allPlanograms, onCreateVersion, onOpe
           </>
         )}
         <button className={btnGhost} onClick={() => onCreateVersion(planogram)}><Copy size={13} /> Create Version</button>
+        <button className={btnGhost + (showActivity ? " bg-slate-100" : "")} onClick={() => setShowActivity((v) => !v)} aria-pressed={showActivity} title="Who proposed, approved or rejected what on this planogram"><TrendingUp size={13} /> Activity</button>
       </div>
     </div>
+    {showActivity && <PlanogramActivity planogram={planogram} />}
+    </>
   );
 }
 
-function PlanogramEditor({ planogram, products, fixtures, performance, productSchema, resetThresholds, stores, capacityWarningsEnabled, onAssignStores, onUpdate, onBack, allPlanograms, onCreateVersion, onOpenVersion, onMakeLive, onResolveIssue, onDraftReset, draftingReset, onDiscardResetDraft }) {
+function PlanogramEditor({ planogram, products, fixtures, performance, productSchema, resetThresholds, stores, capacityWarningsEnabled, onAssignStores, onUpdate, onBack, allPlanograms, onCreateVersion, onOpenVersion, onMakeLive, onResolveIssue, onDraftReset, draftingReset, onApproveResetDraft, onDiscardResetDraft }) {
   const [presentMode, setPresentMode] = useState(false);
   const [hideImages, setHideImages] = useState(false); // session-only view toggle, not saved with the planogram
   const [highlightField, setHighlightField] = useState(null); // attribute field id, or null = off
@@ -7661,7 +7749,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
         <ResetDraftReviewPanel
           planogram={planogram}
           onBack={onBack}
-          onApprove={() => onUpdate({ ...planogram, resetDraft: { ...planogram.resetDraft, reviewed: true } })}
+          onApprove={() => onApproveResetDraft(planogram)}
           onDiscard={() => onDiscardResetDraft(planogram)}
         />
       </div>
@@ -9432,6 +9520,20 @@ function AppContent({ session }) {
   const [taskTypes, setTaskTypes] = useState(DEFAULT_TASK_TYPES); // customizable Store Assistant task type list
   const [resetThresholds, setResetThresholds] = useState([]); // [{category, low, high}] — Reset Drafting Agent's Sales/Space Index bounds, per planogram category
   const [draftingReset, setDraftingReset] = useState(false);
+  const [proposals, setProposals] = useState({ loaded: false, rows: [] }); // pending agent Proposals (see ResetDraftQueue)
+  const [profileNames, setProfileNames] = useState({}); // user id -> display name, for "requested by"
+
+  // Pending Proposals drive the review queue. A failed read leaves loaded:false, which makes the
+  // queue fall back to the drafts themselves rather than showing nothing.
+  const refreshProposals = useCallback(async () => {
+    const result = await loadPendingProposals();
+    setProposals({ loaded: result.ok, rows: result.rows });
+    if (result.ok) {
+      const names = await loadProfileNames(result.rows.map((r) => r.requested_by));
+      setProfileNames((prev) => ({ ...prev, ...names }));
+    }
+  }, []);
+  useEffect(() => { refreshProposals(); }, [refreshProposals]);
 
   useEffect(() => {
     pendingWriteListeners.add(setPendingSaveCount);
@@ -9676,6 +9778,12 @@ function AppContent({ session }) {
     saveIndexed("planogram", p);
   }, []);
   const deletePlanogramEntity = (id) => {
+    // Deleting an unreviewed AI draft from anywhere (e.g. the planogram list) counts as rejecting
+    // it, so its Proposal doesn't sit pending forever. Already decided -> the database no-ops.
+    const doomed = planograms.find((x) => x.id === id);
+    if (doomed?.resetDraft?.proposalId && !doomed.resetDraft.reviewed) {
+      reviewProposal(doomed.resetDraft.proposalId, "rejected", `Draft version "${doomed.name}" deleted`).catch(() => {}).finally(refreshProposals);
+    }
     setPlanograms((prev) => prev.filter((x) => x.id !== id));
     deleteIndexed("planogram", id);
     if (activePlanogramId === id) setActivePlanogramId(null);
@@ -9745,7 +9853,7 @@ function AppContent({ session }) {
   const buildDraftVersion = (source, draft, existingList) => {
     const modifiedSections = applyResetDraftChanges(source.sections, draft.result.changes);
     const next = buildPlanogramVersion({ ...source, sections: modifiedSections }, existingList);
-    next.resetDraft = { ...draft.result, sourceId: source.id, reviewed: false, score: draft.score, createdAt: new Date().toISOString() };
+    next.resetDraft = { ...draft.result, sourceId: source.id, proposalId: draft.proposalId || null, reviewed: false, score: draft.score, createdAt: new Date().toISOString() };
     return next;
   };
 
@@ -9757,6 +9865,7 @@ function AppContent({ session }) {
       const next = buildDraftVersion(source, draft, planograms);
       createPlanogram(next);
       setActivePlanogramId(next.id);
+      refreshProposals();
     } catch (e) {
       window.alert(`Couldn't draft a reset: ${e.message}`);
     } finally {
@@ -9790,13 +9899,38 @@ function AppContent({ session }) {
       failures.push(e.message);
     } finally {
       setDraftingReset(false);
+      refreshProposals();
     }
     if (failures.length > 0) {
       window.alert(`${created} of ${sources.length} drafted.\n\nCouldn't finish:\n${failures.slice(0, 5).join("\n")}${failures.length > 5 ? `\n…and ${failures.length - 5} more` : ""}`);
     }
   };
 
-  const discardResetDraft = (draftPlanogram) => {
+  // Approving or discarding an AI draft is a recorded decision on its Proposal (who, when, and it
+  // lands in the Activity log). The decision is written first: if it can't be recorded, nothing
+  // changes locally, so the Proposal and the draft can't drift apart. Drafts made before
+  // Proposals existed have no proposalId and simply skip the recording step.
+  const recordDraftDecision = async (draftPlanogram, decision) => {
+    const proposalId = draftPlanogram.resetDraft?.proposalId;
+    if (!proposalId) return true;
+    try {
+      await reviewProposal(proposalId, decision, `Draft version "${draftPlanogram.name}"`);
+      return true;
+    } catch (e) {
+      window.alert(`Couldn't record your decision: ${e.message}`);
+      return false;
+    } finally {
+      refreshProposals();
+    }
+  };
+
+  const approveResetDraft = async (draftPlanogram) => {
+    if (!(await recordDraftDecision(draftPlanogram, "approved"))) return;
+    updatePlanogramEntity({ ...draftPlanogram, resetDraft: { ...draftPlanogram.resetDraft, reviewed: true } });
+  };
+
+  const discardResetDraft = async (draftPlanogram) => {
+    if (!(await recordDraftDecision(draftPlanogram, "rejected"))) return;
     const sourceId = draftPlanogram.resetDraft?.sourceId;
     deletePlanogramEntity(draftPlanogram.id);
     if (sourceId) setActivePlanogramId(sourceId);
@@ -10093,7 +10227,7 @@ function AppContent({ session }) {
 
       {!activePlanogram && (
         <div className="bg-white border-b border-slate-200 px-6 flex gap-1">
-          <TabButton active={tab === "planograms"} onClick={() => setTab("planograms")} icon={Layers} badge={planograms.filter((p) => p.resetDraft && !p.resetDraft.reviewed).length}>Planograms</TabButton>
+          <TabButton active={tab === "planograms"} onClick={() => setTab("planograms")} icon={Layers} badge={buildResetDraftQueue(planograms, proposals).length}>Planograms</TabButton>
           <TabButton active={tab === "products"} onClick={() => setTab("products")} icon={Package}>Products</TabButton>
           <TabButton active={tab === "fixtures"} onClick={() => setTab("fixtures")} icon={Boxes}>Fixtures</TabButton>
           <TabButton active={tab === "stores"} onClick={() => setTab("stores")} icon={Store}>Stores</TabButton>
@@ -10126,6 +10260,7 @@ function AppContent({ session }) {
             onResolveIssue={resolvePlanogramIssue}
             onDraftReset={draftResetForPlanogram}
             draftingReset={draftingReset}
+            onApproveResetDraft={approveResetDraft}
             onDiscardResetDraft={discardResetDraft}
           />
         ) : tab === "planograms" ? (
@@ -10144,6 +10279,8 @@ function AppContent({ session }) {
             onImportProSpace={importProSpaceResults}
             onDraftResetBulk={draftResetForPlanogramsBulk}
             draftingReset={draftingReset}
+            proposals={proposals}
+            profileNames={profileNames}
           />
         ) : tab === "products" ? (
           <ProductLibrary

@@ -89,6 +89,19 @@ thresholds, protection rules and scoring never ship to users. Deploying it is a 
 the database schema — see [`supabase/functions/README.md`](supabase/functions/README.md). Until it
 is deployed, the **Draft Reset with AI** buttons show an error and nothing else in the app is affected.
 
+Every draft the agent produces is saved as a **Proposal** (the `proposals` table: which agent, what it
+targets, the proposed change, its reason and Draft Score, who asked, and its review status) and logged
+in the append-only `activity_log`. Nobody edits these tables directly: approving or discarding an AI
+draft records the decision through the `review_proposal()` database function (Admin and Category
+Manager only), which also writes the Activity entry. The review queue on the Planograms tab reads the
+pending Proposals, and the **Activity** button on each planogram shows who proposed, approved or
+rejected what.
+
+**Updating an existing install to this version, in this order:** (1) run the new `supabase/schema.sql`
+in the SQL Editor (safe to re-run), (2) deploy the `draft-reset` function (push a change under
+`supabase/functions/`), (3) deploy the front end. Deploying the function before the schema makes Draft
+Reset report that it couldn't record the proposal.
+
 ## Backup & Restore still works
 
 The in-app **Attribute Fields → Backup & Restore** export/import still works exactly as

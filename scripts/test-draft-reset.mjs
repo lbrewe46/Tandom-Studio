@@ -12,17 +12,27 @@ import assert from "node:assert/strict";
 import { handleDraftReset, MAX_PLANOGRAMS_PER_CALL } from "../supabase/functions/_shared/draft-reset-handler.js";
 
 // ---------------------------------------------------------------------------------------
-// A minimal PostgREST-shaped fake: from(t).select().eq().in().range() / .maybeSingle()
+// A minimal PostgREST-shaped fake: from(t).select().eq().in().range() / .maybeSingle(), plus
+// from(t).insert(rows).select(cols). `failInsert` / `throwInsert` map a table name to an error
+// message to simulate a rejected (or thrown) insert.
 // ---------------------------------------------------------------------------------------
-function makeDb({ tables, tokens, pageLimit = 1000 }) {
+function makeDb({ tables, tokens, pageLimit = 1000, failInsert = {}, throwInsert = {} }) {
   const calls = [];
   class Query {
-    constructor(table) { this.table = table; this.filters = []; this.rangeArg = null; }
+    constructor(table) { this.table = table; this.filters = []; this.rangeArg = null; this.inserting = null; }
+    insert(rows) { this.inserting = Array.isArray(rows) ? rows : [rows]; return this; }
     select() { return this; }
     eq(col, val) { this.filters.push((r) => r[col] === val); return this; }
     in(col, vals) { this.filters.push((r) => vals.includes(r[col])); return this; }
     range(a, b) { this.rangeArg = [a, b]; return this; }
     run() {
+      if (this.inserting) {
+        if (throwInsert[this.table]) throw new Error(throwInsert[this.table]);
+        if (failInsert[this.table]) return { data: null, error: { message: failInsert[this.table] } };
+        const stored = this.inserting.map((r) => ({ id: globalThis.crypto.randomUUID(), created_at: "now", ...r }));
+        (tables[this.table] ||= []).push(...stored);
+        return { data: stored, error: null };
+      }
       calls.push({ table: this.table, range: this.rangeArg });
       let rows = (tables[this.table] || []).filter((r) => this.filters.every((f) => f(r)));
       if (this.rangeArg) rows = rows.slice(this.rangeArg[0], Math.min(this.rangeArg[1] + 1, this.rangeArg[0] + pageLimit));
@@ -189,6 +199,78 @@ await test("tables larger than one PostgREST page are read in full", async () =>
 await test("only the requested planograms are read (not the whole table)", async () => {
   const db = fresh(); await call(db); // tables hold pog1 AND pogBroken; only pog1 was asked for
   assert.deepEqual(db.calls.filter((c) => c.table === "planograms").map((c) => c.ids), [["pog1"]]);
+});
+
+// ---------------------------------------------------------------------------------------
+// Phase 3: Proposals + activity log
+// ---------------------------------------------------------------------------------------
+console.log("\nproposals and activity log");
+
+await test("a successful draft is stored as a pending Proposal and returned with its id", async () => {
+  const t = baseTables(); const db = makeDb({ tables: t, tokens });
+  const { results } = await (await call(db)).json();
+  const [r] = results;
+  assert.equal(t.proposals.length, 1);
+  const prop = t.proposals[0];
+  assert.equal(r.proposalId, prop.id);
+  assert.deepEqual(
+    { agent_id: prop.agent_id, target_type: prop.target_type, target_id: prop.target_id, status: prop.status, score: prop.score, requested_by: prop.requested_by },
+    { agent_id: "reset-drafting-agent", target_type: "planogram_version", target_id: "pog1", status: "pending", score: 80, requested_by: "u-cm" },
+  );
+  assert.deepEqual(prop.proposed_change, r.result, "the stored change set is exactly what the app is given");
+  assert.match(prop.reason, /^4 changes proposed, 1 skipped from the last 8 weeks \(/);
+});
+await test("the agent's action is logged with the requester and a pointer to the Proposal", async () => {
+  const t = baseTables(); const { results } = await (await call(makeDb({ tables: t, tokens }), { token: "tok-admin" })).json();
+  assert.equal(t.activity_log.length, 1);
+  const a = t.activity_log[0];
+  assert.deepEqual([a.actor_type, a.actor_id, a.action, a.target_type, a.target_id], ["agent", "reset-drafting-agent", "proposal_created", "planogram_version", "pog1"]);
+  assert.deepEqual(a.detail, { proposalId: results[0].proposalId, score: 80, changes: 4, skipped: 1, lookbackWeeks: 8, requestedBy: "u-admin" });
+});
+await test("only successful drafts get a Proposal; a batch records each one separately", async () => {
+  const t = baseTables(); t.planograms.push({ id: "pog2", data: { ...planogram, id: "pog2", name: "Snacks endcap" } });
+  const { results } = await (await call(makeDb({ tables: t, tokens }), { body: { planogramIds: ["pog1", "missing", "pog2", "pogBroken"], lookbackWeeks: 8 } })).json();
+  assert.deepEqual(results.map((r) => [r.planogramId, r.ok, Boolean(r.proposalId)]), [["pog1", true, true], ["missing", false, false], ["pog2", true, true], ["pogBroken", false, false]]);
+  assert.deepEqual(t.proposals.map((p) => p.target_id).sort(), ["pog1", "pog2"]);
+  assert.equal(t.activity_log.length, 2);
+  assert.notEqual(results[0].proposalId, results[2].proposalId);
+});
+await test("a repeated planogram id in one call yields one draft and one Proposal", async () => {
+  const t = baseTables();
+  const { results } = await (await call(makeDb({ tables: t, tokens }), { body: { planogramIds: ["pog1", "pog1"], lookbackWeeks: 8 } })).json();
+  assert.equal(results.length, 1);
+  assert.equal(t.proposals.length, 1);
+});
+await test("running the agent again adds a new Proposal rather than overwriting the old one", async () => {
+  const t = baseTables(); const db = makeDb({ tables: t, tokens });
+  await call(db); await call(db);
+  assert.equal(t.proposals.length, 2);
+  assert.notEqual(t.proposals[0].id, t.proposals[1].id);
+});
+await test("if the Proposal can't be saved the draft is reported as failed, with a schema hint and nothing leaked", async () => {
+  for (const opts of [{ failInsert: { proposals: 'relation "public.proposals" does not exist' } }, { throwInsert: { proposals: "socket hang up" } }]) {
+    const t = baseTables(); const res = await call(makeDb({ tables: t, tokens, ...opts }));
+    assert.equal(res.status, 200);
+    const [r] = (await res.json()).results;
+    assert.equal(r.ok, false);
+    assert.match(r.error, /Couldn't record the proposal/);
+    assert.match(r.error, /schema\.sql/);
+    assert.equal(r.result, undefined); assert.equal(r.score, undefined); assert.equal(r.proposalId, undefined);
+    assert.equal((t.activity_log || []).length, 0, "no activity row for something that wasn't recorded");
+  }
+});
+await test("a failed activity write doesn't lose the draft (the Proposal is the record)", async () => {
+  for (const opts of [{ failInsert: { activity_log: "boom" } }, { throwInsert: { activity_log: "boom" } }]) {
+    const t = baseTables(); const res = await call(makeDb({ tables: t, tokens, ...opts }));
+    const [r] = (await res.json()).results;
+    assert.equal(res.status, 200); assert.equal(r.ok, true); assert.ok(r.proposalId);
+    assert.equal(t.proposals.length, 1);
+  }
+});
+await test("rejected callers and bad input write nothing", async () => {
+  const t = baseTables(); const db = makeDb({ tables: t, tokens });
+  await call(db, { token: null }); await call(db, { token: "tok-store" }); await call(db, { body: { planogramIds: [] } }); await call(db, { method: "GET" });
+  assert.equal((t.proposals || []).length, 0); assert.equal((t.activity_log || []).length, 0);
 });
 
 console.log(`\n${passed} passed${process.exitCode ? ", with failures" : ""}`);

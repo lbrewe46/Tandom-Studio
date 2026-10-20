@@ -310,3 +310,100 @@ values ('reset-drafting-agent', 'Reset Drafting Agent',
         'Reads Performance history and drafts facing/deletion/addition changes for a planogram reset.',
         array['planogram_version'])
 on conflict (id) do nothing;
+
+-- ------------------------------------------------------------------
+-- Phase 3: Proposals + activity log
+-- ------------------------------------------------------------------
+-- A Proposal is the one shared record for anything an agent suggests: who proposed it, what it
+-- targets, the proposed change itself, why, how confident (Draft Score), and where it stands in
+-- review. Agents write Proposals only through an Edge Function (service-role key); people never
+-- insert or edit them directly — they review them through review_proposal() below. Nothing in
+-- this phase applies a proposal: the AI-drafted WIP version is still built by the app, and
+-- approving it just records the decision. Phase 4 adds apply_proposal().
+create table if not exists proposals (
+  id uuid primary key default gen_random_uuid(),
+  agent_id text not null references agents(id),
+  target_type text not null,                 -- e.g. 'planogram_version'
+  target_id text not null,                   -- id of the thing proposed against (the source planogram)
+  proposed_change jsonb not null,            -- for the Reset Drafting Agent: { changes, skipped, startISO, endISO, lookbackWeeks }
+  reason text,                               -- one-line human summary
+  score int,                                 -- Draft Score 0-100 (agents that don't score leave it null)
+  status text not null default 'pending'
+    check (status in ('pending', 'approved', 'rejected', 'applied')),
+  requested_by uuid references auth.users(id) on delete set null,  -- the person who ran the agent
+  created_at timestamptz not null default now(),
+  reviewed_by uuid references auth.users(id) on delete set null,
+  reviewed_at timestamptz
+);
+
+create index if not exists proposals_status_created_idx on proposals (status, created_at desc);
+create index if not exists proposals_target_idx on proposals (target_type, target_id);
+
+-- Append-only record of who did what: agents (written by Edge Functions) and people (written by
+-- review_proposal). No client policy allows insert/update/delete, so history can't be rewritten.
+create table if not exists activity_log (
+  id uuid primary key default gen_random_uuid(),
+  actor_type text not null check (actor_type in ('user', 'agent')),
+  actor_id text not null,                    -- profiles.id (as text) for a user, agents.id for an agent
+  action text not null,                      -- e.g. 'proposal_created', 'proposal_approved'
+  target_type text,
+  target_id text,
+  detail jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists activity_log_target_idx on activity_log (target_id, created_at desc);
+create index if not exists activity_log_created_idx on activity_log (created_at desc);
+
+alter table proposals enable row level security;
+alter table activity_log enable row level security;
+
+-- Any signed-in role can read (Store Associates may need to see why a layout changed); nobody
+-- gets an insert/update/delete policy, so only the service role and review_proposal() can write.
+drop policy if exists "Any role can read proposals" on proposals;
+create policy "Any role can read proposals" on proposals for select to authenticated using (true);
+drop policy if exists "Any role can read activity_log" on activity_log;
+create policy "Any role can read activity_log" on activity_log for select to authenticated using (true);
+
+-- Records a person's decision on a pending proposal and logs it. Idempotent for the same
+-- decision (a retry after a dropped connection is harmless); refuses to flip an earlier decision.
+create or replace function review_proposal(p_id uuid, p_decision text, p_note text default null)
+returns proposals
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_prop proposals;
+begin
+  if v_uid is null then raise exception 'Not signed in'; end if;
+  if current_user_role() not in ('admin', 'category_manager') then
+    raise exception 'Your role is not permitted to review proposals';
+  end if;
+  if p_decision not in ('approved', 'rejected') then
+    raise exception 'Decision must be approved or rejected';
+  end if;
+
+  select * into v_prop from proposals where id = p_id for update;
+  if not found then raise exception 'Proposal not found'; end if;
+  if v_prop.status = p_decision then return v_prop; end if;
+  if v_prop.status <> 'pending' then
+    raise exception 'This proposal was already %', v_prop.status;
+  end if;
+
+  update proposals
+     set status = p_decision, reviewed_by = v_uid, reviewed_at = now()
+   where id = p_id
+  returning * into v_prop;
+
+  insert into activity_log (actor_type, actor_id, action, target_type, target_id, detail)
+  values ('user', v_uid::text, 'proposal_' || p_decision, v_prop.target_type, v_prop.target_id,
+          jsonb_build_object('proposalId', v_prop.id, 'agentId', v_prop.agent_id, 'score', v_prop.score, 'note', p_note));
+
+  return v_prop;
+end;
+$$;
+
+revoke all on function review_proposal(uuid, text, text) from public, anon;
+grant execute on function review_proposal(uuid, text, text) to authenticated;
