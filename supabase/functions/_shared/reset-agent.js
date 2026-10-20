@@ -1,7 +1,7 @@
 // Reset Drafting Agent — server-side logic (moved out of the browser bundle in Phase 2).
 // Source of truth lives HERE; src/App.jsx no longer carries it. Shared geometry/performance
 // helpers come from ./app-core.js, which is generated from src/App.jsx (scripts/sync-edge-core.mjs).
-import { getAttrByLabel, getLatestWeekEnding, getCutoffISO, aggregateProductPerformanceRange, getPlacementSpaceIn, getEffectiveDims, layoutFixtureBoxes, getResetThreshold, uid } from "./app-core.js";
+import { getAttrByLabel, getLatestWeekEnding, getCutoffISO, aggregateProductPerformanceRange, getPlacementSpaceIn, getEffectiveDims, layoutFixtureBoxes, getResetThreshold, getStackDims, getShelfClearanceIn, getStackHeightProblem, getStackDepthProblem, getAutoStackHigh, getDosTargetDays, getDaysOfSupply, getCasePackFill, DOS_EXCESS_FACTOR, uid } from "./app-core.js";
 
 // A trial facing increase is only kept if every placement on that fixture still fits —
 // layoutFixtureBoxes already flags overflow per box, so re-running it on a cloned fixture
@@ -33,10 +33,10 @@ function createDraftCache() {
   return { latest: undefined, aggregates: new Map(), candidates: new Map() };
 }
 
-function computeResetDraft(planogram, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, storeId, cache = createDraftCache()) {
+function computeResetDraft(planogram, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, storeId, cache = createDraftCache(), dosTargets = []) {
   if (cache.latest === undefined) cache.latest = getLatestWeekEnding(performance);
   const latestISO = cache.latest;
-  if (!latestISO) return { changes: [], skipped: [], startISO: null, endISO: null, lookbackWeeks };
+  if (!latestISO) return { changes: [], skipped: [], notes: [], startISO: null, endISO: null, lookbackWeeks };
   const endISO = latestISO;
   const startISO = getCutoffISO(latestISO, lookbackWeeks);
   const { low, high } = getResetThreshold(planogram.category || "", resetThresholds);
@@ -54,7 +54,7 @@ function computeResetDraft(planogram, products, fixtures, performance, productSc
     (section.fixtures || []).forEach((fixtureInst) => {
       const fixtureDef = fixtures.find((f) => f.id === fixtureInst.fixtureId);
       (fixtureInst.placements || []).forEach((placement) => {
-        placementRefs.push({ sectionId: section.id, fixtureInst, fixtureDef, placement });
+        placementRefs.push({ sectionId: section.id, section, fixtureInst, fixtureDef, placement });
       });
     });
   });
@@ -141,7 +141,172 @@ function computeResetDraft(planogram, products, fixtures, performance, productSc
           reason: `Increased from ${currentFacings} to ${newFacings} facings — Sales/Space Index ${index.toFixed(0)} over the last ${lookbackWeeks} weeks (above ${high}).`,
         });
       } else {
-        skipped.push({ productId: pid, productName: group.product.name, reason: `Sales/Space Index ${index.toFixed(0)} is a standout, but its fixture has no room for another facing.` });
+        // No room for another facing WIDE — the other lever is stacking one more unit HIGH, which costs
+        // no shelf width. Only taken when the taller stack still clears the shelf above (same rule the
+        // editor enforces); otherwise it's skipped like before.
+        const currentHigh = Math.max(1, Math.round(target.placement.high || 1));
+        const taller = { ...target.placement, high: currentHigh + 1 };
+        const clearance = getShelfClearanceIn(planogram, target.section, target.fixtureInst, fixtures);
+        const alreadyOverflowing = layoutFixtureBoxes(target.fixtureInst, target.fixtureDef, placedProducts).boxes.some((b) => b.overflow);
+        if (!alreadyOverflowing && !getStackHeightProblem(group.product, taller, placedProducts, clearance) && Number.isFinite(clearance)) {
+          changes.push({
+            type: "increaseHigh", productId: pid, productName: group.product.name,
+            sectionId: target.sectionId, fixtureInstId: target.fixtureInst.id, placementId: target.placement.id,
+            oldHigh: currentHigh, newHigh: currentHigh + 1,
+            reason: `Stacked ${currentHigh + 1} high instead of ${currentHigh} — Sales/Space Index ${index.toFixed(0)} over the last ${lookbackWeeks} weeks (above ${high}); there is no room for another facing, but the taller stack (${getStackDims(group.product, taller, placedProducts).heightIn.toFixed(1)}in) fits under the shelf above.`,
+          });
+        } else {
+          skipped.push({ productId: pid, productName: group.product.name, reason: `Sales/Space Index ${index.toFixed(0)} is a standout, but its fixture has no room for another facing${Number.isFinite(clearance) ? " or a taller stack" : ""}.` });
+        }
+      }
+    }
+  });
+
+  // Days-of-supply and case-pack pass. The Sales/Space Index above decides who earns or loses space;
+  // this pass checks the result against how long the shelf lasts. It can (1) cancel a reduction that
+  // would leave a product short of its category's days-of-supply target, (2) add capacity where the
+  // shelf runs short (stack higher first -- it costs no width -- then another facing), and (3) trim
+  // a shelf holding far more than the target. Case packs only ever produce notes, never changes.
+  const notes = [];
+  const facingChangeFor = (placementId) => changes.find((c) => (c.type === "reduceFacings" || c.type === "increaseFacings") && c.placementId === placementId);
+  const highChangeFor = (placementId) => changes.find((c) => (c.type === "reduceHigh" || c.type === "increaseHigh") && c.placementId === placementId);
+  const dropChange = (c) => { if (c) changes.splice(changes.indexOf(c), 1); };
+  productIds.forEach((pid) => {
+    const group = groups[pid];
+    const perf = perfByProduct[pid];
+    const product = group.product;
+    const target = [...group.refs].sort((a, b) => (b.placement.facings || 1) - (a.placement.facings || 1))[0];
+    const pl = target.placement;
+    const origFacings = pl.facings || 1;
+    const origHigh = Math.max(1, Math.round(pl.high || 1));
+    const origDeep = Math.max(1, Math.round(pl.deep || 1));
+    const fc0 = facingChangeFor(pl.id);
+    const hc0 = highChangeFor(pl.id);
+    const state = { facings: fc0 ? fc0.newFacings : origFacings, high: hc0 ? hc0.newHigh : origHigh, deep: origDeep };
+    const hadIncrease = (fc0 && fc0.type === "increaseFacings") || (hc0 && hc0.type === "increaseHigh");
+    const otherUnits = group.refs.reduce((s, r) => (r === target ? s : s + getStackDims(product, r.placement, products).units), 0);
+    const unitsAt = (st) => otherUnits + getStackDims(product, { ...pl, facings: st.facings, high: st.high > 1 ? st.high : undefined, deep: st.deep > 1 ? st.deep : undefined }, products).units;
+    const weekly = perf.weeksOfData >= 4 ? perf.totalUnits / perf.weeksOfData : 0;
+    const dosAt = (st) => getDaysOfSupply(unitsAt(st), weekly);
+    const targetDays = weekly > 0 ? getDosTargetDays(planogram.category || "", dosTargets, product) : null;
+    const dayStr = (n) => (Math.round(n * 10) / 10).toString();
+
+    const writeFacings = (newF, reason) => {
+      dropChange(facingChangeFor(pl.id));
+      state.facings = newF;
+      if (newF === origFacings) return;
+      changes.push({
+        type: newF > origFacings ? "increaseFacings" : "reduceFacings", productId: pid, productName: product.name,
+        sectionId: target.sectionId, fixtureInstId: target.fixtureInst.id, placementId: pl.id,
+        oldFacings: origFacings, newFacings: newF, reason,
+      });
+    };
+    const writeHigh = (newH, reason) => {
+      dropChange(highChangeFor(pl.id));
+      state.high = newH;
+      if (newH === origHigh) return;
+      changes.push({
+        type: newH > origHigh ? "increaseHigh" : "reduceHigh", productId: pid, productName: product.name,
+        sectionId: target.sectionId, fixtureInstId: target.fixtureInst.id, placementId: pl.id,
+        oldHigh: origHigh, newHigh: newH, reason,
+      });
+    };
+
+    const writeDeep = (newD, reason) => {
+      dropChange(changes.find((c) => c.type === "setDeep" && c.placementId === pl.id));
+      state.deep = newD;
+      if (newD === origDeep) return;
+      changes.push({
+        type: "setDeep", productId: pid, productName: product.name,
+        sectionId: target.sectionId, fixtureInstId: target.fixtureInst.id, placementId: pl.id,
+        oldDeep: origDeep, newDeep: newD, reason,
+      });
+    };
+    const shelfDepth = target.fixtureDef?.dims?.d;
+    const deepFits = (st, d) => !getStackDepthProblem(product, { ...pl, facings: st.facings, high: st.high > 1 ? st.high : undefined, deep: d > 1 ? d : undefined }, products, shelfDepth);
+
+    if (targetDays) {
+      // (1) an index-driven reduction that would starve the shelf is cancelled
+      if (fc0 && fc0.type === "reduceFacings" && dosAt(state) < targetDays) {
+        const dosWith = dosAt(state); // days of supply WITH the reduction applied
+        writeFacings(origFacings);
+        notes.push({ productId: pid, productName: product.name, kind: "dosKept", reason: `Kept at ${origFacings} facing${origFacings === 1 ? "" : "s"} -- the Sales/Space Index asked for fewer, but that would leave ${dayStr(dosWith)} days of supply against a ${targetDays}-day target.` });
+      }
+      // (2) short of the target: add capacity until it is reached or nothing fits
+      const startDos = dosAt(state);
+      if (startDos < targetDays) {
+        const startFacings = state.facings, startHigh = state.high, startDeep = state.deep;
+        for (let i = 0; i < 24 && dosAt(state) < targetDays; i++) {
+          // deeper costs no width or height, so it comes first; then taller; another facing last
+          if (state.deep < 60 && deepFits(state, state.deep + 1)) { state.deep += 1; continue; }
+          const clearance = getShelfClearanceIn(planogram, target.section, target.fixtureInst, fixtures);
+          const tallerPl = { ...pl, facings: state.facings, high: state.high + 1 };
+          const canStack = !pl.autoStack && Number.isFinite(clearance) && !getStackHeightProblem(product, tallerPl, products, clearance) && state.high < 12;
+          if (canStack) { state.high += 1; continue; }
+          if (facingIncreaseFits(target.fixtureInst, target.fixtureDef, placedProducts, pl.id, state.facings + 1)) { state.facings += 1; continue; }
+          break;
+        }
+        const endDos = dosAt(state);
+        const gain = `${dayStr(startDos)} -> ${dayStr(endDos)} days of supply against a ${targetDays}-day target`;
+        if (state.facings !== startFacings || state.high !== startHigh || state.deep !== startDeep) {
+          const parts = [];
+          if (state.deep !== startDeep) parts.push(`${state.deep} deep`);
+          if (state.high !== startHigh) parts.push(`stacked ${state.high} high`);
+          if (state.facings !== startFacings) parts.push(`${state.facings} facings`);
+          const reason = `Increased to ${parts.join(" and ")} -- ${gain}.`;
+          const f = state.facings, h = state.high, d = state.deep;
+          writeFacings(f, reason);
+          writeHigh(h, reason);
+          writeDeep(d, reason);
+        }
+        if (endDos < targetDays) {
+          skipped.push({ productId: pid, productName: product.name, reason: `Shelf holds ${dayStr(endDos)} days of supply against a ${targetDays}-day target, and there is no room for more depth, another facing or a taller stack.` });
+        }
+      } else if (!hadIncrease && !product.resetProtected && startDos > targetDays * DOS_EXCESS_FACTOR) {
+        // (3) far more on the shelf than the target needs: trim while the target is still met
+        const startFacings = state.facings, startHigh = state.high;
+        for (let i = 0; i < 4 && dosAt(state) > targetDays * DOS_EXCESS_FACTOR; i++) {
+          const next = state.high > 1 ? { ...state, high: state.high - 1 } : state.facings > 1 ? { ...state, facings: state.facings - 1 } : null;
+          if (!next || dosAt(next) < targetDays) break;
+          state.facings = next.facings; state.high = next.high;
+        }
+        if (state.facings !== startFacings || state.high !== startHigh) {
+          const reason = `Reduced to ${state.high > 1 ? `${state.high} high x ` : ""}${state.facings} facing${state.facings === 1 ? "" : "s"} -- the shelf held ${dayStr(startDos)} days of supply, more than ${DOS_EXCESS_FACTOR}x the ${targetDays}-day target; now ${dayStr(dosAt(state))}.`;
+          const f = state.facings, h = state.high;
+          writeFacings(f, reason);
+          writeHigh(h, reason);
+        }
+      }
+    }
+
+    // Case pack. A store orders and receives whole cases, and the industry-standard pack-out is a case
+    // or a case and a half. A shelf that holds 14 units of a 12-pack leaves most of every delivery with
+    // nowhere to go but the back room, where it gets damaged. Facings Deep costs no width or height, so
+    // it is adjusted first to land on a whole or half number of cases (never under the days-of-supply
+    // target, never past the shelf's depth).
+    const fill = getCasePackFill(unitsAt(state), product.casePack);
+    if (fill && !fill.exact) {
+      const cp = fill.casePack;
+      const currentUnits = unitsAt(state);
+      const casesStr = (u) => `${Math.round((u / cp) * 100) / 100} case${u / cp === 1 ? "" : "s"}`;
+      let best = null;
+      for (let d = 1; d <= 60; d++) {
+        const trial = { ...state, deep: d };
+        if (!deepFits(trial, d)) break;
+        const u = unitsAt(trial);
+        if (!getCasePackFill(u, cp).exact) continue;
+        if (targetDays && dosAt(trial) < targetDays) continue;
+        if (!best || Math.abs(u - currentUnits) < Math.abs(best.units - currentUnits)) best = { deep: d, units: u };
+      }
+      if (best && best.deep !== state.deep) {
+        writeDeep(best.deep, `Deep ${state.deep} -> ${best.deep}: the shelf held ${currentUnits} units of a ${cp}-unit case, which is not a case or half-case pack-out; it now holds ${best.units} (${casesStr(best.units)}), so a delivery goes on the shelf instead of the back room.`);
+      } else if (currentUnits < cp) {
+        skipped.push({ productId: pid, productName: product.name, reason: `Shelf holds only ${currentUnits} units but a case is ${cp}: every full-case delivery overflows the shelf. It needs more facings, height or depth (or a smaller case pack).` });
+      } else {
+        notes.push({
+          productId: pid, productName: product.name, kind: "casePack",
+          reason: `Shelf holds ${currentUnits} units (${casesStr(currentUnits)} of ${cp}), not a case or half-case pack-out, and no Deep setting lands on one. A ${fill.casesToFill}-case delivery would leave ${fill.casesToFill * cp - currentUnits} unit${fill.casesToFill * cp - currentUnits === 1 ? "" : "s"} with nowhere to go.`,
+        });
       }
     }
   });
@@ -180,7 +345,7 @@ function computeResetDraft(planogram, products, fixtures, performance, productSc
         const effectivePlacements = (ref.fixtureInst.placements || [])
           .filter((pl) => !toDeleteIds.has(pl.id))
           .map((pl) => (facingEditsLocal[pl.id] !== undefined ? { ...pl, facings: facingEditsLocal[pl.id] } : pl));
-        fixtureState[ref.fixtureInst.id] = { fixtureInst: ref.fixtureInst, fixtureDef: ref.fixtureDef, sectionId: ref.sectionId, effectivePlacements };
+        fixtureState[ref.fixtureInst.id] = { fixtureInst: ref.fixtureInst, fixtureDef: ref.fixtureDef, sectionId: ref.sectionId, section: ref.section, effectivePlacements };
       });
 
       // layoutFixtureBoxes looks products up by id for every placement; handing it only the
@@ -199,6 +364,13 @@ function computeResetDraft(planogram, products, fixtures, performance, productSc
       candidateScores.forEach(({ product, perf }) => {
         for (const fs of fixturesByRemainder) {
           const newPlacement = { id: uid("pl"), productId: product.id, facings: 1, orientation: "front", rotation: 0, merchStyle: "unit" };
+          // a new product must also fit under the shelf above it (stack-aware, same rule as the editor)
+          const headroom = getShelfClearanceIn(planogram, fs.section, fs.fixtureInst, fixtures);
+          if (getStackHeightProblem(product, newPlacement, layoutProducts, headroom)) continue;
+          // new products stack to the headroom on their own, like products added in the editor
+          const autoHigh = getAutoStackHigh(product, newPlacement, layoutProducts, headroom);
+          if (autoHigh > 1) newPlacement.high = autoHigh;
+          newPlacement.autoStack = true;
           const trialFx = { ...fs.fixtureInst, placements: [...fs.effectivePlacements, newPlacement] };
           const { boxes, totalWidth, widthIn } = layoutFixtureBoxes(trialFx, fs.fixtureDef, layoutProducts);
           if (!boxes.some((b) => b.overflow)) {
@@ -207,7 +379,7 @@ function computeResetDraft(planogram, products, fixtures, performance, productSc
             changes.push({
               type: "addProduct", productId: product.id, productName: product.name,
               sectionId: fs.sectionId, fixtureInstId: fs.fixtureInst.id, placementId: newPlacement.id,
-              newFacings: 1,
+              newFacings: 1, newHigh: autoHigh, autoStack: true,
               reason: `Added — a missing-winner performer ${scopeLabel} ($${Math.round(perf.totalSales).toLocaleString()} in sales over the last ${lookbackWeeks} weeks), not previously on this planogram.`,
             });
             break;
@@ -217,7 +389,7 @@ function computeResetDraft(planogram, products, fixtures, performance, productSc
     }
   }
 
-  return { changes, skipped, startISO, endISO, lookbackWeeks };
+  return { changes, skipped, notes, startISO, endISO, lookbackWeeks };
 }
 
 export { facingIncreaseFits, computeDraftScore, computeResetDraft, createDraftCache };

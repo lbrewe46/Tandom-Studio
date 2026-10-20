@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test:edge": "node scripts/test-draft-reset.mjs && node scripts/test-apply-proposal.mjs",
+    "test:edge": "node scripts/test-draft-reset.mjs && node scripts/test-apply-proposal.mjs && node scripts/test-stacking.mjs && node scripts/test-supply.mjs",
     "sync:edge": "node scripts/sync-edge-core.mjs",
     "check:edge": "node scripts/sync-edge-core.mjs --check && npm run test:edge"
   },

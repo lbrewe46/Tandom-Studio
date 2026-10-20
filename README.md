@@ -67,6 +67,53 @@ weekly performance rows — that would mean normalizing the `performance` table 
 which is an isolated follow-up affecting only that one table and `src/lib/db.js`, not the rest
 of the app.
 
+## Stacking and capping (ProSpace meanings)
+
+A placement now carries the full ProSpace position: **Facings Wide** (`facings`), **Facings High**
+(`high`), **Facings Deep** (`deep`) and **Capping** (`cap: { productId, count }`; no `productId` =
+the same product on top, another product's id = a different product on top). All are optional, so
+every existing planogram loads unchanged as 1 high x 1 deep, uncapped. There is nothing to migrate.
+
+- Only *Wide* uses shelf width. *High* and caps use headroom; *Deep* is capacity only.
+- **Height is enforced.** Headroom is measured from the shelf's top to the shelf above it that overlaps it
+  (or the top of the planogram). The Placement panel disables a step that would not fit, and a stack that would
+  be too tall is refused on edits and when a stacked product is moved or dropped onto a shelf that cannot take it.
+  Stacks that are already too tall (imported, or a shelf moved afterwards) draw with a red dashed outline and can be reduced.
+- **Automatic stacking (`autoStack`).** New shelf products start with "Stack automatically to the available
+  height" on: High is worked out from the headroom under the shelf above and re-fits whenever a shelf moves or a
+  product is added or moved (`refitAutoStacks`). The planner can untick it per product, or press "Auto-stack this
+  shelf" on a fixture. Products the Reset Drafting Agent adds arrive auto-stacked too. Capping stays a manual choice.
+- A cap has its own facing (`cap.orientation`: front, top, left...). One front on the shelf with two caps showing the
+  top counts each cap at the product's depth, not its height, and that is what the height check uses.
+- **Depth is enforced too.** Deep x the unit's depth must fit the shelf's depth (12 deep x 2in = 24in on a 24in shelf
+  is fine, 13 is refused). A cap lying flat reaches further back than a standing unit, so only as many cap units fit
+  front-to-back as the stack below is deep: 10in-long caps over a 24in stack count 2 deep, not 12.
+- ProSpace import reads Facings High and Deep. Caps are not imported yet (their field positions are not mapped).
+- The Reset Drafting Agent keeps stacks intact. When a standout product has no room for another facing, it
+  proposes stacking one higher if that still clears the shelf above, and new products it adds must clear it too.
+- Sales/Space Index still counts linear width only, so stacking does not change a product's space share.
+- The helpers (`getStackDims`, `getShelfClearanceIn`, `getStackHeightProblem`) live in `src/App.jsx` and are
+  copied into the Edge Functions by `npm run sync:edge`; `scripts/test-stacking.mjs` covers them.
+
+## Days of supply and case pack
+
+- **Case pack** (units per case) and an optional **days-of-supply override** live on the product page.
+  Category **days-of-supply targets** are set in Settings, next to the Reset Drafting thresholds
+  (stored as `schema:dosTargets`; a category left blank has no check).
+- **Shelf capacity** is wide x high x deep plus caps. **Days of supply** = capacity / average daily units sold.
+- **Pack-out rule.** Stores receive whole cases, so a shelf should hold a case or a case and a half
+  (1, 1.5, 2, 2.5 cases; odd case packs, which have no half case, use whole cases) and never less than
+  one case. Anything else sends overage to the back room, where it gets damaged.
+- **Reset Drafting Agent**, after the Sales/Space Index pass:
+  - cancels a reduction that would leave a product under its days-of-supply target;
+  - adds capacity where the shelf runs short, cheapest first: deeper, then taller, then another facing;
+  - trims a shelf holding more than 2x its target;
+  - adjusts Facings Deep so the shelf lands on a case or half-case pack-out without breaking the target;
+  - flags a shelf that cannot hold one full case, and reports shelves where no depth setting works.
+- **Placement panel** shows units on shelf, days of supply against target, and the pack-out in cases.
+  The **Supply Report** button on a planogram lists every product with those figures and what needs attention.
+- Case pack never changes sales-driven decisions on its own; Core / Must-Carry products are still never reduced.
+
 ## Access model
 
 Three roles, stored in `profiles.role` and enforced by Row Level Security in `supabase/schema.sql`:

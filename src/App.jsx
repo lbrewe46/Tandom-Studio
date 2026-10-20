@@ -286,7 +286,7 @@ function buildImageCandidateUrls(repo, key, orientation) {
   const pattern = repo.pattern || "{key}.{code}";
   if (pattern.includes("{code}") && code === undefined) return []; // no code defined for this orientation
   const base = repo.baseUrl.endsWith("/") ? repo.baseUrl : repo.baseUrl + "/";
-  const filename = pattern.replace("{key}", key).replace("{orientation}", orientation).replace("{code}", code || "");
+  const filename = pattern.replace("{key}", key).replace("{orientation}", orientation).replace("{code}", code || "").replace("{size}", repo.size || "xlarge");
   const exts = (repo.extensions || "").split(",").map((s) => s.trim()).filter(Boolean);
   // a blank Extensions setting means the pattern already produces the complete path — some CDNs
   // (e.g. a retailer's own product-image URL) serve the image directly with no file extension
@@ -294,21 +294,39 @@ function buildImageCandidateUrls(repo, key, orientation) {
   return exts.map((ext) => `${base}${filename}.${ext}`);
 }
 
-function testImageLoads(url, timeoutMs = 4000) {
+// minWidth rejects a response that loads but is only a tracking pixel / tiny placeholder.
+function testImageLoads(url, timeoutMs = 4000, minWidth = 0) {
   return new Promise((resolve) => {
     const img = new Image();
     let done = false;
     const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
-    img.onload = () => finish(true);
+    img.onload = () => finish(img.naturalWidth >= minWidth);
     img.onerror = () => finish(false);
     setTimeout(() => finish(false), timeoutMs);
     img.src = url;
   });
 }
 
+// Retailer CDNs that serve several resolutions (a "{size}" segment in the pattern). Biggest first:
+// the requested size is tried, then the next ones down as far as "medium" — never quietly
+// settling for a thumbnail, which looks blurry once it is drawn at planogram scale.
+const WEB_IMAGE_SIZES = ["xlarge", "large", "medium", "small", "thumbnail"];
+function webImageSizeChain(size) {
+  const i = Math.max(0, WEB_IMAGE_SIZES.indexOf(size || "xlarge"));
+  return WEB_IMAGE_SIZES.slice(i, Math.max(i + 1, WEB_IMAGE_SIZES.indexOf("medium") + 1));
+}
+// A stored web-lookup image that came from one of the small renditions (earlier versions of the
+// lookup defaulted to "thumbnail"); re-running the web lookup upgrades these in place.
+function isLowResWebImage(url) {
+  return typeof url === "string" && /\/product\/images\/(thumbnail|small)\//.test(url);
+}
+
 async function findRepositoryImage(repo, key, orientation) {
-  for (const url of buildImageCandidateUrls(repo, key, orientation)) {
-    if (await testImageLoads(url)) return url;
+  const sized = (repo.pattern || "").includes("{size}");
+  for (const size of sized ? webImageSizeChain(repo.size) : [undefined]) {
+    for (const url of buildImageCandidateUrls({ ...repo, size }, key, orientation)) {
+      if (await testImageLoads(url, 4000, sized ? 80 : 0)) return url;
+    }
   }
   return null;
 }
@@ -350,10 +368,20 @@ async function matchProductImagesFromRepo(product, repo, schema) {
 
 const DEFAULT_UPC_LOOKUP = {
   enabled: false,
-  baseUrl: "https://www.kroger.com/product/images/thumbnail/",
-  pattern: "{orientation}/{key}",
+  baseUrl: "https://www.kroger.com/product/images/",
+  pattern: "{size}/{orientation}/{key}",
+  size: "xlarge", // xlarge | large | medium | small | thumbnail — thumbnails look blurry at planogram scale
   extensions: "", // blank — this CDN serves the image directly at this path, no file extension
 };
+
+// Settings saved by earlier versions hard-wired the size into the Base URL (".../images/thumbnail/")
+// and defaulted to the smallest one. Move those onto the {size} pattern, and upgrade an old
+// thumbnail default to xlarge; a size someone deliberately picked (large, medium…) is kept.
+function migrateUpcLookup(saved) {
+  const m = (saved?.baseUrl || "").match(/^(.*\/product\/images\/)(thumbnail|small|medium|large|xlarge)\/?$/);
+  if (!m || (saved.pattern || "{orientation}/{key}") !== "{orientation}/{key}") return saved;
+  return { ...saved, baseUrl: m[1], pattern: "{size}/{orientation}/{key}", size: m[2] === "thumbnail" ? "xlarge" : m[2] };
+}
 
 // Kroger's image CDN keys images by a 13-digit code: the 10-digit "item reference" core of a UPC,
 // zero-padded up front to 13. A standard 12-digit UPC-A is [number-system digit][10-digit item
@@ -381,9 +409,9 @@ async function matchProductImagesFromWebCdn(product, repo, schema) {
   let matchedCount = 0;
   if (!key) return { images, matchedCount };
   for (const o of ORIENTATIONS) {
-    if (images[o.id]) continue;
+    if (images[o.id] && !isLowResWebImage(images[o.id])) continue; // keep good images; re-try thumbnails
     const found = await findRepositoryImage(repo, key, o.id);
-    if (found) { images[o.id] = found; matchedCount++; }
+    if (found && found !== images[o.id]) { images[o.id] = found; matchedCount++; }
   }
   return { images, matchedCount };
 }
@@ -857,9 +885,9 @@ function OrientationImages({ images, onChange, repo, lookupKey, upcLookup, upc }
       const found = {};
       let count = 0;
       for (const o of ORIENTATIONS) {
-        if (images[o.id]) continue;
+        if (images[o.id] && !isLowResWebImage(images[o.id])) continue; // keep good images; re-try thumbnails
         const url = await findRepositoryImage(upcLookup, key, o.id);
-        if (url) { found[o.id] = url; count++; }
+        if (url && url !== images[o.id]) { found[o.id] = url; count++; }
       }
       if (count > 0) onChange({ ...images, ...found });
       setWebMatchMsg(count > 0 ? `Matched ${count} image${count !== 1 ? "s" : ""}.` : "No image found on the web for that UPC.");
@@ -1034,6 +1062,8 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, upcLookup, o
   const [merchStylesOpen, setMerchStylesOpen] = useState(Object.keys(initial?.merchStyles || {}).length > 0);
   const [pendingApproval, setPendingApproval] = useState(!!initial?.pendingApproval);
   const [resetProtected, setResetProtected] = useState(!!initial?.resetProtected);
+  const [casePack, setCasePack] = useState(initial?.casePack ? String(initial.casePack) : "");
+  const [dosTargetDays, setDosTargetDays] = useState(initial?.dosTargetDays ? String(initial.dosTargetDays) : "");
 
   const lookupKey = getPrimaryKeyValueRaw({ sku, attributes }, schema, imageRepo?.keyField || "upc");
   // the web (UPC API) lookup always needs an actual UPC, independent of whatever field the
@@ -1054,6 +1084,8 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, upcLookup, o
       merchStyles,
       pendingApproval,
       resetProtected,
+      casePack: Math.round(Number(casePack)) >= 1 ? Math.round(Number(casePack)) : undefined,
+      dosTargetDays: Number(dosTargetDays) > 0 ? Number(dosTargetDays) : undefined,
       importSource: initial?.importSource,
     });
   };
@@ -1101,6 +1133,19 @@ function ProductForm({ schema, initial, primaryKeyField, imageRepo, upcLookup, o
         <p className="text-[11px] text-slate-400 mt-1">
           Overhang: how far this product can safely hang past the shelf edge before it's flagged as overflow (e.g. a bag of chips). Squeeze: how tightly it packs against neighbors for space calculations — 100% = no compression, doesn't change how it renders.
         </p>
+      </div>
+
+      <div>
+        <label className={labelCls}>Supply</label>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Case Pack (units per case)">
+            <input type="number" min="1" step="1" className={inputCls} value={casePack} onChange={(e) => setCasePack(e.target.value)} placeholder="e.g. 12" />
+          </Field>
+          <Field label="Days of Supply Target (override)">
+            <input type="number" min="0" step="0.5" className={inputCls} value={dosTargetDays} onChange={(e) => setDosTargetDays(e.target.value)} placeholder="uses category target" />
+          </Field>
+        </div>
+        <p className="text-[11px] text-slate-400 mt-1">Case pack is how the product ships from the warehouse; the shelf fill and the Reset Drafting Agent compare it with what the shelf holds. The override replaces the category's days-of-supply target for this product only.</p>
       </div>
 
       <label className="flex items-center gap-2 text-sm text-slate-700">
@@ -1717,8 +1762,8 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
   // same as "Match Images from Repository" does for the internal repo.
   const matchAllFromWeb = async () => {
     if (!upcLookup?.enabled) return;
-    const targets = products.filter((p) => ORIENTATIONS.some((o) => !p.images?.[o.id]) && (getAttrByLabel(p, schema, ["upc"]) || "").trim());
-    if (targets.length === 0) { setWebMatchStatus({ type: "ok", message: "Every product either already has all 6 orientation images or has no UPC to look up." }); return; }
+    const targets = products.filter((p) => ORIENTATIONS.some((o) => !p.images?.[o.id] || isLowResWebImage(p.images[o.id])) && (getAttrByLabel(p, schema, ["upc"]) || "").trim());
+    if (targets.length === 0) { setWebMatchStatus({ type: "ok", message: "Every product either already has all 6 orientation images (none of them low-resolution) or has no UPC to look up." }); return; }
     setMatchingWeb(true);
     setWebMatchStatus(null);
     setWebMatchProgress({ current: 0, total: targets.length });
@@ -2585,6 +2630,39 @@ function getPlacementSpaceIn(product, placement) {
   const nominalW = (rotated ? effectiveDims.h : effectiveDims.w) || 1;
   const squeeze = product.squeezeFactor ?? 1;
   return nominalW * squeeze * (placement.facings || 1);
+}
+
+/* Days of supply and case pack.
+   Shelf capacity = the units a placement holds (getStackDims: wide x high x deep, plus caps).
+   Days of supply (DOS) = capacity / average daily unit sales. The target comes from the category's
+   row in `schema:dosTargets` ([{category, days}]), unless the product carries its own
+   `dosTargetDays`. No target = no DOS check. `casePack` on a product is units per warehouse case. */
+const DOS_EXCESS_FACTOR = 2; // a shelf holding more than this many times its target is "over-supplied"
+function getDosTargetDays(category, dosTargets, product) {
+  const own = Number(product?.dosTargetDays);
+  if (Number.isFinite(own) && own > 0) return own;
+  const days = Number((dosTargets || []).find((t) => t.category === category)?.days);
+  return Number.isFinite(days) && days > 0 ? days : null;
+}
+// null when there are no sales to measure against
+function getDaysOfSupply(capacityUnits, weeklyUnits) {
+  return weeklyUnits > 0 ? capacityUnits / (weeklyUnits / 7) : null;
+}
+// How a unit count lines up with the warehouse case. Stores receive whole cases, and the industry
+// standard pack-out is a case or a case and a half: the shelf is "exact" when it holds a whole or half
+// number of cases (1, 1.5, 2, 2.5...) and at least one full case. A half case only exists for an even
+// case pack; an odd one has to be whole cases. null when the product has no case pack.
+function getCasePackFill(units, casePack) {
+  const cp = Math.round(Number(casePack) || 0);
+  if (cp < 1) return null;
+  const u = Math.max(0, Math.round(units));
+  const step = cp % 2 === 0 ? cp / 2 : cp; // smallest increment a pack-out may use
+  return {
+    casePack: cp, step, units: u,
+    cases: u / cp,                       // 1.5 = a case and a half
+    wholeCases: Math.floor(u / cp), loose: u % cp, casesToFill: Math.ceil(u / cp),
+    exact: u >= cp && u % step === 0,
+  };
 }
 
 // Reset Drafting Agent — Sales/Space Index thresholds. A planogram's own Category (the field set
@@ -4125,6 +4203,10 @@ function parsePSAFile(text) {
         y: psaConv(psaField(row, 5), metric) - curFixture.y,
         merchStyle: PSA_MERCH_STYLE_MAP[psaField(row, 12)] || "unit",
         hFacings: Math.max(1, Math.round(psaNum(psaField(row, 13)) || 1)),
+        // Facings High / Deep (fields 14 and 15, verified against sample .psa totals). Capping lives in
+        // further Position fields that aren't mapped yet, so caps aren't imported.
+        vFacings: Math.max(1, Math.round(psaNum(psaField(row, 14)) || 1)),
+        dFacings: Math.max(1, Math.round(psaNum(psaField(row, 15)) || 1)),
         orientation: face,
         rotation: rot,
       });
@@ -4277,6 +4359,10 @@ function mapProSpaceImport(parsed, { existingProducts, existingFixtures, product
           rotation: pos.rotation,
           merchStyle: pos.merchStyle,
         };
+        if (!isPegboard) {
+          if (pos.vFacings > 1) placement.high = pos.vFacings;
+          if (pos.dFacings > 1) placement.deep = pos.dFacings;
+        }
         if (isPegboard) {
           // ProSpace's Position X is the item's LEFT edge on the panel — the same left-edge
           // convention every other X field in this format uses. Tandom's own pegX is the
@@ -4993,6 +5079,179 @@ function getEffectiveDims(product, placement) {
   };
 }
 
+/* Stacking (ProSpace meanings). A placement's `facings` is Facings WIDE. On top of that:
+     high — Facings HIGH: units stacked vertically (default 1)
+     deep — Facings DEEP: units behind each front facing (default 1) — capacity only, no extra shelf width
+     autoStack — true = High is worked out automatically from the headroom under the shelf (see
+            refitAutoStacks); `high` is kept in sync so everything downstream just reads it
+     cap  — Capping: { productId, count } units stacked on top of the stack, per wide facing. productId
+            null/absent/the placement's own product = a same-product cap; any other product id = a
+            different-product cap. productId "" = a different-product cap with no product chosen yet (draws
+            nothing, counts nothing). Absent cap = no capping.
+   Only Wide consumes shelf width; High/Cap consume headroom (getShelfClearanceIn), Deep consumes depth. */
+// Width x height of the face a product shows toward the aisle for a given orientation, from its
+// front-facing w/h/d: Front/Back = w x h, Top/Bottom = w x d (lying flat), Left/Right = d x h.
+function getOrientedFaceDims(dims, orientation) {
+  const w = dims?.w || 1, h = dims?.h || 1, d = dims?.d || dims?.w || 1;
+  // d here is how far the unit reaches back into the shelf in that orientation
+  if (orientation === "top" || orientation === "bottom") return { w, h: d, d: h };
+  if (orientation === "left" || orientation === "right") return { w: d, h, d: w };
+  return { w, h, d };
+}
+
+function getStackConfig(placement) {
+  const toCount = (n) => Math.max(1, Math.round(Number(n) || 1));
+  const capCount = placement?.cap ? Math.round(Number(placement.cap.count) || 0) : 0;
+  return {
+    wide: toCount(placement?.facings),
+    high: toCount(placement?.high),
+    deep: toCount(placement?.deep),
+    cap: capCount > 0 && placement.cap.productId !== "" ? { productId: placement.cap.productId || null, count: capCount } : null,
+  };
+}
+
+// Resolved stack geometry for one placement. unitHIn is one front-facing unit's height as it sits on
+// the shelf (swaps at 90/270 rotation, exactly as ProductBox draws it). Unknown cap products degrade
+// to "no cap" rather than throwing, so stale data never breaks a screen.
+function getStackDims(product, placement, products) {
+  const cfg = getStackConfig(placement);
+  const eff = getEffectiveDims(product, placement);
+  const rotated = placement?.rotation === 90 || placement?.rotation === 270;
+  const unitHIn = (rotated ? eff.w : eff.h) || 1;
+  let capProduct = null;
+  let capUnitHIn = 0;
+  let capUnitWIn = 0;
+  let capUnitDIn = 0;
+  const capOrientation = ORIENTATIONS.some((o) => o.id === placement?.cap?.orientation) ? placement.cap.orientation : "front";
+  if (cfg.cap) {
+    capProduct = !cfg.cap.productId || cfg.cap.productId === product.id ? product : (products || []).find((p) => p.id === cfg.cap.productId) || null;
+    if (capProduct) {
+      // The cap can sit in a different orientation than the front facing below it (e.g. one front on the
+      // shelf, two caps showing the top). The face that points out sets the unit's width and height.
+      const base = capProduct === product ? eff : capProduct.dims || {};
+      const face = getOrientedFaceDims(base, capOrientation);
+      capUnitHIn = capProduct === product && capOrientation === "front" ? unitHIn : face.h;
+      capUnitWIn = capProduct === product && capOrientation === "front" ? (rotated ? eff.h : eff.w) || 1 : face.w;
+      capUnitDIn = face.d;
+    }
+  }
+  const capCount = capProduct ? cfg.cap.count : 0;
+  const unitDIn = eff.d || 1;
+  const stackDepthIn = unitDIn * cfg.deep;
+  // a cap sits on top of the stack, so it can run only as far back as the stack does; a unit lying on
+  // its side reaches further back (e.g. 10in), so fewer of them fit front-to-back than the stack has deep
+  const capDeep = capProduct ? Math.max(1, Math.floor(stackDepthIn / (capUnitDIn || 1) + 1e-6)) : 0;
+  const baseUnits = cfg.wide * cfg.high * cfg.deep;
+  const capUnits = cfg.wide * capCount * capDeep;
+  return {
+    wide: cfg.wide, high: cfg.high, deep: cfg.deep,
+    cap: capProduct ? { product: capProduct, count: capCount, sameProduct: capProduct === product, unitHIn: capUnitHIn, unitWIn: capUnitWIn, unitDIn: capUnitDIn, deep: capDeep, orientation: capOrientation } : null,
+    unitHIn,
+    heightIn: unitHIn * cfg.high + capUnitHIn * capCount,
+    unitDIn, stackDepthIn,
+    baseUnits, capUnits, units: baseUnits + capUnits,
+  };
+}
+
+// Headroom above a shelf, in inches: from the shelf's top surface to the underside of the next
+// fixture above it that overlaps it horizontally, or to the top of the planogram if nothing is
+// above. Pegboard panels are a backdrop, not a ceiling. Fixtures mounted on a pegboard are
+// positioned in the panel's own frame, so they report unlimited headroom (Infinity) instead.
+function getShelfClearanceIn(planogram, section, fixtureInst, fixtureDefs) {
+  if (!fixtureInst || fixtureInst.mountedOnId) return Infinity;
+  const defOf = (fx) => (fixtureDefs || []).find((f) => f.id === fx.fixtureId);
+  const def = defOf(fixtureInst);
+  const w = def ? def.dims.w : 24;
+  const top = (planogram?.base || 0) + (fixtureInst.notchY || 0) + (def ? def.dims.h : 2);
+  let ceiling = planogram?.dims?.h ?? Infinity;
+  (section?.fixtures || []).forEach((o) => {
+    if (o.id === fixtureInst.id || o.mountedOnId) return;
+    const od = defOf(o);
+    if (od?.type === "Pegboard") return;
+    const ow = od ? od.dims.w : 24;
+    const overlaps = (o.xOffset || 0) < (fixtureInst.xOffset || 0) + w && (o.xOffset || 0) + ow > (fixtureInst.xOffset || 0);
+    const bottom = (planogram?.base || 0) + (o.notchY || 0);
+    if (overlaps && bottom >= top - 1e-6) ceiling = Math.min(ceiling, bottom);
+  });
+  return Math.max(0, ceiling - top);
+}
+
+// null when the stack fits under the shelf above (or headroom is unknown), else a plain-English reason.
+function getStackHeightProblem(product, placement, products, clearanceIn) {
+  if (!Number.isFinite(clearanceIn)) return null;
+  const s = getStackDims(product, placement, products);
+  if (s.heightIn <= clearanceIn + 1e-6) return null;
+  const f = (n) => (Math.round(n * 100) / 100).toString();
+  return `Stack is ${f(s.heightIn)}in tall (${s.high} high${s.cap ? ` + ${s.cap.count} capped` : ""}) but this shelf only has ${f(clearanceIn)}in of clearance.`;
+}
+
+// null when the Deep stack fits the shelf's depth (or its depth is unknown), else a plain-English reason.
+function getStackDepthProblem(product, placement, products, shelfDepthIn) {
+  if (!Number.isFinite(shelfDepthIn) || !(shelfDepthIn > 0)) return null;
+  const s = getStackDims(product, placement, products);
+  if (s.stackDepthIn <= shelfDepthIn + 1e-6) return null;
+  const f = (n) => (Math.round(n * 100) / 100).toString();
+  return `${s.deep} deep reaches ${f(s.stackDepthIn)}in back but this shelf is only ${f(shelfDepthIn)}in deep.`;
+}
+
+// Auto-stack: how many units high a placement can go under the given headroom, leaving room for its
+// cap (if any). Capped at AUTO_STACK_MAX so a short product under a tall opening doesn't become a tower.
+// Unknown headroom (mounted shelves) leaves the current height alone.
+const AUTO_STACK_MAX = 12;
+function getAutoStackHigh(product, placement, products, clearanceIn) {
+  const current = Math.max(1, Math.round(Number(placement?.high) || 1));
+  if (!product || !Number.isFinite(clearanceIn)) return current;
+  const s = getStackDims(product, { ...placement, high: 1 }, products);
+  const capIn = s.heightIn - s.unitHIn;
+  const fit = Math.floor((clearanceIn - capIn) / s.unitHIn + 1e-6);
+  return Math.min(AUTO_STACK_MAX, Math.max(1, fit));
+}
+
+// Re-fits every placement marked autoStack to the headroom its shelf has right now, so stacks grow and
+// shrink on their own when a shelf above moves or a product is moved/added. Returns the same
+// planogram object when nothing changed. Pegboards are skipped (products hang, they don't stack).
+function refitAutoStacks(planogram, fixtureDefs, products) {
+  let changed = false;
+  const sections = (planogram.sections || []).map((sec) => {
+    let secChanged = false;
+    const fixturesOut = (sec.fixtures || []).map((fx) => {
+      if (!(fx.placements || []).some((p) => p.autoStack)) return fx;
+      if ((fixtureDefs || []).find((f) => f.id === fx.fixtureId)?.type === "Pegboard") return fx;
+      const clearance = getShelfClearanceIn(planogram, sec, fx, fixtureDefs);
+      let fxChanged = false;
+      const placements = fx.placements.map((pl) => {
+        if (!pl.autoStack) return pl;
+        const prod = (products || []).find((p) => p.id === pl.productId);
+        const next = getAutoStackHigh(prod, pl, products, clearance);
+        if (next === Math.max(1, Math.round(Number(pl.high) || 1))) return pl;
+        fxChanged = true;
+        const { high, ...rest } = pl;
+        return next > 1 ? { ...rest, high: next } : rest;
+      });
+      if (!fxChanged) return fx;
+      secChanged = true;
+      return { ...fx, placements };
+    });
+    if (!secChanged) return sec;
+    changed = true;
+    return { ...sec, fixtures: fixturesOut };
+  });
+  return changed ? { ...planogram, sections } : planogram;
+}
+
+// One-line description of a placement's stacking for lists, guides and exports:
+// "3 wide x 2 high x 2 deep = 12 units, capped 1 high with Brand X". A plain single facing reads "1 facing".
+function describeStack(product, placement, products) {
+  if (!product) return "";
+  const st = getStackDims(product, placement, products);
+  const plain = st.high === 1 && st.deep === 1 && !st.cap;
+  if (plain) return `${st.wide} facing${st.wide !== 1 ? "s" : ""}`;
+  const parts = [`${st.wide} wide`, `${st.high} high`, `${st.deep} deep`];
+  let text = `${parts.join(" x ")} = ${st.units} unit${st.units !== 1 ? "s" : ""}`;
+  if (st.cap) text += `, capped ${st.cap.count} high with ${st.cap.sameProduct ? "the same product" : st.cap.product.name}${st.cap.orientation !== "front" ? ` (${st.cap.orientation} facing)` : ""}`;
+  return text;
+}
+
 function layoutFixtureBoxes(fixtureInst, fixtureDef, products) {
   const widthIn = fixtureDef ? fixtureDef.dims.w : 24;
   const alignment = fixtureInst.alignment || "left"; // "left" | "right" | "spread"
@@ -5012,7 +5271,8 @@ function layoutFixtureBoxes(fixtureInst, fixtureDef, products) {
     const squeeze = prod.squeezeFactor ?? 1;
     const w = nominalW * squeeze;
     const overhangIn = prod.overhangIn || 0;
-    for (let i = 0; i < (pl.facings || 1); i++) items.push({ placement: pl, product: prod, wIn: w, overhangIn, effectiveDims });
+    const stack = getStackDims(prod, pl, products);
+    for (let i = 0; i < (pl.facings || 1); i++) items.push({ placement: pl, product: prod, wIn: w, overhangIn, effectiveDims, stack });
   });
 
   const totalContentWidth = items.reduce((s, it) => s + it.wIn, 0);
@@ -5022,21 +5282,21 @@ function layoutFixtureBoxes(fixtureInst, fixtureDef, products) {
   if (alignment === "right") {
     let cursor = Math.max(0, widthIn - totalContentWidth);
     items.forEach((it) => {
-      boxes.push({ placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: isOverflow(cursor, it), effectiveDims: it.effectiveDims });
+      boxes.push({ placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: isOverflow(cursor, it), effectiveDims: it.effectiveDims, stack: it.stack });
       cursor += it.wIn;
     });
   } else if (alignment === "spread" && items.length > 1 && totalContentWidth < widthIn) {
     const gap = (widthIn - totalContentWidth) / (items.length - 1);
     let cursor = 0;
     items.forEach((it) => {
-      boxes.push({ placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: isOverflow(cursor, it), effectiveDims: it.effectiveDims });
+      boxes.push({ placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: isOverflow(cursor, it), effectiveDims: it.effectiveDims, stack: it.stack });
       cursor += it.wIn + gap;
     });
   } else {
     // left (default), and also the fallback when "spread" has nothing to spread (0-1 items, or content already overflows)
     let cursor = 0;
     items.forEach((it) => {
-      boxes.push({ placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: isOverflow(cursor, it), effectiveDims: it.effectiveDims });
+      boxes.push({ placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: isOverflow(cursor, it), effectiveDims: it.effectiveDims, stack: it.stack });
       cursor += it.wIn;
     });
   }
@@ -5069,19 +5329,36 @@ function applyResetDraftChanges(sections, changes) {
   const next = JSON.parse(JSON.stringify(sections));
   const toDelete = new Set();
   const facingEdits = {}; // placementId -> newFacings
+  const highEdits = {}; // placementId -> new Facings High (stack height)
+  const deepEdits = {}; // placementId -> new Facings Deep (case-pack fit)
   const additions = []; // addProduct changes, applied per-fixture below
   changes.forEach((c) => {
     if (c.type === "delete") toDelete.add(c.placementId);
     else if (c.type === "reduceFacings" || c.type === "increaseFacings") facingEdits[c.placementId] = c.newFacings;
+    else if (c.type === "increaseHigh" || c.type === "reduceHigh") highEdits[c.placementId] = c.newHigh;
+    else if (c.type === "setDeep") deepEdits[c.placementId] = c.newDeep;
     else if (c.type === "addProduct") additions.push(c);
   });
   next.forEach((section) => {
     (section.fixtures || []).forEach((fixtureInst) => {
       fixtureInst.placements = (fixtureInst.placements || [])
         .filter((pl) => !toDelete.has(pl.id))
-        .map((pl) => (facingEdits[pl.id] !== undefined ? { ...pl, facings: facingEdits[pl.id] } : pl));
+        .map((pl) => (facingEdits[pl.id] !== undefined ? { ...pl, facings: facingEdits[pl.id] } : pl))
+        .map((pl) => {
+          if (deepEdits[pl.id] === undefined) return pl;
+          const { deep, ...rest } = pl;
+          return deepEdits[pl.id] > 1 ? { ...rest, deep: deepEdits[pl.id] } : rest;
+        })
+        .map((pl) => {
+          if (highEdits[pl.id] === undefined) return pl;
+          // a High the agent chose on purpose replaces "stack to the headroom" for that placement
+          const { high, autoStack, ...rest } = pl;
+          return highEdits[pl.id] > 1 ? { ...rest, high: highEdits[pl.id] } : rest;
+        });
       additions.filter((a) => a.fixtureInstId === fixtureInst.id).forEach((a) => {
-        fixtureInst.placements.push({ id: a.placementId, productId: a.productId, facings: a.newFacings, orientation: "front", rotation: 0, merchStyle: "unit" });
+        const added = { id: a.placementId, productId: a.productId, facings: a.newFacings, orientation: "front", rotation: 0, merchStyle: "unit" };
+        if (a.newHigh > 1) { added.high = a.newHigh; added.autoStack = true; } else if (a.autoStack) added.autoStack = true;
+        fixtureInst.placements.push(added);
       });
     });
   });
@@ -5143,7 +5420,7 @@ function derivePegRowColumn(pegX, pegY, panelHeightIn) {
 /* ------------------------------------------------------------------ */
 
 function ReadOnlyProductBox({ box, scale, pegYIn, newProductIds }) {
-  const { placement, product, xIn, wIn, effectiveDims } = box;
+  const { placement, product, xIn, wIn, effectiveDims, stack } = box;
   const dims = effectiveDims || product.dims;
   const rotation = placement.rotation || 0;
   const rotated = rotation === 90 || rotation === 270;
@@ -5155,15 +5432,35 @@ function ReadOnlyProductBox({ box, scale, pegYIn, newProductIds }) {
   const hasPeg = pegYIn !== undefined && pegYIn !== null;
   const pegBottomPx = hasPeg ? (pegYIn - (rotated ? dims.w : dims.h)) * scale : undefined;
   const isNew = newProductIds && newProductIds.has(product.id);
+  const highCount = stack?.high || 1;
+  const cap = stack?.cap || null;
+  const capUnitHpx = cap ? Math.max(cap.unitHIn * scale - 1, 4) : 0;
+  const capWpx = cap ? Math.max(Math.min(cap.unitWIn * scale - 1, footprintWpx), 2) : 0;
+  const capImg = cap ? cap.product.images?.[cap.orientation] || (cap.orientation === "front" ? null : cap.product.images?.front) || null : null;
+  const stackTitle = describeStack(product, placement, [product, ...(cap ? [cap.product] : [])]);
   return (
-    <div className={`absolute ${hasPeg ? "" : "bottom-0"}`} style={{ left: xIn * scale, width: footprintWpx, height: footprintHpx, bottom: hasPeg ? pegBottomPx : undefined }}>
-      <div
-        className={`absolute top-1/2 left-1/2 overflow-hidden flex items-center justify-center ${isNew ? "border-2 border-emerald-500 ring-2 ring-emerald-300" : "border border-slate-400/60"}`}
-        style={{ width: naturalWpx, height: naturalHpx, transform: `translate(-50%, -50%) rotate(${rotation}deg)`, background: img ? "#fff" : hashColor(product.name) }}
-        title={isNew ? `${product.name} — New item` : product.name}
-      >
-        {img && <img src={img} alt={product.name} className="absolute inset-0 w-full h-full object-cover" />}
-      </div>
+    <div className={`absolute ${hasPeg ? "" : "bottom-0"}`} style={{ left: xIn * scale, width: footprintWpx, height: footprintHpx * highCount + (cap ? capUnitHpx * cap.count : 0), bottom: hasPeg ? pegBottomPx : undefined }}>
+      {Array.from({ length: highCount }, (_, layer) => (
+        <div key={layer} className="absolute left-0" style={{ bottom: layer * footprintHpx, width: footprintWpx, height: footprintHpx }}>
+          <div
+            className={`absolute top-1/2 left-1/2 overflow-hidden flex items-center justify-center ${isNew ? "border-2 border-emerald-500 ring-2 ring-emerald-300" : "border border-slate-400/60"}`}
+            style={{ width: naturalWpx, height: naturalHpx, transform: `translate(-50%, -50%) rotate(${rotation}deg)`, background: img ? "#fff" : hashColor(product.name) }}
+            title={`${isNew ? `${product.name} — New item` : product.name} · ${stackTitle}`}
+          >
+            {img && <img src={img} alt={product.name} className="absolute inset-0 w-full h-full object-cover" />}
+          </div>
+        </div>
+      ))}
+      {cap && Array.from({ length: cap.count }, (_, ci) => (
+        <div
+          key={"cap" + ci}
+          className="absolute overflow-hidden border border-dashed border-slate-500"
+          style={{ left: (footprintWpx - capWpx) / 2, width: capWpx, height: capUnitHpx, bottom: footprintHpx * highCount + ci * capUnitHpx, background: capImg ? "#fff" : hashColor(cap.product.name) }}
+          title={`Cap: ${cap.product.name}`}
+        >
+          {capImg && <img src={capImg} alt={cap.product.name} className="absolute inset-0 w-full h-full object-cover" />}
+        </div>
+      ))}
     </div>
   );
 }
@@ -5351,7 +5648,7 @@ function PlanogramExecutionGuide({ planogram, products, fixtures, allPlanograms,
                               {sectionNewIds.has(b.product.id) && <span className="text-[10px] font-semibold uppercase tracking-wide rounded-full px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-300">New</span>}
                             </div>
                             <div className="text-xs text-slate-400">
-                              {b.placement.facings || 1} facing{(b.placement.facings || 1) !== 1 ? "s" : ""} · {ORIENTATIONS.find((o) => o.id === b.placement.orientation)?.label || b.placement.orientation}
+                              {describeStack(b.product, b.placement, products)} · {ORIENTATIONS.find((o) => o.id === b.placement.orientation)?.label || b.placement.orientation}
                             </div>
                           </div>
                         </div>
@@ -5470,7 +5767,8 @@ function computeJoinedGroupLayouts(planogram, fixtures, products) {
         const squeeze = prod.squeezeFactor ?? 1;
         const w = nominalW * squeeze;
         const overhangIn = prod.overhangIn || 0;
-        for (let i = 0; i < (pl.facings || 1); i++) items.push({ placement: pl, product: prod, wIn: w, overhangIn });
+        const stack = getStackDims(prod, pl, products);
+        for (let i = 0; i < (pl.facings || 1); i++) items.push({ placement: pl, product: prod, wIn: w, overhangIn, stack });
       });
     });
 
@@ -5478,7 +5776,7 @@ function computeJoinedGroupLayouts(planogram, fixtures, products) {
     const globalBoxes = items.map((it) => {
       // only the group's very last facing's own overhang tolerance matters here, since that's
       // the one actually sitting at the combined run's far edge
-      const box = { placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: cursor + it.wIn > totalWidth + it.overhangIn };
+      const box = { placement: it.placement, product: it.product, xIn: cursor, wIn: it.wIn, overflow: cursor + it.wIn > totalWidth + it.overhangIn, stack: it.stack };
       cursor += it.wIn;
       return box;
     });
@@ -5500,8 +5798,8 @@ function computeJoinedGroupLayouts(planogram, fixtures, products) {
   return result;
 }
 
-function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, schema, overlaySettings, onDragStartPlacement, onDragEndPlacement, dragging, readOnly, capacityWarningsEnabled, hideImages, highlightField, zoomLevel, pegYIn }) {
-  const { placement, product, xIn, wIn, overflow, effectiveDims } = box;
+function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, schema, overlaySettings, onDragStartPlacement, onDragEndPlacement, dragging, readOnly, capacityWarningsEnabled, hideImages, highlightField, zoomLevel, pegYIn, stackProblem }) {
+  const { placement, product, xIn, wIn, overflow, effectiveDims, stack } = box;
   const dims = effectiveDims || product.dims;
   const img = hideImages ? null : product.images?.[placement.orientation];
   const rotation = placement.rotation || 0;
@@ -5550,12 +5848,17 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
   const hasPeg = pegYIn !== undefined && pegYIn !== null;
   const pegBottomPx = hasPeg ? (pegYIn - (rotated ? dims.w : dims.h)) * scale : undefined;
 
-  return (
-    <div
-      className={`absolute ${hasPeg ? "" : "bottom-0"} ${selected ? "z-10" : ""}`}
-      style={{ left: xIn * scale, width: footprintWpx, height: footprintHpx, bottom: hasPeg ? pegBottomPx : undefined, pointerEvents: "auto" }}
-      title={`${product.name} · ${placement.orientation} · ${rotation}°`}
-    >
+  // stacking: `high` copies of the unit stacked from the shelf up, then any cap on top (see getStackDims)
+  const highCount = stack?.high || 1;
+  const deepCount = stack?.deep || 1;
+  const cap = stack?.cap || null;
+  const capUnitHpx = cap ? Math.max(cap.unitHIn * scale - 1, 4) : 0;
+  const stackHpx = footprintHpx * highCount + (cap ? capUnitHpx * cap.count : 0);
+  const capImg = cap && !hideImages ? (cap.product.images?.[cap.orientation] || (cap.orientation === "front" ? null : cap.product.images?.front)) || null : null;
+  const capWpx = cap ? Math.max(Math.min(cap.unitWIn * scale - 1, footprintWpx), 2) : 0;
+
+  const renderUnit = (layer) => (
+    <div key={layer} className="absolute left-0" style={{ bottom: layer * footprintHpx, width: footprintWpx, height: footprintHpx }}>
       <div
         draggable={!readOnly}
         // a product is natively draggable (HTML5 DnD) unconditionally, which — if a Ctrl/Cmd+drag
@@ -5581,19 +5884,19 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
       >
         {img ? (
           <img src={img} alt={product.name} className="absolute inset-0 w-full h-full object-cover" />
-        ) : !hasOverlayContent ? (
+        ) : !hasOverlayContent || layer > 0 ? (
           <span className="block w-full leading-tight text-white font-semibold text-center px-0.5 whitespace-nowrap overflow-hidden text-ellipsis" style={{ fontSize: nameFontSize }}>
             {displayName}
           </span>
         ) : null}
 
-        {hasOverlayContent && settings.layout === "compact" && (
+        {layer === 0 && hasOverlayContent && settings.layout === "compact" && (
           <div className={`absolute ${posCls} left-0 max-w-full bg-black/70 text-white px-0.5 leading-tight overflow-hidden`} style={{ fontSize: overlayFontSize }}>
             {detailLines.slice(0, 1).map((l, i) => <div key={"d" + i} className={`font-semibold ${lineWrapCls}`}>{l}</div>)}
             {metricLineTexts.slice(0, 2).map((l, i) => <div key={"m" + i} className={lineWrapCls}>{l}</div>)}
           </div>
         )}
-        {hasOverlayContent && settings.layout === "detailed" && (
+        {layer === 0 && hasOverlayContent && settings.layout === "detailed" && (
           <div className={`absolute ${posCls} left-0 right-0 bg-black/75 text-white px-0.5 py-0.5 leading-tight overflow-hidden`} style={{ fontSize: overlayFontSize }}>
             {detailLines.map((l, i) => <div key={"d" + i} className={`font-semibold ${lineWrapCls}`}>{l}</div>)}
             {metricLineTexts.map((l, i) => <div key={"m" + i} className={lineWrapCls}>{l}</div>)}
@@ -5602,10 +5905,39 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
       </div>
     </div>
   );
+
+  return (
+    <div
+      className={`absolute ${hasPeg ? "" : "bottom-0"} ${selected ? "z-10" : ""}`}
+      style={{ left: xIn * scale, width: footprintWpx, height: stackHpx, bottom: hasPeg ? pegBottomPx : undefined, pointerEvents: "auto" }}
+      title={`${product.name} · ${placement.orientation} · ${rotation}°${highCount > 1 ? ` · ${highCount} high` : ""}${deepCount > 1 ? ` · ${deepCount} deep` : ""}${cap ? ` · capped ${cap.count}× ${cap.sameProduct ? "same product" : cap.product.name}` : ""}`}
+    >
+      {Array.from({ length: highCount }, (_, layer) => renderUnit(layer))}
+      {cap && Array.from({ length: cap.count }, (_, ci) => (
+        <div
+          key={"cap" + ci}
+          onClick={readOnly ? undefined : (e) => { e.stopPropagation(); onSelect(placement.id); }}
+          className={`absolute flex items-center justify-center overflow-hidden border border-dashed ${selected ? "border-amber-500" : "border-slate-500"}`}
+          style={{ left: (footprintWpx - capWpx) / 2, width: capWpx, height: capUnitHpx, bottom: footprintHpx * highCount + ci * capUnitHpx, background: capImg ? "#fff" : hashColor(cap.product.name) }}
+          title={`Cap: ${cap.product.name}`}
+        >
+          {capImg ? <img src={capImg} alt={cap.product.name} className="absolute inset-0 w-full h-full object-cover" /> : (
+            <span className="block w-full leading-tight text-white font-semibold text-center px-0.5 whitespace-nowrap overflow-hidden text-ellipsis" style={{ fontSize: nameFontSize }}>{cap.sameProduct ? displayName : cap.product.name}</span>
+          )}
+        </div>
+      ))}
+      {deepCount > 1 && (
+        <span className="absolute right-0 top-0 z-20 pointer-events-none bg-slate-900/80 text-white font-mono leading-none px-0.5 rounded-bl" style={{ fontSize: overlayFontSize }}>{deepCount}D</span>
+      )}
+      {stackProblem && (
+        <div className="absolute inset-0 z-20 pointer-events-none border-2 border-dashed border-red-500" title={stackProblem} />
+      )}
+    </div>
+  );
 }
 
 function FixtureBar({
-  fx, fixtureDef, products, scale, base, maxNotchY, selected, sectionId, readOnly, joinedBoxes, capacityWarningsEnabled, hideImages, highlightField, zoomLevel,
+  fx, fixtureDef, products, scale, base, maxNotchY, selected, sectionId, readOnly, joinedBoxes, capacityWarningsEnabled, hideImages, highlightField, zoomLevel, clearanceIn,
   onSelectFixture, selectedPlacementId, onSelectPlacement, onDragCommit, onDropProduct, onMovePlacement,
   performance, cutoffISO, storeId, schema, overlaySettings,
   // only passed for a top-level (unmounted) fixture — lets dragging this bar onto a pegboard panel
@@ -5890,6 +6222,7 @@ function FixtureBar({
             hideImages={hideImages}
             highlightField={highlightField}
             zoomLevel={zoomLevel}
+            stackProblem={getStackHeightProblem(box.product, box.placement, products, clearanceIn) || getStackDepthProblem(box.product, box.placement, products, fixtureDef?.dims?.d)}
           />
         ))}
       </div>
@@ -6496,6 +6829,7 @@ function SectionColumn({
               sectionId={section.id}
               readOnly={readOnly}
               joinedBoxes={joinedLayouts ? joinedLayouts[fx.id] : undefined}
+              clearanceIn={getShelfClearanceIn(planogram, section, fx, fixtures)}
               capacityWarningsEnabled={capacityWarningsEnabled}
               hideImages={hideImages}
               highlightField={highlightField}
@@ -6590,7 +6924,43 @@ function AddFixturePopover({ fixtures, onAdd, onClose }) {
   );
 }
 
-function PlacementInspector({ placement, product, metrics, weeks, onChange, onRemove, onClose, isPegboard, pegboardHeightIn }) {
+function PlacementInspector({ placement, product, metrics, weeks, onChange, onRemove, onClose, isPegboard, pegboardHeightIn, products, clearanceIn, shelfDepthIn, dosTargetDays }) {
+  const [capQuery, setCapQuery] = useState("");
+  const stack = product ? getStackDims(product, placement, products || []) : null;
+  const clearance = isPegboard ? Infinity : clearanceIn;
+  // a change that makes the stack taller than the shelf above allows is refused (the editor also
+  // refuses it server-side of the click, in updatePlacement); changes that don't add height always pass
+  const canApply = (patch) => {
+    if (!product) return true;
+    const probe = { ...placement, ...patch };
+    const next = getStackDims(product, probe.autoStack ? { ...probe, high: 1 } : probe, products || []); // auto High re-fits itself
+    const heightOk = !Number.isFinite(clearance) || next.heightIn <= clearance + 1e-6
+      || next.heightIn <= (placement.autoStack ? getStackDims(product, { ...placement, high: 1 }, products || []).heightIn : (stack?.heightIn ?? 0)) + 1e-6;
+    const depthOk = !Number.isFinite(shelfDepthIn) || next.stackDepthIn <= shelfDepthIn + 1e-6 || next.stackDepthIn <= (stack?.stackDepthIn ?? 0) + 1e-6;
+    return heightOk && depthOk;
+  };
+  const f1 = (n) => (Math.round(n * 10) / 10).toString();
+  const high = stack?.high || 1;
+  const deep = stack?.deep || 1;
+  const capMode = !placement.cap ? "none" : placement.cap.productId === "" || (placement.cap.productId && placement.cap.productId !== placement.productId) ? "other" : "same";
+  const capMatches = capMode === "other" && capQuery.trim()
+    ? (products || []).filter((p) => p.id !== placement.productId && String(p.name).toLowerCase().includes(capQuery.trim().toLowerCase())).slice(0, 30)
+    : [];
+  const stepper = (label, value, patchFor, minV) => (
+    <div className="flex items-center justify-between">
+      <span className="text-xs text-slate-600">{label}</span>
+      <div className="flex items-center gap-2">
+        <button className={btnIcon} disabled={value <= minV} onClick={() => onChange({ ...placement, ...patchFor(value - 1) })}><Minus size={13} /></button>
+        <span className="w-8 text-center font-mono text-sm">{value}</span>
+        <button
+          className={btnIcon + (canApply(patchFor(value + 1)) ? "" : " opacity-40 cursor-not-allowed")}
+          disabled={!canApply(patchFor(value + 1))}
+          title={canApply(patchFor(value + 1)) ? undefined : "Not enough clearance under the shelf above"}
+          onClick={() => onChange({ ...placement, ...patchFor(value + 1) })}
+        ><Plus size={13} /></button>
+      </div>
+    </div>
+  );
   const pegLoc = isPegboard && pegboardHeightIn != null
     ? derivePegRowColumn(placement.pegX ?? 0, placement.pegY ?? pegboardHeightIn, pegboardHeightIn)
     : null;
@@ -6680,12 +7050,130 @@ function PlacementInspector({ placement, product, metrics, weeks, onChange, onRe
 
       <div>
         <label className={labelCls}>Facings</label>
-        <div className="flex items-center gap-2">
-          <button className={btnIcon} onClick={() => onChange({ ...placement, facings: Math.max(1, (placement.facings || 1) - 1) })}><Minus size={13} /></button>
-          <span className="w-8 text-center font-mono text-sm">{placement.facings || 1}</span>
-          <button className={btnIcon} onClick={() => onChange({ ...placement, facings: (placement.facings || 1) + 1 })}><Plus size={13} /></button>
+        <div className="space-y-1.5">
+          {stepper("Wide", placement.facings || 1, (n) => ({ facings: n }), 1)}
+          {!isPegboard && (placement.autoStack ? (
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-slate-600">High</span>
+              <span className="text-xs font-mono text-slate-700">{high} <span className="text-slate-400 font-sans">(auto)</span></span>
+            </div>
+          ) : stepper("High", high, (n) => ({ high: n > 1 ? n : undefined }), 1))}
+          {!isPegboard && stepper("Deep", deep, (n) => ({ deep: n > 1 ? n : undefined }), 1)}
         </div>
+        {!isPegboard && (
+          <label className="flex items-center gap-2 mt-2 text-xs text-slate-600 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={!!placement.autoStack}
+              onChange={(e) => {
+                if (e.target.checked) onChange({ ...placement, autoStack: true });
+                else { const { autoStack, ...rest } = placement; onChange(rest); }
+              }}
+            />
+            Stack automatically to the available height
+          </label>
+        )}
+        {!isPegboard && stack && (
+          <p className="text-[10px] text-slate-500 mt-1.5">
+            {stack.units} unit{stack.units !== 1 ? "s" : ""} ({stack.wide} wide × {high} high × {deep} deep{stack.cap ? ` + ${stack.capUnits} capped` : ""}) · stack {f1(stack.heightIn)}in tall
+            {Number.isFinite(clearance) ? ` of ${f1(clearance)}in clearance` : ""} · {f1(stack.stackDepthIn)}in back
+            {Number.isFinite(shelfDepthIn) ? ` of ${f1(shelfDepthIn)}in shelf depth` : ""}
+          </p>
+        )}
+        {!isPegboard && stack && Number.isFinite(clearance) && stack.heightIn > clearance + 1e-6 && (
+          <p className="text-[10px] text-red-600 mt-1">{getStackHeightProblem(product, placement, products || [], clearance)} Reduce the stack to clear this.</p>
+        )}
+        {!isPegboard && stack && getStackDepthProblem(product, placement, products || [], shelfDepthIn) && (
+          <p className="text-[10px] text-red-600 mt-1">{getStackDepthProblem(product, placement, products || [], shelfDepthIn)} Reduce Deep to clear this.</p>
+        )}
       </div>
+
+      {!isPegboard && (
+        <div>
+          <label className={labelCls}>Capping</label>
+          <select
+            className={inputCls}
+            value={capMode}
+            onChange={(e) => {
+              const mode = e.target.value;
+              if (mode === "none") { const { cap, ...rest } = placement; onChange(rest); return; }
+              setCapQuery("");
+              // productId "" = "different product, none chosen yet" (draws nothing until one is picked)
+              const cap = { productId: mode === "same" ? null : "", count: Math.max(1, placement.cap?.count || 1), ...(placement.cap?.orientation ? { orientation: placement.cap.orientation } : {}) };
+              if (canApply({ cap })) onChange({ ...placement, cap });
+            }}
+          >
+            <option value="none">No capping</option>
+            <option value="same">Same product on top</option>
+            <option value="other">Different product on top</option>
+          </select>
+          {capMode === "other" && (
+            <div className="mt-1.5 space-y-1.5">
+              {placement.cap?.productId && placement.cap.productId !== placement.productId ? (
+                <div className="flex items-center justify-between text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-md px-2 py-1">
+                  <span className="truncate">{(products || []).find((p) => p.id === placement.cap.productId)?.name || "Unknown product"}</span>
+                  <button className="text-slate-400 hover:text-slate-600" onClick={() => onChange({ ...placement, cap: { productId: "", count: placement.cap.count } })}><X size={12} /></button>
+                </div>
+              ) : null}
+              <input className={inputCls} placeholder="Search products to cap with…" value={capQuery} onChange={(e) => setCapQuery(e.target.value)} />
+              {capMatches.length > 0 && (
+                <select
+                  className={inputCls}
+                  size={Math.min(6, capMatches.length)}
+                  onChange={(e) => {
+                    const cap = { productId: e.target.value, count: Math.max(1, placement.cap?.count || 1) };
+                    if (canApply({ cap })) { onChange({ ...placement, cap }); setCapQuery(""); }
+                  }}
+                >
+                  {capMatches.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+              )}
+            </div>
+          )}
+          {placement.cap && (capMode === "same" || (placement.cap.productId && placement.cap.productId !== placement.productId)) && (
+            <div className="mt-1.5 space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs text-slate-600">Cap facing</span>
+                <select
+                  className={inputCls + " !w-auto"}
+                  value={placement.cap.orientation || "front"}
+                  onChange={(e) => { const cap = { ...placement.cap, orientation: e.target.value }; if (canApply({ cap })) onChange({ ...placement, cap }); }}
+                >
+                  {ORIENTATIONS.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
+                </select>
+              </div>
+              {stepper("Cap units high", placement.cap.count || 1, (n) => ({ cap: { ...placement.cap, count: n } }), 1)}
+            </div>
+          )}
+        </div>
+      )}
+
+      {!isPegboard && stack && (() => {
+        // what this placement holds against what it sells: capacity, days of supply, and the case pack
+        const dos = metrics ? getDaysOfSupply(stack.units, metrics.avgWeeklyUnits) : null;
+        const fill = getCasePackFill(stack.units, product?.casePack);
+        if (dos === null && !fill && !dosTargetDays) return null;
+        const status = dos === null || !dosTargetDays ? "text-slate-700" : dos < dosTargetDays ? "text-red-600" : dos > dosTargetDays * DOS_EXCESS_FACTOR ? "text-amber-600" : "text-emerald-600";
+        return (
+          <div className="bg-slate-50 border border-slate-200 rounded-md p-2.5 text-xs">
+            <div className="font-semibold text-slate-600 mb-1.5">Supply (this placement)</div>
+            <div className="grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-slate-700">
+              <span>On shelf</span><span className="text-right">{stack.units} units</span>
+              {dos !== null && (<><span>Days of supply</span><span className={"text-right font-semibold " + status}>{f1(dos)}{dosTargetDays ? ` / ${dosTargetDays}` : ""}</span></>)}
+              {fill && (<><span>Case pack</span><span className="text-right">{fill.casePack}</span></>)}
+              {fill && (<><span>Pack-out</span><span className="text-right">{Math.round(fill.cases * 100) / 100} case{fill.cases === 1 ? "" : "s"}</span></>)}
+            </div>
+            {fill && !fill.exact && (
+              <p className="text-[10px] text-red-600 mt-1.5">
+                {fill.units < fill.casePack
+                  ? `Less than one case (${fill.casePack}): a full-case delivery will not fit on this shelf and ends up in the back room.`
+                  : `Not a case or half-case pack-out (${fill.step}-unit steps): a delivery leaves overage with nowhere to go but the back room.`}
+              </p>
+            )}
+            {dos !== null && dosTargetDays && dos < dosTargetDays && <p className="text-[10px] text-red-600 mt-1.5">Below the {dosTargetDays}-day target at the current sales rate.</p>}
+          </div>
+        );
+      })()}
 
       <button className={btnDanger + " w-full justify-center"} onClick={onRemove}><Trash2 size={13} /> Remove from fixture</button>
     </div>
@@ -7116,10 +7604,12 @@ function ResetDraftReviewPanel({ planogram, onApprove, onDiscard, onBack, approv
   const draft = planogram.resetDraft || {};
   const changes = draft.changes || [];
   const skipped = draft.skipped || [];
-  const reduced = changes.filter((c) => c.type === "reduceFacings");
-  const increased = changes.filter((c) => c.type === "increaseFacings");
+  const reduced = changes.filter((c) => c.type === "reduceFacings" || c.type === "reduceHigh");
+  const increased = changes.filter((c) => c.type === "increaseFacings" || c.type === "increaseHigh");
   const deleted = changes.filter((c) => c.type === "delete");
   const added = changes.filter((c) => c.type === "addProduct");
+  const deepSet = changes.filter((c) => c.type === "setDeep");
+  const notes = draft.notes || [];
 
   const Group = ({ title, icon: Icon, colorCls, items }) => {
     if (items.length === 0) return null;
@@ -7152,12 +7642,95 @@ function ResetDraftReviewPanel({ planogram, onApprove, onDiscard, onBack, approv
       )}
       <Group title="Missing-Winner Additions" icon={Sparkles} colorCls="text-blue-700" items={added} />
       <Group title="Facing Reductions" icon={Minus} colorCls="text-amber-700" items={reduced} />
-      <Group title="Facing Increases" icon={Plus} colorCls="text-emerald-700" items={increased} />
+      <Group title="Facing / Stack Increases" icon={Plus} colorCls="text-emerald-700" items={increased} />
+      <Group title="Depth / case-pack fit" icon={Package} colorCls="text-sky-700" items={deepSet} />
       <Group title="Deletions" icon={Trash2} colorCls="text-red-700" items={deleted} />
       <Group title="Skipped" icon={AlertTriangle} colorCls="text-slate-500" items={skipped} />
+      <Group title="Supply notes (no change made)" icon={Package} colorCls="text-slate-600" items={notes} />
       <div className="flex items-center gap-2 mt-6">
         <button className={btnDanger} disabled={busy} onClick={onDiscard}><Trash2 size={13} /> {discardLabel || "Discard Draft"}</button>
         <button className={btnPrimary + " ml-auto"} disabled={busy} onClick={onApprove}><Check size={14} /> {busy ? "Working…" : approveLabel || "Keep as WIP — Continue to Approve"}</button>
+      </div>
+    </div>
+  );
+}
+
+// One row per product on the planogram: what the shelf holds, how long that lasts at the current
+// sales rate, how it compares with the category target, and whether it lines up with the case pack.
+// Problems sort first (short of target, then pack-out that sends overage to the back room).
+function buildSupplyReport(planogram, products, performance, cutoffISO, storeId, dosTargets) {
+  const byProduct = {};
+  (planogram.sections || []).forEach((sec) => (sec.fixtures || []).forEach((fx) => (fx.placements || []).forEach((pl) => {
+    const product = products.find((p) => p.id === pl.productId);
+    if (!product) return;
+    const units = getStackDims(product, pl, products).units;
+    (byProduct[product.id] ||= { product, units: 0, placements: 0 });
+    byProduct[product.id].units += units;
+    byProduct[product.id].placements += 1;
+  })));
+  const rows = Object.values(byProduct).map(({ product, units, placements }) => {
+    const m = aggregateProductPerformance(product.id, performance, cutoffISO, storeId);
+    const weekly = m ? m.avgWeeklyUnits : 0;
+    const dos = getDaysOfSupply(units, weekly);
+    const target = getDosTargetDays(planogram.category || "", dosTargets, product);
+    const fill = getCasePackFill(units, product.casePack);
+    const supply = dos === null ? "noSales" : !target ? "noTarget" : dos < target ? "short" : dos > target * DOS_EXCESS_FACTOR ? "over" : "ok";
+    const pack = !fill ? "none" : fill.units < fill.casePack ? "belowCase" : fill.exact ? "ok" : "overage";
+    return { product, units, placements, weekly, dos, target, fill, supply, pack };
+  });
+  const rank = (r) => (r.pack === "belowCase" ? 0 : r.supply === "short" ? 1 : r.pack === "overage" ? 2 : r.supply === "over" ? 3 : 4);
+  return rows.sort((a, b) => rank(a) - rank(b) || a.product.name.localeCompare(b.product.name));
+}
+
+function SupplyReportModal({ planogram, products, performance, cutoffISO, storeId, dosTargets, weeks, onClose }) {
+  const rows = React.useMemo(() => buildSupplyReport(planogram, products, performance, cutoffISO, storeId, dosTargets), [planogram, products, performance, cutoffISO, storeId, dosTargets]);
+  const f1 = (n) => (Math.round(n * 10) / 10).toString();
+  const problems = rows.filter((r) => r.pack === "belowCase" || r.pack === "overage" || r.supply === "short").length;
+  const supplyCell = (r) => {
+    if (r.supply === "noSales") return <span className="text-slate-400">no sales</span>;
+    const cls = r.supply === "short" ? "text-red-600" : r.supply === "over" ? "text-amber-600" : r.supply === "ok" ? "text-emerald-600" : "text-slate-700";
+    return <span className={"font-semibold " + cls}>{f1(r.dos)}{r.target ? ` / ${r.target}` : ""}</span>;
+  };
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-6 no-print" onClick={onClose}>
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-5xl max-h-[85vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-3 border-b border-slate-200">
+          <div>
+            <h3 className="font-bold text-slate-800 flex items-center gap-1.5"><Package size={16} /> Supply report — {planogram.name}</h3>
+            <p className="text-xs text-slate-500">Units on the shelf vs. sales over the last {weeks} weeks, and vs. how the product ships. {problems ? `${problems} item${problems === 1 ? "" : "s"} need attention.` : "Everything lines up."}</p>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+        </div>
+        <div className="overflow-auto px-5 py-3">
+          <table className="min-w-full text-sm">
+            <thead>
+              <tr className="text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500 border-b border-slate-200">
+                <th className="py-1.5 pr-3">Product</th><th className="py-1.5 pr-3 text-right">On shelf</th><th className="py-1.5 pr-3 text-right">Units/wk</th>
+                <th className="py-1.5 pr-3 text-right">Days of supply / target</th><th className="py-1.5 pr-3 text-right">Case pack</th><th className="py-1.5 pr-3 text-right">Pack-out</th><th className="py-1.5">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.product.id} className="border-b border-slate-100">
+                  <td className="py-1.5 pr-3 text-slate-800">{r.product.name}</td>
+                  <td className="py-1.5 pr-3 text-right font-mono">{r.units}</td>
+                  <td className="py-1.5 pr-3 text-right font-mono">{r.weekly ? f1(r.weekly) : "—"}</td>
+                  <td className="py-1.5 pr-3 text-right font-mono">{supplyCell(r)}</td>
+                  <td className="py-1.5 pr-3 text-right font-mono">{r.fill ? r.fill.casePack : "—"}</td>
+                  <td className="py-1.5 pr-3 text-right font-mono">{r.fill ? `${Math.round(r.fill.cases * 100) / 100} cases` : "—"}</td>
+                  <td className="py-1.5 text-xs">
+                    {r.pack === "belowCase" && <span className="text-red-600 font-semibold">Less than one case — every delivery overflows</span>}
+                    {r.pack === "overage" && <span className="text-red-600 font-semibold">Not a case / half-case pack-out — overage to the back room</span>}
+                    {r.supply === "short" && <span className="text-red-600 block">Short of the {r.target}-day target</span>}
+                    {r.supply === "over" && <span className="text-amber-600 block">Over {DOS_EXCESS_FACTOR}x the target</span>}
+                    {r.pack !== "belowCase" && r.pack !== "overage" && r.supply !== "short" && r.supply !== "over" && <span className="text-slate-400">OK</span>}
+                  </td>
+                </tr>
+              ))}
+              {rows.length === 0 && <tr><td colSpan={7} className="py-6 text-center text-slate-400 italic">No products on this planogram yet.</td></tr>}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
@@ -7211,6 +7784,42 @@ function ResetThresholdsEditor({ planograms, resetThresholds, onChange }) {
         </tbody>
       </table>
     </div>
+  );
+}
+
+// Settings panel for per-category days-of-supply targets (blank = no check for that category).
+function DosTargetsEditor({ planograms, dosTargets, onChange }) {
+  const categories = React.useMemo(() => {
+    const set = new Set();
+    (planograms || []).forEach((p) => { if (p.category) set.add(p.category); });
+    return [...set].sort();
+  }, [planograms]);
+  const setDays = (cat, value) => {
+    const rest = dosTargets.filter((t) => t.category !== cat);
+    const days = value === "" ? null : Math.max(0, Number(value));
+    onChange(days === null || Number.isNaN(days) ? rest : [...rest, { category: cat, days }]);
+  };
+  if (categories.length === 0) return <p className="text-sm text-slate-500">Set a Category on a planogram to configure a days-of-supply target for it.</p>;
+  return (
+    <table className="min-w-full text-sm">
+      <thead>
+        <tr className="text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500 border-b border-slate-200">
+          <th className="py-1.5 pr-3">Category</th>
+          <th className="py-1.5 pr-3">Days of supply on shelf</th>
+        </tr>
+      </thead>
+      <tbody>
+        {categories.map((cat) => {
+          const row = dosTargets.find((t) => t.category === cat);
+          return (
+            <tr key={cat} className="border-b border-slate-100">
+              <td className="py-1.5 pr-3 text-slate-700">{cat}</td>
+              <td className="py-1.5 pr-3"><input type="number" min="0" step="0.5" className={inputCls + " w-24"} placeholder="off" value={row?.days ?? ""} onChange={(e) => setDays(cat, e.target.value)} /></td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
   );
 }
 
@@ -7329,7 +7938,7 @@ function PlanogramVersionsBar({ planogram, allPlanograms, onCreateVersion, onOpe
   );
 }
 
-function PlanogramEditor({ planogram, products, fixtures, performance, productSchema, resetThresholds, stores, capacityWarningsEnabled, onAssignStores, onUpdate, onBack, allPlanograms, onCreateVersion, onOpenVersion, onMakeLive, onResolveIssue, onDraftReset, draftingReset, onApproveResetDraft, onDiscardResetDraft }) {
+function PlanogramEditor({ planogram, products, fixtures, performance, productSchema, resetThresholds, dosTargets, stores, capacityWarningsEnabled, onAssignStores, onUpdate, onBack, allPlanograms, onCreateVersion, onOpenVersion, onMakeLive, onResolveIssue, onDraftReset, draftingReset, onApproveResetDraft, onDiscardResetDraft }) {
   const [presentMode, setPresentMode] = useState(false);
   const [hideImages, setHideImages] = useState(false); // session-only view toggle, not saved with the planogram
   const [highlightField, setHighlightField] = useState(null); // attribute field id, or null = off
@@ -7395,7 +8004,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   const planogramMarginPct = planogramTotals.totalSales > 0 ? (planogramTotals.grossProfit / planogramTotals.totalSales) * 100 : 0;
   const planogramUnitProfit = planogramTotals.totalUnits > 0 ? planogramTotals.grossProfit / planogramTotals.totalUnits : 0;
 
-  const mutateSections = (fn) => onUpdate({ ...planogram, sections: fn(planogram.sections) });
+  const mutateSections = (fn) => onUpdate(refitAutoStacks({ ...planogram, sections: fn(planogram.sections) }, fixtures, products));
 
   const addSection = () => {
     mutateSections((secs) => [...secs, { id: uid("sec"), name: `Sec ${secs.length + 1}`, width: 48, fixtures: [] }]);
@@ -7572,6 +8181,8 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                 if (f.id !== fxId) return f;
                 const arr = [...f.placements];
                 const newPlacement = { id: newId, productId, facings: 1, orientation: "front", rotation: 0, merchStyle: "unit" };
+                // shelf products stack to the available height on their own; the planner can switch it off per product
+                if (!pegCoords) newPlacement.autoStack = true;
                 if (pegCoords) { newPlacement.pegX = pegCoords.pegX; newPlacement.pegY = pegCoords.pegY; }
                 const idx = insertIndex == null ? arr.length : clamp(insertIndex, 0, arr.length);
                 arr.splice(idx, 0, newPlacement);
@@ -7590,7 +8201,51 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   };
   const quickAddProduct = (sectionId, fxId) => addPlacement(sectionId, fxId, quickAddProductId);
 
+  // Stacking guard: a stack taller than the headroom under the shelf above is refused. Edits that
+  // don't add height always go through, so a stack that is already too tall (imported, or drafted
+  // before the shelf above moved) can still be reduced. Only stacked placements (more than one
+  // high, or capped) are held to this on moves/drops — a lone tall product keeps its old behavior.
+  const [stackNotice, setStackNotice] = useState("");
+  const [supplyReportOpen, setSupplyReportOpen] = useState(false);
+  useEffect(() => {
+    if (!stackNotice) return undefined;
+    const t = setTimeout(() => setStackNotice(""), 6000);
+    return () => clearTimeout(t);
+  }, [stackNotice]);
+  const findFixtureCtx = (sectionId, fxId) => {
+    const sec = planogram.sections.find((s) => s.id === sectionId);
+    const fx = sec?.fixtures.find((f) => f.id === fxId);
+    return sec && fx ? { sec, fx, def: fixtures.find((d) => d.id === fx.fixtureId) } : null;
+  };
+  const stackBlockReason = (placement, destSectionId, destFxId, mode) => {
+    const product = products.find((p) => p.id === placement.productId);
+    const dest = findFixtureCtx(destSectionId, destFxId);
+    if (!product || !dest || dest.def?.type === "Pegboard") return null;
+    const cfg = getStackConfig(placement);
+    if (mode === "move" && placement.autoStack) return null; // it re-fits itself to the new shelf
+    if (mode === "move" && cfg.high <= 1 && !cfg.cap && cfg.deep <= 1) return null;
+    const height = getStackHeightProblem(product, placement, products, getShelfClearanceIn(planogram, dest.sec, dest.fx, fixtures));
+    // moving onto a shelf too shallow for the Deep stack is refused as well (edits check depth separately)
+    return height || (mode === "move" ? getStackDepthProblem(product, placement, products, dest.def?.dims?.d) : null);
+  };
+
   const updatePlacement = (sectionId, fxId, placementId, patch) => {
+    const current = findFixtureCtx(sectionId, fxId)?.fx.placements.find((p) => p.id === placementId);
+    const product = current && products.find((p) => p.id === current.productId);
+    if (current && product) {
+      // an auto-stacked placement re-fits its own High, so judge it at 1 high (cap + one unit must fit)
+      const judged = patch.autoStack ? { ...patch, high: 1 } : patch;
+      const reason = stackBlockReason(judged, sectionId, fxId, "edit");
+      if (reason && getStackDims(product, judged, products).heightIn > getStackDims(product, current.autoStack ? { ...current, high: 1 } : current, products).heightIn + 1e-6) {
+        setStackNotice(reason + " The change wasn't applied.");
+        return;
+      }
+      const depthReason = getStackDepthProblem(product, patch, products, findFixtureCtx(sectionId, fxId)?.def?.dims?.d);
+      if (depthReason && getStackDims(product, patch, products).stackDepthIn > getStackDims(product, current, products).stackDepthIn + 1e-6) {
+        setStackNotice(depthReason + " The change wasn't applied.");
+        return;
+      }
+    }
     mutateSections((secs) =>
       secs.map((s) =>
         s.id === sectionId
@@ -7617,6 +8272,11 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
 
   // move an existing placement from one fixture to another, preserving its orientation/rotation/facings
   const movePlacement = (source, dest, insertIndex, pegCoords) => {
+    const movingPl = findFixtureCtx(source.sectionId, source.fixtureInstId)?.fx.placements.find((p) => p.id === source.placementId);
+    if (movingPl) {
+      const reason = stackBlockReason(movingPl, dest.sectionId, dest.fixtureInstId, "move");
+      if (reason) { setStackNotice(reason + " It wasn't moved."); return; }
+    }
     mutateSections((secs) => {
       let moved = null;
       const withoutSource = secs.map((s) => {
@@ -7714,6 +8374,11 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   // crossing into a non-pegboard fixture.
   const moveGroupToFixture = (items, dest, insertIndex) => {
     if (!items || items.length === 0) return;
+    for (const it of items) {
+      const pl = findFixtureCtx(it.sectionId, it.fixtureInstId)?.fx.placements.find((p) => p.id === it.placementId);
+      const reason = pl && stackBlockReason(pl, dest.sectionId, dest.fixtureInstId, "move");
+      if (reason) { setStackNotice(reason + " Nothing was moved."); return; }
+    }
     mutateSections((secs) => {
       const movedById = {};
       let next = secs.map((s) => ({
@@ -7967,6 +8632,13 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
               >
                 <ImageOff size={12} /> {hideImages ? "Images Hidden" : "Hide Images"}
               </button>
+              <button
+                onClick={() => setSupplyReportOpen(true)}
+                title="Units on the shelf vs. sales (days of supply) and vs. the warehouse case pack"
+                className="text-xs font-medium flex items-center gap-1.5 rounded-full px-2.5 py-1 border border-slate-300 text-slate-600 hover:bg-slate-50"
+              >
+                <Package size={12} /> Supply Report
+              </button>
               <div className="relative">
                 <button
                   onClick={() => setHighlightPanelOpen((o) => !o)}
@@ -8176,6 +8848,16 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
             <ChevronRight size={12} className="text-slate-500" />
           </button>
 
+          {supplyReportOpen && (
+            <SupplyReportModal planogram={planogram} products={products} performance={performance} cutoffISO={cutoffISO} storeId={activeStoreId} dosTargets={dosTargets} weeks={analysisWeeks} onClose={() => setSupplyReportOpen(false)} />
+          )}
+          {stackNotice && (
+            <div role="alert" className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 max-w-md bg-red-600 text-white text-xs font-semibold rounded-lg shadow-lg px-4 py-2.5 flex items-start gap-2 no-print">
+              <AlertTriangle size={14} className="shrink-0 mt-px" />
+              <span>{stackNotice}</span>
+              <button onClick={() => setStackNotice("")} className="shrink-0 opacity-80 hover:opacity-100"><X size={13} /></button>
+            </div>
+          )}
           {placementCtx ? (
             <PlacementInspector
               placement={placementCtx.pl}
@@ -8184,6 +8866,10 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
               weeks={analysisWeeks}
               isPegboard={fixtures.find((f) => f.id === placementCtx.fx.fixtureId)?.type === "Pegboard"}
               pegboardHeightIn={fixtures.find((f) => f.id === placementCtx.fx.fixtureId)?.dims?.h}
+              products={products}
+              clearanceIn={getShelfClearanceIn(planogram, placementCtx.sec, placementCtx.fx, fixtures)}
+              shelfDepthIn={fixtures.find((f) => f.id === placementCtx.fx.fixtureId)?.dims?.d}
+              dosTargetDays={getDosTargetDays(planogram.category || "", dosTargets, placementCtx.product)}
               onChange={(patch) => updatePlacement(placementCtx.sec.id, placementCtx.fx.id, placementCtx.pl.id, patch)}
               onRemove={() => removePlacement(placementCtx.sec.id, placementCtx.fx.id, placementCtx.pl.id)}
               onClose={() => setSelectedPlacement(null)}
@@ -8213,6 +8899,16 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                   <input type="number" step="1" className={inputCls} value={fixtureCtx.fx.xOffset} onChange={(e) => updateFixtureInst(fixtureCtx.section.id, fixtureCtx.fx.id, { xOffset: Math.round(Number(e.target.value)) || 0 })} />
                 </Field>
               </div>
+
+              {!fixtureCtx.fx.mountedOnId && fixtures.find((f) => f.id === fixtureCtx.fx.fixtureId)?.type !== "Pegboard" && (
+                <button
+                  className={btnGhost + " w-full justify-center"}
+                  title="Turn on automatic stacking for every product on this shelf"
+                  onClick={() => updateFixtureInst(fixtureCtx.section.id, fixtureCtx.fx.id, { placements: fixtureCtx.fx.placements.map((pl) => ({ ...pl, autoStack: true })) })}
+                >
+                  <Layers size={13} /> Auto-stack this shelf
+                </button>
+              )}
 
               <button
                 className={btnGhost + " w-full justify-center"}
@@ -9593,6 +10289,7 @@ function AppContent({ session }) {
   const [eventTypes, setEventTypes] = useState(DEFAULT_EVENT_TYPES); // customizable event type list
   const [taskTypes, setTaskTypes] = useState(DEFAULT_TASK_TYPES); // customizable Store Assistant task type list
   const [resetThresholds, setResetThresholds] = useState([]); // [{category, low, high}] — Reset Drafting Agent's Sales/Space Index bounds, per planogram category
+  const [dosTargets, setDosTargets] = useState([]); // [{category, days}] — days of supply the shelf should hold, per planogram Category (no row = no check)
   const [draftingReset, setDraftingReset] = useState(false);
   const [proposals, setProposals] = useState({ loaded: false, rows: [] }); // pending agent Proposals (see ResetDraftQueue)
   const [reviewingProposalId, setReviewingProposalId] = useState(null); // the Proposal open in ProposalReview, if any
@@ -9627,7 +10324,7 @@ function AppContent({ session }) {
 
     (async () => {
       try {
-        const [pSchema, fSchema, pkField, imgRepo, upcLk, capWarn, prods, fixs, pogs, perf, strs, savedMode, savedStoreId, savedEvents, savedEventTypes, savedTaskTypes, savedResetThresholds] = await Promise.all([
+        const [pSchema, fSchema, pkField, imgRepo, upcLk, capWarn, prods, fixs, pogs, perf, strs, savedMode, savedStoreId, savedEvents, savedEventTypes, savedTaskTypes, savedResetThresholds, savedDosTargets] = await Promise.all([
           safeGet("schema:product"),
           safeGet("schema:fixture"),
           safeGet("settings:primaryKeyField"),
@@ -9645,13 +10342,14 @@ function AppContent({ session }) {
           safeGet("schema:eventType"),
           safeGet("schema:taskType"),
           safeGet("schema:resetThresholds"),
+          safeGet("schema:dosTargets"),
         ]);
         if (settled) return; // the timeout already fired and the app moved on — don't clobber state after the fact
         if (pSchema) setProductSchema(JSON.parse(pSchema));
         if (fSchema) setFixtureSchema(JSON.parse(fSchema));
         if (pkField) setPrimaryKeyField(pkField);
         if (imgRepo) setImageRepo({ ...DEFAULT_IMAGE_REPO, ...JSON.parse(imgRepo) });
-        if (upcLk) setUpcLookup({ ...DEFAULT_UPC_LOOKUP, ...JSON.parse(upcLk) });
+        if (upcLk) setUpcLookup({ ...DEFAULT_UPC_LOOKUP, ...migrateUpcLookup(JSON.parse(upcLk)) });
         if (capWarn !== null) setCapacityWarningsEnabled(capWarn === "true");
         if (savedMode) setAppModeState(savedMode);
         if (savedStoreId) setSelectedStoreIdState(savedStoreId);
@@ -9659,6 +10357,7 @@ function AppContent({ session }) {
         if (savedEventTypes) setEventTypes(JSON.parse(savedEventTypes));
         if (savedTaskTypes) setTaskTypes(JSON.parse(savedTaskTypes));
         if (savedResetThresholds) setResetThresholds(JSON.parse(savedResetThresholds));
+        if (savedDosTargets) setDosTargets(JSON.parse(savedDosTargets));
         setProducts(prods);
         setFixtures(fixs);
         setPlanograms(pogs);
@@ -9831,6 +10530,10 @@ function AppContent({ session }) {
   const updateResetThresholds = (next) => {
     setResetThresholds(next);
     safeSet("schema:resetThresholds", JSON.stringify(next));
+  };
+  const updateDosTargets = (next) => {
+    setDosTargets(next);
+    safeSet("schema:dosTargets", JSON.stringify(next));
   };
 
 
@@ -10329,6 +11032,7 @@ function AppContent({ session }) {
             performance={performance}
             productSchema={productSchema}
             resetThresholds={resetThresholds}
+            dosTargets={dosTargets}
             stores={stores}
             capacityWarningsEnabled={capacityWarningsEnabled}
             onAssignStores={(storeIds) => assignStoresToPlanogram(activePlanogram.id, storeIds)}
@@ -10555,8 +11259,17 @@ function AppContent({ session }) {
                     className={inputCls}
                     value={upcLookup.baseUrl}
                     onChange={(e) => updateUpcLookup({ baseUrl: e.target.value })}
-                    placeholder="https://www.kroger.com/product/images/thumbnail/"
+                    placeholder="https://www.kroger.com/product/images/"
                   />
+                </Field>
+                <Field label="Image size (use {size} in the pattern)">
+                  <select className={inputCls} value={upcLookup.size || "xlarge"} onChange={(e) => updateUpcLookup({ size: e.target.value })}>
+                    <option value="xlarge">Extra large — best quality (recommended)</option>
+                    <option value="large">Large</option>
+                    <option value="medium">Medium</option>
+                    <option value="small">Small — blurry at planogram scale</option>
+                    <option value="thumbnail">Thumbnail — blurry at planogram scale</option>
+                  </select>
                 </Field>
                 <div className="grid grid-cols-2 gap-3">
                   <Field label="Filename Pattern">
@@ -10564,7 +11277,7 @@ function AppContent({ session }) {
                       className={inputCls}
                       value={upcLookup.pattern}
                       onChange={(e) => updateUpcLookup({ pattern: e.target.value })}
-                      placeholder="{orientation}/{key}"
+                      placeholder="{size}/{orientation}/{key}"
                     />
                   </Field>
                   <Field label="File Extensions (blank = none)">
@@ -10579,7 +11292,7 @@ function AppContent({ session }) {
               </div>
               <p className="text-[11px] text-slate-400 mt-2">
                 Example: 12-digit UPC <code>013000004668</code> normalizes to <code>{normalizeUpcForKrogerCdn("013000004668")}</code> (Kroger's CDN keys images by a 13-digit code — the UPC's number-system and check digits dropped, zero-padded back to 13), then Front view → tries
-                <code className="mx-1">{upcLookup.baseUrl}{(upcLookup.pattern || "{orientation}/{key}").replace("{key}", normalizeUpcForKrogerCdn("013000004668")).replace("{orientation}", "front")}{(upcLookup.extensions || "").split(",")[0]?.trim() ? `.${upcLookup.extensions.split(",")[0].trim()}` : ""}</code>.
+                <code className="mx-1">{upcLookup.baseUrl}{(upcLookup.pattern || "{size}/{orientation}/{key}").replace("{key}", normalizeUpcForKrogerCdn("013000004668")).replace("{orientation}", "front").replace("{size}", upcLookup.size || "xlarge")}{(upcLookup.extensions || "").split(",")[0]?.trim() ? `.${upcLookup.extensions.split(",")[0].trim()}` : ""}</code>.
                 {ORIENTATIONS.length > 1 && " The same normalized key is tried for all 6 orientations — front, back, top, bottom, left, right — filling in whichever ones the retailer happens to have."}
               </p>
               <p className="text-[11px] text-slate-400 mt-1">
@@ -10600,6 +11313,12 @@ function AppContent({ session }) {
               <h3 className="text-sm font-semibold text-slate-800 mb-1 flex items-center gap-1.5"><Sparkles size={15} className="text-amber-500" /> Reset Drafting Thresholds</h3>
               <p className="text-xs text-slate-500 mb-3">Sales/Space Index bounds the Reset Drafting Agent uses to flag under- and over-performers, by planogram Category. Default {DEFAULT_RESET_THRESHOLDS.low} / {DEFAULT_RESET_THRESHOLDS.high} applies until a category is set here.</p>
               <ResetThresholdsEditor planograms={planograms} resetThresholds={resetThresholds} onChange={updateResetThresholds} />
+            </div>
+
+            <div className="bg-white rounded-lg border border-slate-200 p-4 mt-6">
+              <h3 className="text-sm font-semibold text-slate-800 mb-1 flex items-center gap-1.5"><Sparkles size={15} className="text-amber-500" /> Days of Supply Targets</h3>
+              <p className="text-xs text-slate-500 mb-3">How many days of sales the shelf should hold, by planogram Category. The Reset Drafting Agent weighs this alongside the Sales/Space Index: it will not cut a product below its target, adds facings or height where the shelf runs short, and trims a shelf holding far more than it needs. Leave a category blank to skip the check. A product can carry its own target on its product page.</p>
+              <DosTargetsEditor planograms={planograms} dosTargets={dosTargets} onChange={updateDosTargets} />
             </div>
           </div>
         )}

@@ -123,7 +123,7 @@ export async function handleDraftReset(req, db) {
       fetchAll(db, "products", "data"),
       fetchAll(db, "fixtures", "data"),
       fetchAll(db, "performance", "id, data"),
-      fetchAll(db, "app_settings", "key, value", (q) => q.in("key", ["schema:product", "schema:resetThresholds"])),
+      fetchAll(db, "app_settings", "key, value", (q) => q.in("key", ["schema:product", "schema:resetThresholds", "schema:dosTargets"])),
     ]);
     const planogramById = Object.fromEntries(planogramRows.map((r) => [r.id, r.data]));
     const products = productRows.map((r) => r.data);
@@ -134,6 +134,7 @@ export async function handleDraftReset(req, db) {
     // missing-winner additions, same as the app would.
     const productSchema = setting("schema:product", []);
     const resetThresholds = setting("schema:resetThresholds", []);
+    const dosTargets = setting("schema:dosTargets", []);
 
     const cache = createDraftCache(); // one Performance snapshot, so planograms can share window totals
     const results = [];
@@ -141,7 +142,7 @@ export async function handleDraftReset(req, db) {
       const planogram = planogramById[planogramId];
       if (!planogram) { results.push({ planogramId, ok: false, error: "Planogram not found" }); continue; }
       try {
-        const result = computeResetDraft(planogram, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, storeId, cache);
+        const result = computeResetDraft(planogram, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, storeId, cache, dosTargets);
         // what the planogram looked like when this was drafted; apply-proposal refuses to apply
         // the proposal if the planogram has been edited since (its placement ids may have moved)
         result.sourceFingerprint = await fingerprint(planogram.sections ?? null);
