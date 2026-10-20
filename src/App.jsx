@@ -10,7 +10,7 @@ import {
 import {
   supabase, supabaseConfigured, pendingWriteListeners,
   safeGet, safeSet, safeDelete, loadIndexed, saveIndexed, deleteIndexed, waitForPendingWrites,
-  loadPendingProposals, reviewProposal, loadProfileNames, loadActivity,
+  loadPendingProposals, reviewProposal, loadProfileNames, loadActivity, loadProposal, applyProposal, invokeEdgeFunction,
 } from "./lib/db.js";
 
 /* ------------------------------------------------------------------ */
@@ -158,6 +158,29 @@ function cloneSectionsWithNewIds(sections) {
       placements: (fx.placements || []).map((pl) => ({ ...pl, id: uid("pl") })),
     })),
   }));
+}
+
+// Builds the next version of `source`: linked back to its family's master, next version number
+// (computed from `existingList`, which need not be the latest React state — bulk creation relies
+// on that), content deep-cloned with fresh ids, lifecycle reset to a clean WIP. Pure, so the
+// app and the apply-proposal Edge Function (via scripts/sync-edge-core.mjs) build versions
+// identically; `id` lets the server pass a deterministic id so a retried apply can't duplicate.
+function makePlanogramVersion(source, existingList, id) {
+  const masterId = getFamilyMasterId(source);
+  const siblings = existingList.filter((p) => getFamilyMasterId(p) === masterId);
+  const nextVersion = Math.max(1, ...siblings.map((p) => p.versionNumber || 1)) + 1;
+  const baseName = source.name.replace(/\s*\(v\d+\)\s*$/i, "").trim();
+  return {
+    ...source,
+    id: id || uid("pog"),
+    name: `${baseName} (v${nextVersion})`,
+    masterId,
+    versionNumber: nextVersion,
+    sections: cloneSectionsWithNewIds(source.sections),
+    status: "wip",
+    eventDate: "",
+    publishedAt: undefined,
+  };
 }
 
 function PlanogramStatusBadge({ status, className }) {
@@ -4606,7 +4629,7 @@ function NewPlanogramForm({ existingCategories, onCreate, onCancel }) {
   );
 }
 
-function PlanogramList({ planograms, stores, products, fixtures, productSchema, onCreate, onOpen, onDelete, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace, onDraftResetBulk, draftingReset, proposals, profileNames }) {
+function PlanogramList({ planograms, stores, products, fixtures, productSchema, onCreate, onOpen, onDelete, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace, onDraftResetBulk, draftingReset, proposals, profileNames, onOpenProposal }) {
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
   const [bulkLookbackWeeks, setBulkLookbackWeeks] = useState(13);
@@ -4722,7 +4745,7 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
         />
       )}
 
-      <ResetDraftQueue planograms={planograms} proposals={proposals} profileNames={profileNames} onOpenDraft={onOpen} />
+      <ResetDraftQueue planograms={planograms} proposals={proposals} profileNames={profileNames} onOpenDraft={onOpen} onOpenProposal={onOpenProposal} />
 
       {planograms.length > 0 && (
         <div className="bg-white border border-slate-200 rounded-lg p-3 mb-4 space-y-3">
@@ -5033,17 +5056,14 @@ function layoutFixtureBoxes(fixtureInst, fixtureDef, products) {
 const DRAFT_RESET_CHUNK = 50; // mirrors MAX_PLANOGRAMS_PER_CALL in the Edge Function
 async function invokeDraftReset(planogramIds, lookbackWeeks) {
   await waitForPendingWrites();
-  const { data, error } = await supabase.functions.invoke("draft-reset", { body: { planogramIds, lookbackWeeks } });
-  if (error) {
-    let message = error.message || "The draft-reset function couldn't be reached.";
-    try { const body = await error.context.json(); if (body?.error) message = body.error; } catch (e) { /* keep the generic message */ }
-    throw new Error(message);
-  }
+  const data = await invokeEdgeFunction("draft-reset", { planogramIds, lookbackWeeks });
   return data.results;
 }
 
 // Applies a computed draft's changes to a plain sections array (old ids, not yet cloned) — used
-// right before buildPlanogramVersion, which clones whatever sections it's given with fresh ids.
+// right before makePlanogramVersion, which clones whatever sections it's given with fresh ids.
+// Since Phase 4 this runs in the apply-proposal Edge Function (copied from here by
+// scripts/sync-edge-core.mjs); it stays in this file as the single source of truth.
 // Deletions and facing edits both key off placement id, so order between them doesn't matter.
 function applyResetDraftChanges(sections, changes) {
   const next = JSON.parse(JSON.stringify(sections));
@@ -6992,23 +7012,32 @@ function resetDraftScoreBand(score) {
 
 // The review queue: every AI draft still waiting on a person, lowest Draft Score first, so the
 // planograms that most needed a human to finish the job float to the top of a bulk run.
-// Membership and score come from the pending Proposals when they could be loaded; a draft whose
-// Proposal has already been decided (say, on another device) drops out, and a draft with no
-// Proposal at all (made before Proposals existed) still shows, so nothing is ever hidden just
-// because the proposals table couldn't be read.
+// Two kinds of entry:
+//  - a pending Proposal from the Reset Drafting Agent (the normal case since Phase 4): nothing
+//    exists yet but the proposal; approving it is what creates the new WIP version;
+//  - an older draft that already exists as a WIP version carrying `resetDraft` (made before
+//    Phase 4). Those still open the in-place review. If the proposals couldn't be loaded, or one
+//    was already decided elsewhere, drafts follow the Proposal's status when there is one, and
+//    are never hidden just because the proposals table couldn't be read.
 function buildResetDraftQueue(planograms, proposals) {
-  const pendingById = Object.fromEntries((proposals.rows || []).map((r) => [r.id, r]));
-  return planograms
+  const pendingRows = proposals.rows || [];
+  const pendingById = Object.fromEntries(pendingRows.map((r) => [r.id, r]));
+  const drafts = planograms
     .filter((p) => p.resetDraft && !p.resetDraft.reviewed)
     .filter((p) => !(p.resetDraft.proposalId && proposals.loaded && !pendingById[p.resetDraft.proposalId]))
     .map((p) => {
       const proposal = pendingById[p.resetDraft.proposalId];
-      return { planogram: p, proposal, score: proposal?.score ?? p.resetDraft.score ?? 100 };
-    })
-    .sort((a, b) => a.score - b.score);
+      return { kind: "draft", planogram: p, proposal, score: proposal?.score ?? p.resetDraft.score ?? 100 };
+    });
+  const linked = new Set(planograms.map((p) => p.resetDraft?.proposalId).filter(Boolean));
+  const fresh = pendingRows
+    .filter((r) => r.agent_id === "reset-drafting-agent" && r.target_type === "planogram_version" && !linked.has(r.id))
+    .map((r) => ({ kind: "proposal", planogram: planograms.find((p) => p.id === r.target_id), proposal: r, score: r.score ?? 100 }))
+    .filter((item) => item.planogram); // its source planogram was deleted: nothing left to review against
+  return [...drafts, ...fresh].sort((a, b) => a.score - b.score);
 }
 
-function ResetDraftQueue({ planograms, proposals, profileNames, onOpenDraft }) {
+function ResetDraftQueue({ planograms, proposals, profileNames, onOpenDraft, onOpenProposal }) {
   const pending = buildResetDraftQueue(planograms, proposals);
 
   if (pending.length === 0) return null;
@@ -7018,18 +7047,21 @@ function ResetDraftQueue({ planograms, proposals, profileNames, onOpenDraft }) {
       <h3 className="text-sm font-semibold text-blue-900 flex items-center gap-1.5 mb-1"><Sparkles size={15} /> AI Draft Review Queue ({pending.length})</h3>
       <p className="text-xs text-blue-700 mb-3">Sorted lowest score first — these are the drafts that most needed a human to finish the job.</p>
       <div className="divide-y divide-blue-100 bg-white rounded-md border border-blue-100">
-        {pending.map(({ planogram: p, proposal, score }) => {
+        {pending.map(({ kind, planogram: p, proposal, score }) => {
           const band = resetDraftScoreBand(score);
           const requester = proposal?.requested_by ? profileNames[proposal.requested_by] : null;
+          const summary = kind === "draft"
+            ? `${(p.resetDraft.changes || []).length} changes, ${(p.resetDraft.skipped || []).length} skipped`
+            : (proposal.reason || "").replace(/ from the last .*$/, "").replace(/\.$/, "");
           return (
-            <button key={p.id} onClick={() => onOpenDraft(p.id)} className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-slate-50">
+            <button key={proposal?.id || p.id} onClick={() => (kind === "proposal" ? onOpenProposal(proposal.id) : onOpenDraft(p.id))} className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-slate-50">
               <span className={`text-xs font-bold rounded-full px-2 py-0.5 border shrink-0 ${band.cls}`}>{score}%</span>
               <span className="flex-1 min-w-0">
                 <span className="block text-sm font-medium text-slate-800 truncate">{p.name}</span>
                 {proposal && <span className="block text-[10px] text-slate-400 truncate">{requester ? `Requested by ${requester} · ` : ""}{new Date(proposal.created_at).toLocaleString()}</span>}
               </span>
               {p.category && <span className="text-[10px] text-slate-400 shrink-0">{p.category}</span>}
-              <span className="text-[10px] text-slate-400 shrink-0">{(p.resetDraft.changes || []).length} changes, {(p.resetDraft.skipped || []).length} skipped</span>
+              <span className="text-[10px] text-slate-400 shrink-0">{summary}</span>
               <span className={`text-[10px] font-medium rounded-full px-2 py-0.5 border shrink-0 ${band.cls}`}>{band.label}</span>
             </button>
           );
@@ -7039,7 +7071,48 @@ function ResetDraftQueue({ planograms, proposals, profileNames, onOpenDraft }) {
   );
 }
 
-function ResetDraftReviewPanel({ planogram, onApprove, onDiscard, onBack }) {
+// Reviews a pending Proposal before anything exists: shows what the agent wants to change and
+// why, and Approve is what has the apply-proposal function create the new WIP version. Rejecting
+// just records the decision. Reuses the same review layout as the older in-place drafts.
+function ProposalReview({ proposalId, planograms, onBack, onApprove, onReject }) {
+  const [state, setState] = useState({ status: "loading" });
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    loadProposal(proposalId).then((r) => { if (alive) setState(r.ok ? { status: "ready", proposal: r.row } : { status: "error", message: r.error }); });
+    return () => { alive = false; };
+  }, [proposalId]);
+
+  const run = async (action, proposal) => {
+    setBusy(true);
+    try { await action(proposal); } finally { setBusy(false); }
+  };
+
+  if (state.status === "loading") return <p className="text-sm text-slate-400">Loading the proposal…</p>;
+  if (state.status === "error" || state.proposal.status !== "pending") {
+    return (
+      <div className="max-w-3xl mx-auto">
+        <button className={btnGhost + " mb-3"} onClick={onBack}><ArrowLeft size={14} /> Back</button>
+        <p className="text-sm text-slate-600">{state.status === "error" ? state.message : `This proposal was already ${state.proposal.status}.`}</p>
+      </div>
+    );
+  }
+  const { proposal } = state;
+  const source = planograms.find((p) => p.id === proposal.target_id);
+  return (
+    <ResetDraftReviewPanel
+      planogram={{ name: source?.name || "(planogram deleted)", resetDraft: proposal.proposed_change }}
+      approveLabel="Approve — create WIP version"
+      discardLabel="Reject"
+      busy={busy}
+      onBack={onBack}
+      onApprove={() => run(onApprove, proposal)}
+      onDiscard={() => run(onReject, proposal)}
+    />
+  );
+}
+
+function ResetDraftReviewPanel({ planogram, onApprove, onDiscard, onBack, approveLabel, discardLabel, busy }) {
   const draft = planogram.resetDraft || {};
   const changes = draft.changes || [];
   const skipped = draft.skipped || [];
@@ -7083,8 +7156,8 @@ function ResetDraftReviewPanel({ planogram, onApprove, onDiscard, onBack }) {
       <Group title="Deletions" icon={Trash2} colorCls="text-red-700" items={deleted} />
       <Group title="Skipped" icon={AlertTriangle} colorCls="text-slate-500" items={skipped} />
       <div className="flex items-center gap-2 mt-6">
-        <button className={btnDanger} onClick={onDiscard}><Trash2 size={13} /> Discard Draft</button>
-        <button className={btnPrimary + " ml-auto"} onClick={onApprove}><Check size={14} /> Keep as WIP — Continue to Approve</button>
+        <button className={btnDanger} disabled={busy} onClick={onDiscard}><Trash2 size={13} /> {discardLabel || "Discard Draft"}</button>
+        <button className={btnPrimary + " ml-auto"} disabled={busy} onClick={onApprove}><Check size={14} /> {busy ? "Working…" : approveLabel || "Keep as WIP — Continue to Approve"}</button>
       </div>
     </div>
   );
@@ -7158,6 +7231,7 @@ function describeActivity(row, names) {
       sub: [d.score != null ? `Draft Score ${d.score}%` : null, d.lookbackWeeks ? `last ${d.lookbackWeeks} weeks` : null, requester ? `requested by ${requester}` : null].filter(Boolean).join(" · "),
     };
   }
+  if (row.action === "proposal_applied") return { icon: Check, cls: "text-emerald-600 bg-emerald-50", title: `${actor} approved the AI draft and created ${d.planogramName || "a new version"}`, sub: d.score != null ? `Draft Score ${d.score}%` : "" };
   if (row.action === "proposal_approved") return { icon: Check, cls: "text-emerald-600 bg-emerald-50", title: `${actor} approved the AI draft`, sub: d.note || "" };
   if (row.action === "proposal_rejected") return { icon: X, cls: "text-red-600 bg-red-50", title: `${actor} rejected the AI draft`, sub: d.note || "" };
   return { icon: AlertTriangle, cls: "text-slate-500 bg-slate-100", title: `${actor}: ${row.action}`, sub: "" };
@@ -7167,7 +7241,7 @@ function describeActivity(row, names) {
 // append-only activity_log; it covers this planogram and, for an AI draft, the version it was
 // drafted from, since that is what the agent's proposal was recorded against.
 function PlanogramActivity({ planogram }) {
-  const ids = [planogram.id, planogram.resetDraft?.sourceId].filter(Boolean);
+  const ids = [planogram.id, planogram.resetDraft?.sourceId, planogram.aiDraft?.sourceId].filter(Boolean);
   const idsKey = ids.join("|");
   const [state, setState] = useState({ status: "loading", rows: [], names: {} });
   const load = useCallback(async () => {
@@ -9521,6 +9595,7 @@ function AppContent({ session }) {
   const [resetThresholds, setResetThresholds] = useState([]); // [{category, low, high}] — Reset Drafting Agent's Sales/Space Index bounds, per planogram category
   const [draftingReset, setDraftingReset] = useState(false);
   const [proposals, setProposals] = useState({ loaded: false, rows: [] }); // pending agent Proposals (see ResetDraftQueue)
+  const [reviewingProposalId, setReviewingProposalId] = useState(null); // the Proposal open in ProposalReview, if any
   const [profileNames, setProfileNames] = useState({}); // user id -> display name, for "requested by"
 
   // Pending Proposals drive the review queue. A failed read leaves loaded:false, which makes the
@@ -9801,23 +9876,7 @@ function AppContent({ session }) {
   // state) to compute the next version number — this indirection is what lets bulk creation
   // below get correct, non-colliding version numbers even when two selected planograms belong
   // to the same family, since state updates don't land synchronously between loop iterations.
-  const buildPlanogramVersion = (source, existingList) => {
-    const masterId = getFamilyMasterId(source);
-    const siblings = existingList.filter((p) => getFamilyMasterId(p) === masterId);
-    const nextVersion = Math.max(1, ...siblings.map((p) => p.versionNumber || 1)) + 1;
-    const baseName = source.name.replace(/\s*\(v\d+\)\s*$/i, "").trim();
-    return {
-      ...source,
-      id: uid("pog"),
-      name: `${baseName} (v${nextVersion})`,
-      masterId,
-      versionNumber: nextVersion,
-      sections: cloneSectionsWithNewIds(source.sections),
-      status: "wip",
-      eventDate: "",
-      publishedAt: undefined,
-    };
-  };
+  const buildPlanogramVersion = (source, existingList) => makePlanogramVersion(source, existingList);
 
   // Creates a new version of a planogram, always linked back to the ORIGINAL master of its
   // family (never to whichever version it happens to be copied from). The merchandising content
@@ -9845,27 +9904,19 @@ function AppContent({ session }) {
     return created;
   };
 
-  // Reset Drafting Agent: the analysis runs server-side (draft-reset Edge Function); this builds
-  // the next version with the proposed changes already applied and attaches the change list +
-  // reasons as `resetDraft`, so PlanogramEditor shows the bundled review instead of the normal
-  // gondola builder until a Space Planner approves or discards it. Still an ordinary WIP version
-  // underneath — approving it is nothing more than clearing resetDraft.reviewed.
-  const buildDraftVersion = (source, draft, existingList) => {
-    const modifiedSections = applyResetDraftChanges(source.sections, draft.result.changes);
-    const next = buildPlanogramVersion({ ...source, sections: modifiedSections }, existingList);
-    next.resetDraft = { ...draft.result, sourceId: source.id, proposalId: draft.proposalId || null, reviewed: false, score: draft.score, createdAt: new Date().toISOString() };
-    return next;
-  };
-
+  // Reset Drafting Agent: the analysis runs server-side (draft-reset Edge Function), which saves
+  // what it found as a pending Proposal. Nothing is created in the planogram list yet — a person
+  // reviews the Proposal and approving it (apply-proposal function) is what creates the new WIP
+  // version. For a single planogram the review opens straight away; a bulk run just fills the
+  // Review Queue, lowest score first.
   const draftResetForPlanogram = async (source, lookbackWeeks) => {
     setDraftingReset(true);
     try {
       const [draft] = await invokeDraftReset([source.id], lookbackWeeks);
       if (!draft?.ok) throw new Error(draft?.error || "No draft came back.");
-      const next = buildDraftVersion(source, draft, planograms);
-      createPlanogram(next);
-      setActivePlanogramId(next.id);
-      refreshProposals();
+      await refreshProposals();
+      setActivePlanogramId(null);
+      setReviewingProposalId(draft.proposalId);
     } catch (e) {
       window.alert(`Couldn't draft a reset: ${e.message}`);
     } finally {
@@ -9873,26 +9924,18 @@ function AppContent({ session }) {
     }
   };
 
-  // Phase 3: the same draft, run across every selected planogram at once (a cluster or a whole
-  // chain's worth of resets in one go). Each draft lands as its own WIP version with its own
-  // Draft Score, rather than navigating into any one of them — the Review Queue (sorted by
-  // score, lowest first) is where a Space Planner works through the results afterward.
   const draftResetForPlanogramsBulk = async (sources, lookbackWeeks) => {
     setDraftingReset(true);
-    let created = 0;
+    let drafted = 0;
     const failures = [];
     try {
-      let workingList = planograms;
       for (let i = 0; i < sources.length; i += DRAFT_RESET_CHUNK) {
         const chunk = sources.slice(i, i + DRAFT_RESET_CHUNK);
-        const drafts = await invokeDraftReset(chunk.map((s) => s.id), lookbackWeeks);
+        const results = await invokeDraftReset(chunk.map((s) => s.id), lookbackWeeks);
         chunk.forEach((source) => {
-          const draft = drafts.find((d) => d.planogramId === source.id);
-          if (!draft?.ok) { failures.push(`${source.name}: ${draft?.error || "no result"}`); return; }
-          const next = buildDraftVersion(source, draft, workingList);
-          createPlanogram(next);
-          workingList = [...workingList, next];
-          created++;
+          const result = results.find((d) => d.planogramId === source.id);
+          if (!result?.ok) { failures.push(`${source.name}: ${result?.error || "no result"}`); return; }
+          drafted++;
         });
       }
     } catch (e) {
@@ -9902,7 +9945,36 @@ function AppContent({ session }) {
       refreshProposals();
     }
     if (failures.length > 0) {
-      window.alert(`${created} of ${sources.length} drafted.\n\nCouldn't finish:\n${failures.slice(0, 5).join("\n")}${failures.length > 5 ? `\n…and ${failures.length - 5} more` : ""}`);
+      window.alert(`${drafted} of ${sources.length} drafted.\n\nCouldn't finish:\n${failures.slice(0, 5).join("\n")}${failures.length > 5 ? `\n…and ${failures.length - 5} more` : ""}`);
+    }
+  };
+
+  // Approve = the apply-proposal function builds the new WIP version from the Proposal and commits
+  // it (planogram, proposal status and activity entry in one step); the returned version is added
+  // to the list as-is (the server already saved it) and opened. A refusal — e.g. the planogram was
+  // edited after the draft was made — comes back as a message and leaves the Proposal pending.
+  const approveProposal = async (proposal) => {
+    try {
+      const out = await applyProposal(proposal.id);
+      if (out?.planogram) setPlanograms((prev) => (prev.some((p) => p.id === out.planogram.id) ? prev : [...prev, out.planogram]));
+      setReviewingProposalId(null);
+      if (out?.planogramId) setActivePlanogramId(out.planogramId);
+    } catch (e) {
+      window.alert(`Couldn't approve this draft: ${e.message}`);
+    } finally {
+      refreshProposals();
+    }
+  };
+
+  const rejectProposal = async (proposal) => {
+    const source = planograms.find((p) => p.id === proposal.target_id);
+    try {
+      await reviewProposal(proposal.id, "rejected", source ? `Draft for "${source.name}"` : null);
+      setReviewingProposalId(null);
+    } catch (e) {
+      window.alert(`Couldn't record your decision: ${e.message}`);
+    } finally {
+      refreshProposals();
     }
   };
 
@@ -10225,7 +10297,7 @@ function AppContent({ session }) {
         </div>
       </div>
 
-      {!activePlanogram && (
+      {!activePlanogram && !reviewingProposalId && (
         <div className="bg-white border-b border-slate-200 px-6 flex gap-1">
           <TabButton active={tab === "planograms"} onClick={() => setTab("planograms")} icon={Layers} badge={buildResetDraftQueue(planograms, proposals).length}>Planograms</TabButton>
           <TabButton active={tab === "products"} onClick={() => setTab("products")} icon={Package}>Products</TabButton>
@@ -10240,7 +10312,16 @@ function AppContent({ session }) {
       )}
 
       <div className="p-6 max-w-[1400px] mx-auto">
-        {activePlanogram ? (
+        {reviewingProposalId ? (
+          <ProposalReview
+            key={reviewingProposalId}
+            proposalId={reviewingProposalId}
+            planograms={planograms}
+            onBack={() => setReviewingProposalId(null)}
+            onApprove={approveProposal}
+            onReject={rejectProposal}
+          />
+        ) : activePlanogram ? (
           <PlanogramEditor
             planogram={activePlanogram}
             products={products}
@@ -10281,6 +10362,7 @@ function AppContent({ session }) {
             draftingReset={draftingReset}
             proposals={proposals}
             profileNames={profileNames}
+            onOpenProposal={setReviewingProposalId}
           />
         ) : tab === "products" ? (
           <ProductLibrary

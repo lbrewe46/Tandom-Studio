@@ -3,6 +3,7 @@
 | Function | What it does | Who may call it |
 | --- | --- | --- |
 | `draft-reset` | Runs the Reset Drafting Agent over one or more planograms, saves each result as a pending Proposal (with an activity-log entry), and returns the proposed changes, reasons, Draft Score and `proposalId` | `admin`, `category_manager` |
+| `apply-proposal` | Approves a pending Proposal: builds the next WIP planogram version from it and commits the planogram, the Proposal's `applied` status and the activity entry in one transaction. Refuses if the proposal was already decided or the planogram was edited after the draft | `admin`, `category_manager` |
 
 The browser sends only planogram ids and a lookback window. Thresholds, Core / Must-Carry
 protection, scoring and all performance data are read here with the service-role key.
@@ -22,6 +23,7 @@ protection, scoring and all performance data are read here with the service-role
    supabase login
    supabase link --project-ref <your-project-ref>
    supabase functions deploy draft-reset
+   supabase functions deploy apply-proposal
    ```
 
    No Supabase secrets to set: `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are injected into every Edge
@@ -56,6 +58,7 @@ app and the agent both need). After changing any of those helpers in `App.jsx`:
 npm run sync:edge     # regenerate app-core.js
 npm run check:edge    # CI-friendly: fails if app-core.js is stale, then runs the tests
 supabase functions deploy draft-reset
+supabase functions deploy apply-proposal
 ```
 
 The agent itself (`_shared/reset-agent.js`) lives only here — `App.jsx` no longer contains it.
@@ -64,7 +67,9 @@ The agent itself (`_shared/reset-agent.js`) lives only here — `App.jsx` no lon
 
 `npm run test:edge` runs the real request handler against an in-memory stand-in for Supabase
 (auth, roles, disabled agent, input validation, page limits, a hand-built planogram with a known
-answer). It does not exercise Supabase's own JWT/RLS machinery or the Deno runtime — the smoke test
+answer, and for `apply-proposal` every refusal path, retries, version numbering and a full draft-then-approve
+round trip). The database function `apply_proposal()` is not covered by these; it was exercised directly
+against a real Postgres when it was written. The tests do not exercise Supabase's own JWT/RLS machinery or the Deno runtime — the smoke test
 above covers that once deployed.
 
 ## Limits worth knowing

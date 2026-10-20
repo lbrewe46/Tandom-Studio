@@ -32,6 +32,8 @@ const ROOTS = [
   "getEffectiveDims",
   "layoutFixtureBoxes",
   "getResetThreshold",
+  "applyResetDraftChanges",
+  "makePlanogramVersion",
 ];
 
 const lines = fs.readFileSync(appPath, "utf8").split("\n");

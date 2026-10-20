@@ -31,3 +31,4 @@ jobs:
           test -n "$SUPABASE_ACCESS_TOKEN" || { echo "Missing repository secret SUPABASE_ACCESS_TOKEN"; exit 1; }
           test -n "$SUPABASE_PROJECT_ID" || { echo "Missing repository secret SUPABASE_PROJECT_ID"; exit 1; }
       - run: supabase functions deploy draft-reset --project-ref "$SUPABASE_PROJECT_ID"
+      - run: supabase functions deploy apply-proposal --project-ref "$SUPABASE_PROJECT_ID"

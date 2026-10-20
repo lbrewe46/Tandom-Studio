@@ -7,9 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test:edge": "node scripts/test-draft-reset.mjs",
+    "test:edge": "node scripts/test-draft-reset.mjs && node scripts/test-apply-proposal.mjs",
     "sync:edge": "node scripts/sync-edge-core.mjs",
-    "check:edge": "node scripts/sync-edge-core.mjs --check && node scripts/test-draft-reset.mjs"
+    "check:edge": "node scripts/sync-edge-core.mjs --check && npm run test:edge"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

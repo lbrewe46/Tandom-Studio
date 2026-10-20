@@ -407,3 +407,57 @@ $$;
 
 revoke all on function review_proposal(uuid, text, text) from public, anon;
 grant execute on function review_proposal(uuid, text, text) to authenticated;
+
+-- ------------------------------------------------------------------
+-- Phase 4: applying a proposal
+-- ------------------------------------------------------------------
+-- Turning an approved proposal into a real planogram version is its own privileged step, held by
+-- a different actor than the one that proposed it. The `apply-proposal` Edge Function checks the
+-- caller's role, builds the new version from the proposal, and then calls this function — which
+-- only the service role can execute — to commit everything in ONE transaction: the new planogram
+-- row, the proposal's move to 'applied', and the activity entry. Nothing else in the system
+-- writes a planogram on a proposal's behalf, and an agent never does.
+alter table proposals add column if not exists applied_id text;  -- id of the planogram this created
+
+create or replace function apply_proposal(p_id uuid, p_user uuid, p_planogram jsonb)
+returns text
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_prop proposals;
+  v_new_id text := p_planogram->>'id';
+begin
+  if v_new_id is null or v_new_id = '' then raise exception 'The new planogram has no id'; end if;
+
+  select * into v_prop from proposals where id = p_id for update;
+  if not found then raise exception 'Proposal not found'; end if;
+
+  -- applying twice is harmless: the second call just reports the planogram the first one made
+  if v_prop.status = 'applied' then return v_prop.applied_id; end if;
+  if v_prop.status <> 'pending' then
+    raise exception 'This proposal was already %', v_prop.status;
+  end if;
+
+  insert into planograms (id, data, updated_by) values (v_new_id, p_planogram, p_user);
+
+  update proposals
+     set status = 'applied',
+         applied_id = v_new_id,
+         reviewed_by = coalesce(reviewed_by, p_user),
+         reviewed_at = coalesce(reviewed_at, now())
+   where id = p_id;
+
+  insert into activity_log (actor_type, actor_id, action, target_type, target_id, detail)
+  values ('user', p_user::text, 'proposal_applied', v_prop.target_type, v_prop.target_id,
+          jsonb_build_object('proposalId', v_prop.id, 'agentId', v_prop.agent_id, 'score', v_prop.score,
+                             'planogramId', v_new_id, 'planogramName', p_planogram->>'name',
+                             'version', p_planogram->'versionNumber'));
+
+  return v_new_id;
+end;
+$$;
+
+revoke all on function apply_proposal(uuid, uuid, jsonb) from public, anon, authenticated;
+grant execute on function apply_proposal(uuid, uuid, jsonb) to service_role;

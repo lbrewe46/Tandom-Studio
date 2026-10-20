@@ -18,6 +18,8 @@
 // the service-role key, so they never travel to (or from) the browser.
 
 import { computeResetDraft, computeDraftScore, createDraftCache } from "./reset-agent.js";
+import { json, preflightOrWrongMethod, authenticate } from "./http.js";
+import { fingerprint } from "./proposal-core.js";
 
 export const AGENT_ID = "reset-drafting-agent";
 export const TARGET_TYPE = "planogram_version";
@@ -27,15 +29,6 @@ export const ALLOWED_ROLES = ["admin", "category_manager"];
 // Tunable: Edge Functions have a per-invocation CPU budget; the client chunks bulk runs to this.
 export const MAX_PLANOGRAMS_PER_CALL = 50;
 const PAGE_SIZE = 1000; // PostgREST's default max rows per request
-
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
-
-const json = (status, body) =>
-  new Response(JSON.stringify(body), { status, headers: { ...CORS, "Content-Type": "application/json" } });
 
 // PostgREST silently truncates at PAGE_SIZE rows, so page through until a short page comes back.
 async function fetchAll(db, table, columns, applyFilters = (q) => q) {
@@ -99,19 +92,13 @@ async function recordProposals(db, results, requestedBy) {
 }
 
 export async function handleDraftReset(req, db) {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
-  if (req.method !== "POST") return json(405, { error: "Use POST" });
+  const early = preflightOrWrongMethod(req);
+  if (early) return early;
 
   // --- who is calling? -------------------------------------------------------------------
-  const token = (req.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
-  if (!token) return json(401, { error: "Missing Authorization header" });
-  const { data: userData, error: userErr } = await db.auth.getUser(token);
-  if (userErr || !userData?.user) return json(401, { error: "Invalid or expired session" });
-
-  const { data: profile } = await db.from("profiles").select("role").eq("id", userData.user.id).maybeSingle();
-  if (!profile || !ALLOWED_ROLES.includes(profile.role)) {
-    return json(403, { error: "Your role is not permitted to run this agent" });
-  }
+  const auth = await authenticate(req, db, ALLOWED_ROLES, "Your role is not permitted to run this agent");
+  if (auth.response) return auth.response;
+  const userData = { user: auth.user };
 
   // --- is the agent switched on, and allowed to touch this kind of target? ---------------
   const { data: agent } = await db.from("agents").select("enabled, allowed_target_types").eq("id", AGENT_ID).maybeSingle();
@@ -149,16 +136,20 @@ export async function handleDraftReset(req, db) {
     const resetThresholds = setting("schema:resetThresholds", []);
 
     const cache = createDraftCache(); // one Performance snapshot, so planograms can share window totals
-    const results = ids.map((planogramId) => {
+    const results = [];
+    for (const planogramId of ids) {
       const planogram = planogramById[planogramId];
-      if (!planogram) return { planogramId, ok: false, error: "Planogram not found" };
+      if (!planogram) { results.push({ planogramId, ok: false, error: "Planogram not found" }); continue; }
       try {
         const result = computeResetDraft(planogram, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, storeId, cache);
-        return { planogramId, ok: true, score: computeDraftScore(result), result };
+        // what the planogram looked like when this was drafted; apply-proposal refuses to apply
+        // the proposal if the planogram has been edited since (its placement ids may have moved)
+        result.sourceFingerprint = await fingerprint(planogram.sections ?? null);
+        results.push({ planogramId, ok: true, score: computeDraftScore(result), result });
       } catch (e) {
-        return { planogramId, ok: false, error: `Draft failed: ${e?.message || e}` };
+        results.push({ planogramId, ok: false, error: `Draft failed: ${e?.message || e}` });
       }
-    });
+    }
     await recordProposals(db, results, userData.user.id);
     return json(200, { results });
   } catch (e) {

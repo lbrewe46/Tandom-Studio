@@ -205,3 +205,39 @@ export async function loadActivity(targetIds, limit = 100) {
     return { ok: false, rows: [], names: {}, error: e?.message };
   }
 }
+
+// -------------------------------------------------------------------
+// Edge Functions + applying proposals (Phase 4)
+// -------------------------------------------------------------------
+
+// Calls an Edge Function and returns its JSON. On failure throws an Error carrying the
+// function's own message when it sent one (e.g. "Your role is not permitted…"), else a generic one.
+export async function invokeEdgeFunction(name, body) {
+  if (!supabase) throw new Error("Supabase isn't configured.");
+  const { data, error } = await supabase.functions.invoke(name, { body });
+  if (error) {
+    let message = error.message || `The ${name} function couldn't be reached.`;
+    try { const detail = await error.context.json(); if (detail?.error) message = detail.error; } catch (e) { /* keep the generic message */ }
+    throw new Error(message);
+  }
+  return data;
+}
+
+// One full Proposal, including its proposed change set (the pending list leaves that out).
+export async function loadProposal(proposalId) {
+  if (!supabase) return { ok: false, error: "Supabase isn't configured." };
+  try {
+    const { data, error } = await supabase.from("proposals").select("*").eq("id", proposalId).maybeSingle();
+    if (error) return { ok: false, error: error.message };
+    if (!data) return { ok: false, error: "This proposal no longer exists." };
+    return { ok: true, row: data };
+  } catch (e) {
+    return { ok: false, error: e?.message || "Couldn't load the proposal." };
+  }
+}
+
+// Approving a proposal: the apply-proposal function builds the new WIP version and commits it
+// (planogram + proposal status + activity entry) in one step. Resolves { planogramId, planogram }.
+export function applyProposal(proposalId) {
+  return invokeEdgeFunction("apply-proposal", { proposalId });
+}

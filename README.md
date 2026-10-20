@@ -91,16 +91,26 @@ is deployed, the **Draft Reset with AI** buttons show an error and nothing else 
 
 Every draft the agent produces is saved as a **Proposal** (the `proposals` table: which agent, what it
 targets, the proposed change, its reason and Draft Score, who asked, and its review status) and logged
-in the append-only `activity_log`. Nobody edits these tables directly: approving or discarding an AI
-draft records the decision through the `review_proposal()` database function (Admin and Category
-Manager only), which also writes the Activity entry. The review queue on the Planograms tab reads the
-pending Proposals, and the **Activity** button on each planogram shows who proposed, approved or
-rejected what.
+in the append-only `activity_log`. Nothing is created in your planogram list until a person approves:
+
+- **Draft Reset with AI** on one planogram opens the review straight away; a bulk run just fills the
+  **AI Draft Review Queue** on the Planograms tab (lowest Draft Score first).
+- **Approve** calls the `apply-proposal` Edge Function (Admin and Category Manager only), which builds
+  the next WIP version from the Proposal and commits it — the new planogram, the Proposal's move to
+  `applied` and the activity entry — in a single database transaction (`apply_proposal()`, callable only
+  by the service role). If the planogram was edited after the draft was made, Approve is refused with an
+  explanation, so a stale draft can't be applied; reject it and run a new one.
+- **Reject** records the decision through `review_proposal()` and nothing else changes.
+- The **Activity** button on each planogram shows who proposed, approved or rejected what.
+
+Nobody writes the `proposals` or `activity_log` tables directly, and the agent itself never touches
+`planograms`.
 
 **Updating an existing install to this version, in this order:** (1) run the new `supabase/schema.sql`
-in the SQL Editor (safe to re-run), (2) deploy the `draft-reset` function (push a change under
-`supabase/functions/`), (3) deploy the front end. Deploying the function before the schema makes Draft
-Reset report that it couldn't record the proposal.
+in the SQL Editor (safe to re-run), (2) deploy the two functions, `draft-reset` and `apply-proposal` (the
+GitHub Action does both whenever something under `supabase/functions/` is pushed), (3) deploy the front
+end. Deploying the functions before the schema makes Draft Reset report that it couldn't record the
+proposal.
 
 ## Backup & Restore still works
 
