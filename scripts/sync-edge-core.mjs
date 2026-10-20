@@ -50,6 +50,9 @@ const ROOTS = [
   "getFamilyMembers",
   "getPredecessorPlanogram",
   "HELP_SECTIONS",
+  "rollupImpactRows",
+  "rollupResetImpact",
+  "IMPACT_DIMENSIONS",
 ];
 
 const lines = fs.readFileSync(appPath, "utf8").split("\n");

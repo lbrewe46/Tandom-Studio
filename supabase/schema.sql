@@ -467,3 +467,256 @@ $$;
 
 revoke all on function apply_proposal(uuid, uuid, jsonb) from public, anon, authenticated;
 grant execute on function apply_proposal(uuid, uuid, jsonb) to service_role;
+
+-- ------------------------------------------------------------------
+-- Reset Impact + Execution Follow-up agents
+-- ------------------------------------------------------------------
+-- Both agents are deterministic (no model call) and write only through their Edge Functions with the
+-- service-role key, so neither table has an insert policy.
+
+insert into agents (id, name, description, allowed_target_types)
+values ('reset-impact-agent', 'Reset Impact Agent',
+        'Compares sales before and after a planogram version goes Live (the Historical version is the baseline), against similar stores that did not reset.',
+        array['planogram_version'])
+on conflict (id) do nothing;
+
+insert into agents (id, name, description, allowed_target_types)
+values ('execution-followup-agent', 'Execution Follow-up Agent',
+        'Finds stores whose reset is stuck or past due, adds a reminder task to Task Management, and escalates to the Category Manager.',
+        array['store_task', 'escalation'])
+on conflict (id) do nothing;
+
+-- One row per measured planogram version; re-measuring replaces it.
+create table if not exists reset_impacts (
+  planogram_id text primary key,              -- the Live version that was measured
+  baseline_planogram_id text,                 -- the Historical version it replaced
+  proposal_id uuid,                           -- the AI proposal that created this version, when there was one
+  go_live_date date,
+  params jsonb not null default '{}',         -- window lengths used
+  result jsonb not null,                      -- per-store rows, control group, space, summary
+  computed_by uuid references auth.users(id) on delete set null,
+  computed_at timestamptz not null default now()
+);
+create index if not exists reset_impacts_proposal_idx on reset_impacts (proposal_id);
+alter table reset_impacts enable row level security;
+drop policy if exists "Admin and Category Manager can read reset_impacts" on reset_impacts;
+create policy "Admin and Category Manager can read reset_impacts"
+  on reset_impacts for select to authenticated
+  using (current_user_role() in ('admin', 'category_manager'));
+
+-- A store that stayed late on a reset long enough to need a person's attention.
+create table if not exists escalations (
+  id uuid primary key default gen_random_uuid(),
+  planogram_id text not null,
+  planogram_name text,
+  store_id text not null,
+  store_name text,
+  kind text,                                  -- past_due | stuck | past_due_and_stuck
+  days_overdue int,
+  reason text,
+  prior_escalations int not null default 0,   -- this store's escalations in the previous 90 days (repeat problems)
+  status text not null default 'open' check (status in ('open', 'resolved')),
+  created_by_agent text,
+  created_at timestamptz not null default now(),
+  resolved_at timestamptz,
+  resolved_by uuid references auth.users(id) on delete set null,
+  resolution text
+);
+create index if not exists escalations_open_idx on escalations (status, created_at desc);
+create index if not exists escalations_store_idx on escalations (store_id, created_at desc);
+alter table escalations enable row level security;
+drop policy if exists "Admin and Category Manager can read escalations" on escalations;
+create policy "Admin and Category Manager can read escalations"
+  on escalations for select to authenticated
+  using (current_user_role() in ('admin', 'category_manager'));
+-- people may mark an escalation resolved (nothing else is ever updated by a client)
+drop policy if exists "Admin and Category Manager can resolve escalations" on escalations;
+create policy "Admin and Category Manager can resolve escalations"
+  on escalations for update to authenticated
+  using (current_user_role() in ('admin', 'category_manager'))
+  with check (current_user_role() in ('admin', 'category_manager'));
+
+-- ------------------------------------------------------------------
+-- Access model v2: five roles, store/region assignment, scoped reads and writes
+-- ------------------------------------------------------------------
+--   admin             everything, including users and roles
+--   category_manager  everything merchandising- and store-related (Tandom Studio)
+--   regional_manager  Store Assistant for every store in their assigned region(s) (profiles.regions)
+--   event_planner     Event Planner; read-only planograms/stores/products/fixtures
+--   store_associate   Store Assistant for their ONE assigned store (profiles.store_id)
+-- Store-scoped users (store_associate, regional_manager) can read only their stores and the planograms
+-- assigned to them, and write only what store execution needs: tasks and photos on their stores, and
+-- execution progress, item checks, feedback issues and go-live status on those planograms (enforced by
+-- the guard triggers below, not just by the app). They never see Performance (sales) data.
+-- This block must stay LAST in the file: it replaces the read policies created earlier.
+-- Verified against a real Postgres by scripts/test-access-rules.sh.
+
+alter table profiles add column if not exists store_id text;                        -- store_associate: the one store
+alter table profiles add column if not exists regions text[] not null default '{}'; -- regional_manager: region names (stores.data->>'region')
+
+alter table profiles drop constraint if exists profiles_role_check;
+alter table profiles add constraint profiles_role_check
+  check (role in ('admin', 'category_manager', 'regional_manager', 'event_planner', 'store_associate'));
+
+-- The store ids the signed-in user is scoped to: [] when they have none, NULL for roles that aren't store-scoped.
+create or replace function current_user_store_ids()
+returns text[]
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select case p.role
+    when 'store_associate' then case when p.store_id is null then '{}'::text[] else array[p.store_id] end
+    when 'regional_manager' then coalesce((select array_agg(s.id) from stores s where s.data->>'region' = any(p.regions)), '{}'::text[])
+    else null
+  end
+  from profiles p where p.id = auth.uid()
+$$;
+
+create or replace function is_store_scoped_user()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select coalesce((select role in ('store_associate', 'regional_manager') from profiles where id = auth.uid()), false)
+$$;
+
+-- Only an Admin changes a user's role, store or regions (service-role / SQL-editor changes have no auth.uid() and pass).
+create or replace function prevent_unauthorized_role_change()
+returns trigger as $$
+begin
+  if auth.uid() is null then return new; end if;
+  if (new.role is distinct from old.role or new.store_id is distinct from old.store_id or new.regions is distinct from old.regions)
+     and coalesce(current_user_role(), '') <> 'admin' then
+    raise exception 'Only an Admin can change a user''s role, store or regions';
+  end if;
+  return new;
+end;
+$$ language plpgsql security definer set search_path = public;
+
+-- ---- reads ---------------------------------------------------------------------------------
+drop policy if exists "Any role can read stores" on stores;
+drop policy if exists "Role-scoped read stores" on stores;
+create policy "Role-scoped read stores" on stores for select to authenticated using (
+  current_user_role() in ('admin', 'category_manager', 'event_planner')
+  or (is_store_scoped_user() and id = any(coalesce(current_user_store_ids(), '{}')))
+);
+
+drop policy if exists "Any role can read planograms" on planograms;
+drop policy if exists "Role-scoped read planograms" on planograms;
+create policy "Role-scoped read planograms" on planograms for select to authenticated using (
+  current_user_role() in ('admin', 'category_manager', 'event_planner')
+  or (is_store_scoped_user() and coalesce(data->>'status', 'wip') <> 'wip'
+      and (data->'storeIds') ?| coalesce(current_user_store_ids(), '{}'))
+);
+
+drop policy if exists "Any role can read performance" on performance;
+drop policy if exists "Role-scoped read performance" on performance;
+create policy "Role-scoped read performance" on performance for select to authenticated using (
+  current_user_role() in ('admin', 'category_manager')
+);
+
+-- ---- store-scoped writes -------------------------------------------------------------------
+-- The "exists" test lets an app "save" (an upsert) of a row that is already there through the INSERT
+-- check without ever allowing a brand-new row to be created.
+drop policy if exists "Store users insert own stores" on stores;
+create policy "Store users insert own stores" on stores for insert to authenticated with check (
+  is_store_scoped_user() and id = any(coalesce(current_user_store_ids(), '{}'))
+  and exists (select 1 from stores x where x.id = stores.id)
+);
+drop policy if exists "Store users update own stores" on stores;
+create policy "Store users update own stores" on stores for update to authenticated
+  using (is_store_scoped_user() and id = any(coalesce(current_user_store_ids(), '{}')))
+  with check (is_store_scoped_user() and id = any(coalesce(current_user_store_ids(), '{}')));
+
+drop policy if exists "Store users insert own planograms" on planograms;
+create policy "Store users insert own planograms" on planograms for insert to authenticated with check (
+  is_store_scoped_user() and (data->'storeIds') ?| coalesce(current_user_store_ids(), '{}')
+  and exists (select 1 from planograms x where x.id = planograms.id)
+);
+drop policy if exists "Store users update own planograms" on planograms;
+create policy "Store users update own planograms" on planograms for update to authenticated
+  using (is_store_scoped_user() and coalesce(data->>'status', 'wip') <> 'wip' and (data->'storeIds') ?| coalesce(current_user_store_ids(), '{}'))
+  with check (is_store_scoped_user() and (data->'storeIds') ?| coalesce(current_user_store_ids(), '{}'));
+
+-- A store user may change only tasks and photos on a store row.
+create or replace function guard_store_scoped_store_write()
+returns trigger as $$
+begin
+  if auth.uid() is null or not is_store_scoped_user() then return new; end if;
+  if (new.data - 'tasks' - 'photos') is distinct from (old.data - 'tasks' - 'photos') then
+    raise exception 'Store users can only change a store''s tasks and photos';
+  end if;
+  return new;
+end;
+$$ language plpgsql security definer set search_path = public;
+drop trigger if exists guard_store_scoped_store_write on stores;
+create trigger guard_store_scoped_store_write before update on stores
+  for each row execute procedure guard_store_scoped_store_write();
+
+-- A store user may change only: execution progress and item checks for THEIR stores, feedback issues they
+-- add (existing issues stay as they are), and a planogram's go-live status moving forward.
+create or replace function guard_store_scoped_planogram_write()
+returns trigger as $$
+declare
+  scope text[];
+  k text;
+  i jsonb;
+begin
+  if auth.uid() is null or not is_store_scoped_user() then return new; end if;
+  scope := coalesce(current_user_store_ids(), '{}');
+  if (new.data - 'execution' - 'itemChecks' - 'issues' - 'status') is distinct from (old.data - 'execution' - 'itemChecks' - 'issues' - 'status') then
+    raise exception 'Store users can only update execution progress, item checks, feedback and go-live status';
+  end if;
+  for k in
+    select jsonb_object_keys(coalesce(new.data->'execution', '{}'::jsonb))
+    union select jsonb_object_keys(coalesce(old.data->'execution', '{}'::jsonb))
+    union select jsonb_object_keys(coalesce(new.data->'itemChecks', '{}'::jsonb))
+    union select jsonb_object_keys(coalesce(old.data->'itemChecks', '{}'::jsonb))
+  loop
+    if not (k = any(scope)) and (
+         (new.data->'execution'->k) is distinct from (old.data->'execution'->k)
+         or (new.data->'itemChecks'->k) is distinct from (old.data->'itemChecks'->k)) then
+      raise exception 'Store users can only update execution for their own stores';
+    end if;
+  end loop;
+  if not (coalesce(new.data->'issues', '[]'::jsonb) @> coalesce(old.data->'issues', '[]'::jsonb)) then
+    raise exception 'Store users cannot change or remove existing feedback';
+  end if;
+  for i in select * from jsonb_array_elements(coalesce(new.data->'issues', '[]'::jsonb)) loop
+    if not (coalesce(old.data->'issues', '[]'::jsonb) @> jsonb_build_array(i)) and not ((i->>'storeId') = any(scope)) then
+      raise exception 'Store users can only raise feedback for their own stores';
+    end if;
+  end loop;
+  if (new.data->>'status') is distinct from (old.data->>'status')
+     and not (coalesce(old.data->>'status', 'wip'), coalesce(new.data->>'status', 'wip')) in (('approved', 'live'), ('pending', 'live'), ('live', 'historical')) then
+    raise exception 'Store users cannot change a planogram''s status that way';
+  end if;
+  return new;
+end;
+$$ language plpgsql security definer set search_path = public;
+drop trigger if exists guard_store_scoped_planogram_write on planograms;
+create trigger guard_store_scoped_planogram_write before update on planograms
+  for each row execute procedure guard_store_scoped_planogram_write();
+
+-- ---- event planners: events only -------------------------------------------------------------
+-- (events and event types live in app_settings under these two keys)
+drop policy if exists "Event planners insert event settings" on app_settings;
+create policy "Event planners insert event settings" on app_settings for insert to authenticated
+  with check (current_user_role() = 'event_planner' and key in ('settings:events', 'schema:eventType'));
+drop policy if exists "Event planners update event settings" on app_settings;
+create policy "Event planners update event settings" on app_settings for update to authenticated
+  using (current_user_role() = 'event_planner' and key in ('settings:events', 'schema:eventType'))
+  with check (current_user_role() = 'event_planner' and key in ('settings:events', 'schema:eventType'));
+
+-- ---- regional managers: see and resolve escalations for their stores -----------------------------
+drop policy if exists "Regional managers read their escalations" on escalations;
+create policy "Regional managers read their escalations" on escalations for select to authenticated
+  using (current_user_role() = 'regional_manager' and store_id = any(coalesce(current_user_store_ids(), '{}')));
+drop policy if exists "Regional managers resolve their escalations" on escalations;
+create policy "Regional managers resolve their escalations" on escalations for update to authenticated
+  using (current_user_role() = 'regional_manager' and store_id = any(coalesce(current_user_store_ids(), '{}')))
+  with check (current_user_role() = 'regional_manager' and store_id = any(coalesce(current_user_store_ids(), '{}')));

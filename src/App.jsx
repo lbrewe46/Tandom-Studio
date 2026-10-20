@@ -11,6 +11,7 @@ import {
   supabase, supabaseConfigured, pendingWriteListeners,
   safeGet, safeSet, safeDelete, loadIndexed, saveIndexed, deleteIndexed, waitForPendingWrites,
   loadPendingProposals, reviewProposal, loadProfileNames, loadActivity, loadProposal, applyProposal, invokeEdgeFunction,
+  loadResetImpacts, loadEscalations, resolveEscalation,
 } from "./lib/db.js";
 
 /* ------------------------------------------------------------------ */
@@ -1468,6 +1469,63 @@ function aggregateProductPerformanceRange(productId, performanceMap, startISO, e
 function pctChange(current, prior) {
   if (!prior) return current > 0 ? null : 0;
   return ((current - prior) / prior) * 100;
+}
+
+// Reset Impact (see supabase/functions/_shared/reset-impact.js). Rolling store rows up into groups.
+// A row carries weekly-average `pre`/`post` {sales, units, margin}, the `controlChange` of its
+// planogram (what similar stores that did not reset did, as a fraction, or null) and that planogram's
+// `space` {preLinearFt, postLinearFt}. Lift = actual after-total minus what the control trend predicts
+// (pre x (1 + control change)), as points of the before-total, so groups of any mix add up correctly.
+const IMPACT_METRICS = ["sales", "units", "margin"];
+function rollupImpactRows(rows, label = "All stores") {
+  const metrics = {};
+  IMPACT_METRICS.forEach((m) => {
+    const pre = rows.reduce((t, r) => t + r.pre[m], 0);
+    const post = rows.reduce((t, r) => t + r.post[m], 0);
+    const adj = rows.filter((r) => r.controlChange && r.controlChange[m] != null);
+    const adjPre = adj.reduce((t, r) => t + r.pre[m], 0);
+    const adjPost = adj.reduce((t, r) => t + r.post[m], 0);
+    const expected = adj.reduce((t, r) => t + r.pre[m] * (1 + r.controlChange[m]), 0);
+    metrics[m] = { pre, post, changePct: pre > 0 ? (post / pre - 1) * 100 : null, liftPp: adjPre > 0 ? ((adjPost - expected) / adjPre) * 100 : null };
+  });
+  const lfRows = rows.filter((r) => r.space && r.space.preLinearFt > 0 && r.space.postLinearFt > 0);
+  const lfPre = lfRows.reduce((t, r) => t + r.space.preLinearFt, 0);
+  const lfPost = lfRows.reduce((t, r) => t + r.space.postLinearFt, 0);
+  const sPre = lfRows.reduce((t, r) => t + r.pre.sales, 0);
+  const sPost = lfRows.reduce((t, r) => t + r.post.sales, 0);
+  const salesPerLinearFt = lfPre > 0 && lfPost > 0 && sPre > 0 ? { pre: sPre / lfPre, post: sPost / lfPost, changePct: ((sPost / lfPost) / (sPre / lfPre) - 1) * 100 } : null;
+  return { label, stores: new Set(rows.map((r) => r.storeId)).size, rows: rows.length, planograms: new Set(rows.map((r) => r.planogramId).filter(Boolean)).size, metrics, salesPerLinearFt };
+}
+
+const IMPACT_DIMENSIONS = [
+  { id: "region", label: "Region" },
+  { id: "store", label: "Store" },
+  { id: "category", label: "Category" },
+  { id: "department", label: "Department" },
+  { id: "cluster", label: "Cluster" },
+  { id: "format", label: "Store format" },
+  { id: "planogram", label: "Planogram" },
+];
+// impacts: computeResetImpact results (status "ok"). Only stores with a full after-window ("measured") count;
+// maturing stores are tallied separately so nobody reads a half-finished result as final.
+function rollupResetImpact(impacts, dimension) {
+  const groups = new Map();
+  let maturing = 0;
+  (impacts || []).filter((i) => i && i.status === "ok").forEach((imp) => {
+    (imp.rows || []).forEach((r) => {
+      if (r.status === "maturing") maturing++;
+      if (r.status !== "measured") return;
+      const label = ({
+        region: r.region, store: `${r.storeName}${r.storeNumber ? ` (#${r.storeNumber})` : ""}`, format: r.format,
+        category: imp.planogram.category, department: imp.planogram.department, cluster: imp.planogram.cluster, planogram: imp.planogram.name,
+      }[dimension]) || `(No ${(IMPACT_DIMENSIONS.find((d) => d.id === dimension) || {}).label || dimension})`;
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label).push({ ...r, planogramId: imp.planogramId, space: imp.space, controlChange: imp.control ? imp.control.change : null });
+    });
+  });
+  const out = [...groups.entries()].map(([label, rows]) => rollupImpactRows(rows, label));
+  out.sort((a, b) => (b.metrics.sales.post - b.metrics.sales.pre) - (a.metrics.sales.post - a.metrics.sales.pre));
+  return { groups: out, total: out.length ? rollupImpactRows([...groups.values()].flat(), "All") : null, maturing };
 }
 
 const money = (n) => `$${(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -3680,6 +3738,30 @@ const HELP_SECTIONS = [
     ],
   },
   {
+    id: "resetImpact",
+    title: "Reset Impact",
+    blocks: [
+      { type: "p", text: "The **Reset Impact** tab (Admins and Category Managers) shows how sales changed after a new planogram version went Live, using the Historical version as the baseline. Press **Measure all Live resets** to calculate it; the same figures appear as an **outcome** card in that planogram's Activity panel, including for resets that came from an approved AI proposal." },
+      { type: "ul", items: [
+        "**Before / after:** weekly averages for the weeks before each store completed the reset and the full weeks after. A store needs at least 4 weeks after to count; until then it shows as maturing and is left out of totals.",
+        "**vs similar stores:** the change minus what stores that did not reset did over the same weeks, in percentage points, so a market-wide trend isn't credited to the reset.",
+        "**Summarize by** Region, Store, Category, Department, Cluster, Store format or Planogram, and **Measure** Sales $, Units, Margin $ or Sales per linear foot (sales divided by the shelf space the category had before and after).",
+      ] },
+    ],
+  },
+  {
+    id: "executionFollowup",
+    title: "Execution Follow-up",
+    blocks: [
+      { type: "p", text: "The **Execution** tab (Admins and Category Managers) finds stores whose reset is **past its due date** (the planogram's Event Date) or **stuck in Partially Completed**. **Check stores** previews what would happen; nothing is sent until you confirm." },
+      { type: "ul", items: [
+        "Each late store gets one **Reset Follow-up** reminder in its Task Management list. A store is never sent a second reminder while the first is open.",
+        "A store that is overdue (or stuck) by the **Escalate after** number of days is escalated to the Category Manager and listed under Escalations, flagged as a repeat when it was escalated before in the last 90 days.",
+        "When a store finishes, running the check again closes its reminder and escalation.",
+      ] },
+    ],
+  },
+  {
     id: "askTandom",
     title: "Ask Tandom",
     blocks: [
@@ -3688,6 +3770,7 @@ const HELP_SECTIONS = [
         "Ask where a product goes, what changes in the next reset (new, deleted and changed items), which tasks are open, what a product's case pack is, or how to do something in the app.",
         "Store associates only see their own store's planograms, tasks and issues. Planners and admins can ask about anything.",
         "Ask it to mark a task complete (or reopen it) and it shows a confirmation card; the task only changes when you press **Confirm**.",
+        "Open a planogram first and Ask Tandom knows which one you mean, so you can ask \"what changes in this planogram?\". Store associates get the same button inside the step-by-step execution guide.",
         "It looks answers up in your data rather than guessing, and says so when it can't find something. It can't edit planograms or products.",
       ] },
     ],
@@ -5616,7 +5699,7 @@ function ReadOnlySectionDiagram({ section, planogram, fixtures, products, scale,
 // exactly what goes where — "side-by-side images" in the sense that mattered here (there's no
 // "before" photo of what's currently on a given store's shelf to show, so the pairing is each
 // product's own image next to a diagram of its exact position).
-function PlanogramExecutionGuide({ planogram, products, fixtures, allPlanograms, storeId, onToggleItemCheck, onBack }) {
+function PlanogramExecutionGuide({ planogram, products, fixtures, allPlanograms, storeId, onToggleItemCheck, onBack, askTandom }) {
   const [stepIdx, setStepIdx] = useState(0); // 0 = item changes, 1 = overview, 2..N+1 = one per section
   const sections = planogram.sections || [];
   const totalSteps = sections.length + 2;
@@ -5791,6 +5874,7 @@ function PlanogramExecutionGuide({ planogram, products, fixtures, allPlanograms,
         <button className={btnGhost} disabled={stepIdx === 0} onClick={() => setStepIdx((s) => Math.max(0, s - 1))}><ChevronLeft size={14} /> Previous</button>
         <button className={btnPrimary} disabled={stepIdx >= totalSteps - 1} onClick={() => setStepIdx((s) => Math.min(totalSteps - 1, s + 1))}>Next <ChevronRight size={14} /></button>
       </div>
+      {askTandom}
     </div>
   );
 }
@@ -8036,7 +8120,7 @@ function DosTargetsEditor({ planograms, dosTargets, onChange }) {
 }
 
 // Names for agent actors in the Activity log (agents aren't users, so they have no profile row).
-const AGENT_DISPLAY_NAMES = { "reset-drafting-agent": "Reset Drafting Agent" };
+const AGENT_DISPLAY_NAMES = { "reset-drafting-agent": "Reset Drafting Agent", "reset-impact-agent": "Reset Impact Agent", "execution-followup-agent": "Execution Follow-up Agent" };
 
 // One Activity row -> a sentence a person can read. Unknown actions still render (as the raw
 // action name) so a newer agent's entries don't vanish from an older build of the app.
@@ -8053,6 +8137,17 @@ function describeActivity(row, names) {
     };
   }
   if (row.action === "proposal_applied") return { icon: Check, cls: "text-emerald-600 bg-emerald-50", title: `${actor} approved the AI draft and created ${d.planogramName || "a new version"}`, sub: d.score != null ? `Draft Score ${d.score}%` : "" };
+  if (row.action === "impact_measured") {
+    const pct = d.salesChangePct, lift = d.liftPp;
+    return {
+      icon: TrendingUp, cls: "text-violet-600 bg-violet-50",
+      title: `${actor} measured the reset: sales ${pct == null ? "change not available" : `${fmtPct(pct)} per week`}${lift == null ? "" : ` (${fmtPp(lift)} vs similar stores)`}`,
+      sub: [d.goLiveDate ? `went live ${d.goLiveDate}` : null, `${d.measuredStores ?? 0} store${d.measuredStores === 1 ? "" : "s"} measured`, d.maturingStores ? `${d.maturingStores} still maturing` : null].filter(Boolean).join(" · "),
+    };
+  }
+  if (row.action === "reminder_sent") return { icon: Mail, cls: "text-amber-600 bg-amber-50", title: `${actor} sent ${d.storeName || "a store"} a reminder task`, sub: d.reason || "" };
+  if (row.action === "execution_escalated") return { icon: AlertTriangle, cls: "text-red-600 bg-red-50", title: `${actor} escalated ${d.storeName || "a store"} to the Category Manager`, sub: [d.daysOverdue != null ? `${d.daysOverdue} days overdue` : null, d.priorEscalations ? `repeat: ${d.priorEscalations} earlier in 90 days` : null].filter(Boolean).join(" · ") };
+  if (row.action === "escalation_resolved") return { icon: Check, cls: "text-emerald-600 bg-emerald-50", title: `${d.storeName || "A store"} finished the reset — escalation closed`, sub: "" };
   if (row.action === "proposal_approved") return { icon: Check, cls: "text-emerald-600 bg-emerald-50", title: `${actor} approved the AI draft`, sub: d.note || "" };
   if (row.action === "proposal_rejected") return { icon: X, cls: "text-red-600 bg-red-50", title: `${actor} rejected the AI draft`, sub: d.note || "" };
   return { icon: AlertTriangle, cls: "text-slate-500 bg-slate-100", title: `${actor}: ${row.action}`, sub: "" };
@@ -8072,10 +8167,40 @@ function PlanogramActivity({ planogram }) {
   }, [idsKey]);
   useEffect(() => { load(); }, [load]);
 
+  // How the reset turned out: this version's own measurement, or that of the version that replaced it
+  const [outcomes, setOutcomes] = useState([]);
+  const [measuring, setMeasuring] = useState(false);
+  const loadOutcomes = useCallback(async () => {
+    const r = await loadResetImpacts(idsKey.split("|"));
+    setOutcomes(r.ok ? r.rows.filter((x) => x.result?.status === "ok") : []);
+  }, [idsKey]);
+  useEffect(() => { loadOutcomes(); }, [loadOutcomes]);
+  const canMeasure = effectivePlanogramStatus(planogram) === "live";
+  const measureThis = async () => {
+    setMeasuring(true);
+    try { await invokeEdgeFunction("reset-impact", { planogramIds: [planogram.id] }); await Promise.all([loadOutcomes(), load()]); } catch (e) { /* the card simply stays as it was */ } finally { setMeasuring(false); }
+  };
+
   return (
     <div className="bg-white border border-slate-200 rounded-lg p-4 mb-4 no-print">
+      {outcomes.map((o) => {
+        const sum = o.result.summary;
+        const sales = sum?.metrics.sales;
+        return (
+          <div key={o.planogram_id} className="mb-3 rounded-md border border-violet-200 bg-violet-50 px-3 py-2">
+            <div className="text-xs font-semibold text-violet-800 flex items-center gap-1.5"><TrendingUp size={13} /> Reset outcome — {o.result.planogram?.name}{o.proposal_id ? " (from an approved AI proposal)" : ""}</div>
+            {sum ? (
+              <div className="text-sm text-slate-800 mt-0.5">
+                Sales {fmtPct(sales.changePct)} per week{sales.liftPp != null ? <> — <span className={deltaCls(sales.liftPp)}>{fmtPp(sales.liftPp)}</span> vs similar stores that didn't reset</> : " (no comparison stores)"}
+                <span className="text-xs text-slate-500"> · {o.result.counts.measured} store{o.result.counts.measured === 1 ? "" : "s"} measured{o.result.counts.maturing ? `, ${o.result.counts.maturing} still maturing` : ""} · live {o.go_live_date}</span>
+              </div>
+            ) : <div className="text-sm text-slate-600 mt-0.5">No store has enough weeks after the reset yet ({o.result.counts.maturing} maturing).</div>}
+          </div>
+        );
+      })}
       <div className="flex items-center gap-2 mb-2">
         <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-1.5"><TrendingUp size={14} /> Activity</h3>
+        {canMeasure && <button className={btnGhost} onClick={measureThis} disabled={measuring} title="Compare sales before and after this version went Live"><TrendingUp size={12} /> {measuring ? "Measuring…" : "Measure impact"}</button>}
         <button className={btnGhost + " ml-auto"} onClick={load} disabled={state.status === "loading"}><RefreshCw size={12} /> Refresh</button>
       </div>
       {state.status === "error" && <p className="text-sm text-amber-700">Activity couldn't be loaded. If the latest <code>supabase/schema.sql</code> hasn't been run yet, run it in the Supabase SQL Editor.</p>}
@@ -9303,7 +9428,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
 /* else here — no new backend table needed for this phase.              */
 /* ------------------------------------------------------------------ */
 
-function StoreSelectorScreen({ stores, onSelectStore, onExitToPlanner }) {
+function StoreSelectorScreen({ stores, onSelectStore, onExitToPlanner, onSignOut }) {
   const [query, setQuery] = useState("");
   const filtered = stores.filter((s) => (s.name + " " + (s.storeNumber || "")).toLowerCase().includes(query.toLowerCase()));
   return (
@@ -9328,7 +9453,8 @@ function StoreSelectorScreen({ stores, onSelectStore, onExitToPlanner }) {
             </p>
           )}
         </div>
-        <button onClick={onExitToPlanner} className="text-xs text-slate-400 hover:underline mt-4">← Back to Tandom Studio</button>
+        {onExitToPlanner && <button onClick={onExitToPlanner} className="text-xs text-slate-400 hover:underline mt-4">← Back to Tandom Studio</button>}
+        {onSignOut && <button onClick={onSignOut} className="text-xs text-slate-400 hover:underline mt-4 block">Sign out</button>}
       </div>
     </div>
   );
@@ -9494,7 +9620,7 @@ function MyStoreView({ store, planograms }) {
   );
 }
 
-function MyActivitiesView({ store, planograms, products, fixtures, onSetExecutionStatus, onCompleteExecution, onMarkReviewed, onToggleItemCheck, onAddIssue }) {
+function MyActivitiesView({ store, planograms, products, fixtures, onSetExecutionStatus, onCompleteExecution, onMarkReviewed, onToggleItemCheck, onAddIssue, onTaskSynced }) {
   const [reportingFor, setReportingFor] = useState(null); // planogram id currently showing the feedback form
   const [issueType, setIssueType] = useState(ISSUE_TYPES[0].id);
   const [issueText, setIssueText] = useState("");
@@ -9539,6 +9665,7 @@ function MyActivitiesView({ store, planograms, products, fixtures, onSetExecutio
         storeId={store.id}
         onToggleItemCheck={onToggleItemCheck}
         onBack={() => setViewingGuideFor(null)}
+        askTandom={<AskTandomLauncher onTaskSynced={onTaskSynced} storeId={store.id} storeName={store.name} planogram={{ id: current.id, name: current.name || "Untitled planogram" }} />}
       />
     );
   }
@@ -9703,6 +9830,7 @@ const DEFAULT_TASK_TYPES = [
   { id: "fronting_facing", label: "Fronting and Facing" },
   { id: "restocking", label: "Restocking" },
   { id: "damaged_goods", label: "Damaged Good Processing" },
+  { id: "reset_followup", label: "Reset Follow-up" },
   { id: "other", label: "Other" },
 ];
 
@@ -9853,7 +9981,7 @@ function TaskManagementView({ store, taskTypes, onAddTask, onUpdateTask, onDelet
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-[10px] font-semibold uppercase tracking-wide rounded-full px-2 py-0.5 bg-slate-100 text-slate-600 border border-slate-200">
-                    {taskTypes.find((t) => t.id === task.type)?.label || task.type}
+                    {taskTypes.find((t) => t.id === task.type)?.label || (task.type === "reset_followup" ? "Reset Follow-up" : task.type)}
                   </span>
                   {task.dueDate && <span className="text-[10px] text-slate-400 flex items-center gap-1"><CalendarDays size={10} /> Due {task.dueDate}</span>}
                 </div>
@@ -10112,13 +10240,23 @@ const ASK_TANDOM_SUGGESTIONS_STORE = [
   "Which tasks are open?",
   "Where does the new product go?",
 ];
+const ASK_TANDOM_SUGGESTIONS_THIS_STORE = [
+  "What changes in this planogram?",
+  "Where does each new product go?",
+  "Summarize this planogram",
+];
+const ASK_TANDOM_SUGGESTIONS_THIS_PLANNER = [
+  "Summarize this planogram",
+  "What's different from the live version?",
+  "What are the case packs of the products on it?",
+];
 const ASK_TANDOM_SUGGESTIONS_PLANNER = [
   "Which planograms go live soon?",
   "How do planogram versions work?",
   "What is the case pack for a product?",
 ];
 
-function AskTandomPanel({ storeId, storeName, onTaskSynced, compact, onClose }) {
+function AskTandomPanel({ storeId, storeName, planogram, onTaskSynced, compact, onClose }) {
   const [messages, setMessages] = useState([]); // [{role, content, actions?: [{...action, state: "pending"|"working"|"done"|"dismissed"|"error", error?}]}]
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -10135,7 +10273,7 @@ function AskTandomPanel({ storeId, storeName, onTaskSynced, compact, onClose }) 
     setInput("");
     setBusy(true);
     try {
-      const data = await invokeEdgeFunction("ask-tandom", { messages: next.map((m) => ({ role: m.role, content: m.content })), storeId: storeId || undefined });
+      const data = await invokeEdgeFunction("ask-tandom", { messages: next.map((m) => ({ role: m.role, content: m.content })), storeId: storeId || undefined, planogramId: planogram?.id || undefined });
       setMessages((prev) => [...prev, { role: "assistant", content: data.reply || "…", actions: (data.actions || []).map((a) => ({ ...a, state: "pending" })) }]);
     } catch (e) {
       setError(e?.message || "Ask Tandom couldn't answer just now.");
@@ -10158,7 +10296,7 @@ function AskTandomPanel({ storeId, storeName, onTaskSynced, compact, onClose }) 
     }
   };
 
-  const suggestions = storeId ? ASK_TANDOM_SUGGESTIONS_STORE : ASK_TANDOM_SUGGESTIONS_PLANNER;
+  const suggestions = planogram ? (storeId ? ASK_TANDOM_SUGGESTIONS_THIS_STORE : ASK_TANDOM_SUGGESTIONS_THIS_PLANNER) : storeId ? ASK_TANDOM_SUGGESTIONS_STORE : ASK_TANDOM_SUGGESTIONS_PLANNER;
 
   return (
     <div className={`flex flex-col bg-white ${compact ? "h-full" : "border border-slate-200 rounded-lg h-[calc(100vh-8rem)] min-h-[360px]"}`}>
@@ -10167,6 +10305,7 @@ function AskTandomPanel({ storeId, storeName, onTaskSynced, compact, onClose }) 
         <div className="flex-1 min-w-0">
           <div className="font-bold text-sm text-slate-800">Ask Tandom</div>
           <div className="text-[11px] text-slate-400 truncate">{storeName ? `Answering for ${storeName}` : "Answering across all planograms"}</div>
+          {planogram && <div className="text-[11px] text-amber-700 truncate" title={planogram.name}>About: {planogram.name}</div>}
         </div>
         {messages.length > 0 && <button className="text-[11px] text-slate-400 hover:text-slate-600" onClick={() => { setMessages([]); setError(""); }}>New chat</button>}
         {onClose && <button className="text-slate-400 hover:text-slate-600" onClick={onClose} title="Close"><X size={16} /></button>}
@@ -10220,13 +10359,13 @@ function AskTandomPanel({ storeId, storeName, onTaskSynced, compact, onClose }) 
 }
 
 // Planner-side launcher: a floating button that opens the same chat in a corner panel.
-function AskTandomLauncher({ onTaskSynced }) {
+function AskTandomLauncher({ onTaskSynced, planogram, storeId, storeName }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="no-print">
       {open ? (
         <div className="fixed bottom-4 right-4 z-40 w-[26rem] max-w-[calc(100vw-2rem)] h-[34rem] max-h-[calc(100vh-2rem)] rounded-lg shadow-2xl border border-slate-300 overflow-hidden">
-          <AskTandomPanel compact onClose={() => setOpen(false)} onTaskSynced={onTaskSynced} />
+          <AskTandomPanel compact key={planogram?.id || "none"} planogram={planogram} storeId={storeId} storeName={storeName} onClose={() => setOpen(false)} onTaskSynced={onTaskSynced} />
         </div>
       ) : (
         <button onClick={() => setOpen(true)} className="fixed bottom-4 right-4 z-40 flex items-center gap-2 rounded-full bg-amber-500 text-slate-900 font-semibold text-sm px-4 py-2.5 shadow-lg hover:bg-amber-400">
@@ -10246,12 +10385,12 @@ const STORE_ASSISTANT_NAV = [
   { id: "askTandom", label: "Ask Tandom", icon: Sparkles },
 ];
 
-function StoreAssistantModule({ stores, planograms, products, fixtures, selectedStoreId, onSelectStore, onExitToPlanner, onSetExecutionStatus, onCompleteExecution, onMarkReviewed, onToggleItemCheck, onAddIssue, onAddPhoto, onDeletePhoto, onAddTask, onUpdateTask, onDeleteTask, onTaskSynced, taskTypes, onUpdateTaskTypes }) {
+function StoreAssistantModule({ isRegional, lockedStore, onSignOut, stores, planograms, products, fixtures, selectedStoreId, onSelectStore, onExitToPlanner, onSetExecutionStatus, onCompleteExecution, onMarkReviewed, onToggleItemCheck, onAddIssue, onAddPhoto, onDeletePhoto, onAddTask, onUpdateTask, onDeleteTask, onTaskSynced, taskTypes, onUpdateTaskTypes }) {
   const [section, setSection] = useState("myActivities");
   const store = stores.find((s) => s.id === selectedStoreId);
 
   if (!store) {
-    return <StoreSelectorScreen stores={stores} onSelectStore={onSelectStore} onExitToPlanner={onExitToPlanner} />;
+    return <StoreSelectorScreen stores={stores} onSelectStore={onSelectStore} onExitToPlanner={onExitToPlanner} onSignOut={onSignOut} />;
   }
 
   return (
@@ -10262,7 +10401,7 @@ function StoreAssistantModule({ stores, planograms, products, fixtures, selected
           <span className="font-bold text-sm">Store Assistant</span>
         </div>
         <nav className="flex-1 py-2">
-          {STORE_ASSISTANT_NAV.map((item) => (
+          {(isRegional ? [...STORE_ASSISTANT_NAV, { id: "escalations", label: "Escalations", icon: AlertTriangle }] : STORE_ASSISTANT_NAV).map((item) => (
             <button
               key={item.id}
               onClick={() => setSection(item.id)}
@@ -10277,20 +10416,30 @@ function StoreAssistantModule({ stores, planograms, products, fixtures, selected
             <div className="font-semibold text-slate-200">{store.name}</div>
             <div className="text-slate-400">#{store.storeNumber || "—"}</div>
           </div>
-          <button onClick={() => onSelectStore(null)} className="text-xs text-slate-400 hover:text-white flex items-center gap-1">
-            <RefreshCw size={11} /> Switch store
-          </button>
-          <button onClick={onExitToPlanner} className="text-xs text-slate-400 hover:text-white flex items-center gap-1">
-            <LogOut size={11} /> Exit to Tandom Studio
-          </button>
+          {!lockedStore && (
+            <button onClick={() => onSelectStore(null)} className="text-xs text-slate-400 hover:text-white flex items-center gap-1">
+              <RefreshCw size={11} /> Switch store
+            </button>
+          )}
+          {onExitToPlanner && (
+            <button onClick={onExitToPlanner} className="text-xs text-slate-400 hover:text-white flex items-center gap-1">
+              <LogOut size={11} /> Exit to Tandom Studio
+            </button>
+          )}
+          {onSignOut && (
+            <button onClick={onSignOut} className="text-xs text-slate-400 hover:text-white flex items-center gap-1">
+              <LogOut size={11} /> Sign out
+            </button>
+          )}
         </div>
       </div>
       <div className="flex-1 p-6 max-w-4xl">
         {section === "myStore" && <MyStoreView store={store} planograms={planograms} />}
-        {section === "myActivities" && <MyActivitiesView store={store} planograms={planograms} products={products} fixtures={fixtures} onSetExecutionStatus={onSetExecutionStatus} onCompleteExecution={onCompleteExecution} onMarkReviewed={onMarkReviewed} onToggleItemCheck={onToggleItemCheck} onAddIssue={onAddIssue} />}
+        {section === "myActivities" && <MyActivitiesView store={store} planograms={planograms} products={products} fixtures={fixtures} onSetExecutionStatus={onSetExecutionStatus} onCompleteExecution={onCompleteExecution} onMarkReviewed={onMarkReviewed} onToggleItemCheck={onToggleItemCheck} onAddIssue={onAddIssue} onTaskSynced={onTaskSynced} />}
         {section === "taskManagement" && <TaskManagementView store={store} taskTypes={taskTypes} onAddTask={onAddTask} onUpdateTask={onUpdateTask} onDeleteTask={onDeleteTask} onUpdateTaskTypes={onUpdateTaskTypes} />}
         {section === "storeFeedback" && <StoreFeedbackViewSA store={store} planograms={planograms} />}
         {section === "photoCollection" && <PhotoCollectionView store={store} planograms={planograms} onAddPhoto={onAddPhoto} onDeletePhoto={onDeletePhoto} />}
+        {section === "escalations" && <RegionalEscalationsView />}
         {section === "askTandom" && <AskTandomPanel storeId={store.id} storeName={store.name} onTaskSynced={onTaskSynced} />}
       </div>
     </div>
@@ -10480,7 +10629,7 @@ function EventForm({ event, eventTypes, planograms, onSave, onCancel, onDelete }
   );
 }
 
-function EventPlannerModule({ events, eventTypes, planograms, onCreateEvent, onUpdateEvent, onDeleteEvent, onUpdateEventTypes, onExitToPlanner }) {
+function EventPlannerModule({ onSignOut, events, eventTypes, planograms, onCreateEvent, onUpdateEvent, onDeleteEvent, onUpdateEventTypes, onExitToPlanner }) {
   const today = new Date();
   const [viewMonth, setViewMonth] = useState(today.getMonth()); // 0-11
   const [viewYear, setViewYear] = useState(today.getFullYear());
@@ -10554,12 +10703,22 @@ function EventPlannerModule({ events, eventTypes, planograms, onCreateEvent, onU
           >
             <Plus size={13} /> New Event
           </button>
-          <button
-            onClick={onExitToPlanner}
-            className="text-xs flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 rounded-full px-3 py-1.5 border border-slate-700"
-          >
-            <LogOut size={13} /> Exit to Tandom Studio
-          </button>
+          {onExitToPlanner && (
+            <button
+              onClick={onExitToPlanner}
+              className="text-xs flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 rounded-full px-3 py-1.5 border border-slate-700"
+            >
+              <LogOut size={13} /> Exit to Tandom Studio
+            </button>
+          )}
+          {onSignOut && (
+            <button
+              onClick={onSignOut}
+              className="text-xs flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 rounded-full px-3 py-1.5 border border-slate-700"
+            >
+              <LogOut size={13} /> Sign out
+            </button>
+          )}
         </div>
       </div>
 
@@ -10668,64 +10827,148 @@ function EventPlannerModule({ events, eventTypes, planograms, onCreateEvent, onU
 }
 
 const USER_ROLES = [
-  { id: "admin", label: "Admin", hint: "Everything, including user roles" },
-  { id: "category_manager", label: "Category Manager", hint: "Edit planograms, products, fixtures, stores" },
-  { id: "store_associate", label: "Store Associate", hint: "View and execute resets; no editing" },
+  { id: "admin", label: "Admin", hint: "Everything, including users and roles", landing: "Tandom Studio" },
+  { id: "category_manager", label: "Category Manager", hint: "Planograms, products, fixtures, stores, reports", landing: "Tandom Studio" },
+  { id: "regional_manager", label: "Regional Manager", hint: "Store Assistant for every store in their regions", landing: "Store Assistant" },
+  { id: "event_planner", label: "Event Planner", hint: "Event Planner; can view planograms and stores", landing: "Event Planner" },
+  { id: "store_associate", label: "Store Associate", hint: "Store Assistant for their one store", landing: "Store Assistant" },
 ];
 
-// Admin-only. Lists every profile with a role dropdown. The database already restricts role changes to
-// admins (RLS policy + trigger); the guards here just stop an admin locking themselves, or everyone, out.
-function UserRolesPanel({ currentUserId }) {
+// Admin-only. Invite people by email (role and store/regions set up front) and manage who has which role.
+// Sign-up is closed: an account exists only because an Admin invited it here. The database restricts role,
+// store and region changes to Admins; the checks here just stop an admin locking themselves out.
+function UserRolesPanel({ currentUserId, stores }) {
   const [users, setUsers] = useState(null);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [savingId, setSavingId] = useState(null);
+  const [form, setForm] = useState({ email: "", displayName: "", role: "store_associate", storeId: "", regions: [] });
+  const [inviting, setInviting] = useState(false);
+
+  const regionOptions = [...new Set((stores || []).map((x) => (x.region || "").trim()).filter(Boolean))].sort();
+  const storeOptions = (stores || []).slice().sort((a, b) => (a.name || "").localeCompare(b.name || ""));
 
   const load = useCallback(async () => {
-    const { data, error: err } = await supabase.from("profiles").select("id, email, display_name, role, created_at").order("created_at", { ascending: true });
-    if (err) { setError(`Couldn't load users: ${err.message}`); return; }
-    setUsers(data || []);
+    let r = await supabase.from("profiles").select("id, email, display_name, role, store_id, regions, created_at").order("created_at", { ascending: true });
+    if (r.error) r = await supabase.from("profiles").select("id, email, display_name, role, created_at").order("created_at", { ascending: true });
+    if (r.error) { setError(`Couldn't load users: ${r.error.message}`); return; }
+    setUsers(r.data || []);
   }, []);
   useEffect(() => { load(); }, [load]);
 
   const adminCount = (users || []).filter((u) => u.role === "admin").length;
 
-  const changeRole = async (user, role) => {
-    if (role === user.role) return;
-    setError("");
-    if (user.id === currentUserId) { setError("You can't change your own role — ask another admin."); return; }
-    if (user.role === "admin" && adminCount <= 1) { setError("There must always be at least one Admin."); return; }
+  // patch: any of { role, store_id, regions }. Moving to a role that doesn't use a store/regions clears them.
+  const update = async (user, patch) => {
+    setError(""); setNotice("");
+    const next = { ...user, ...patch };
+    if (patch.role && patch.role !== "store_associate") next.store_id = null;
+    if (patch.role && patch.role !== "regional_manager") next.regions = [];
+    if (user.id === currentUserId && patch.role && patch.role !== user.role) { setError("You can't change your own role — ask another admin."); return; }
+    if (patch.role && user.role === "admin" && patch.role !== "admin" && adminCount <= 1) { setError("There must always be at least one Admin."); return; }
     setSavingId(user.id);
-    const { error: err } = await supabase.from("profiles").update({ role }).eq("id", user.id);
+    const { error: err } = await supabase.from("profiles").update({ role: next.role, store_id: next.store_id || null, regions: next.regions || [] }).eq("id", user.id);
     setSavingId(null);
     if (err) { setError(`Couldn't update ${user.email || "user"}: ${err.message}`); return; }
-    setUsers((prev) => prev.map((u) => (u.id === user.id ? { ...u, role } : u)));
+    setUsers((prev) => prev.map((u) => (u.id === user.id ? next : u)));
+    if (next.role === "store_associate" && !next.store_id) setNotice(`${user.email || "This person"} has no store yet — they can't use Store Assistant until you choose one.`);
+    if (next.role === "regional_manager" && (next.regions || []).length === 0) setNotice(`${user.email || "This person"} has no regions yet — pick at least one.`);
+  };
+
+  const toggleRegion = (list, r) => (list.includes(r) ? list.filter((x) => x !== r) : [...list, r]);
+
+  const invite = async (e) => {
+    e.preventDefault();
+    setError(""); setNotice("");
+    if (form.role === "store_associate" && !form.storeId) { setError("Choose the store this person works in."); return; }
+    if (form.role === "regional_manager" && form.regions.length === 0) { setError("Choose at least one region."); return; }
+    setInviting(true);
+    try {
+      await invokeEdgeFunction("manage-users", {
+        action: "invite", email: form.email.trim(), displayName: form.displayName.trim(), role: form.role,
+        storeId: form.role === "store_associate" ? form.storeId : undefined,
+        regions: form.role === "regional_manager" ? form.regions : undefined,
+        redirectTo: window.location.origin,
+      });
+      setNotice(`Invitation sent to ${form.email.trim()}. They'll get an email with a link to set their password.`);
+      setForm({ email: "", displayName: "", role: form.role, storeId: "", regions: [] });
+      await load();
+    } catch (err) {
+      setError(err?.message || "The invitation couldn't be sent.");
+    } finally { setInviting(false); }
   };
 
   return (
     <div className="bg-white rounded-lg border border-slate-200 p-4 mt-6">
       <h3 className="text-sm font-semibold text-slate-800 mb-1 flex items-center gap-1.5"><Users size={15} className="text-amber-500" /> Users &amp; Roles</h3>
       <p className="text-xs text-slate-500 mb-3">
-        New sign-ups start as Store Associate. {USER_ROLES.map((r) => `${r.label}: ${r.hint}`).join(" · ")}. Role changes take effect the next time that person loads the app.
+        Accounts are created by invitation only. Each role lands on its own screen: {USER_ROLES.map((r) => `${r.label} → ${r.landing}`).join(" · ")}. Role changes take effect the next time that person loads the app.
       </p>
       {error && <div className="text-sm rounded-md px-3 py-2 mb-3 bg-red-50 text-red-700 border border-red-200">{error}</div>}
+      {notice && <div className="text-sm rounded-md px-3 py-2 mb-3 bg-emerald-50 text-emerald-700 border border-emerald-200">{notice}</div>}
+
+      <form onSubmit={invite} className="border border-slate-200 rounded-md p-3 mb-4 bg-slate-50">
+        <div className="text-xs font-semibold text-slate-600 mb-2">Invite someone</div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <input className={inputCls} type="email" required placeholder="Email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+          <input className={inputCls} placeholder="Name" value={form.displayName} onChange={(e) => setForm({ ...form, displayName: e.target.value })} />
+          <select className={inputCls} value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>
+            {USER_ROLES.map((r) => <option key={r.id} value={r.id}>{r.label}</option>)}
+          </select>
+          {form.role === "store_associate" && (
+            <select className={inputCls} required value={form.storeId} onChange={(e) => setForm({ ...form, storeId: e.target.value })}>
+              <option value="">Choose their store…</option>
+              {storeOptions.map((x) => <option key={x.id} value={x.id}>{x.name}{x.storeNumber ? ` (#${x.storeNumber})` : ""}</option>)}
+            </select>
+          )}
+        </div>
+        {form.role === "regional_manager" && (
+          <div className="mt-2 flex flex-wrap gap-2 items-center">
+            <span className="text-xs text-slate-500">Regions:</span>
+            {regionOptions.length === 0 && <span className="text-xs text-amber-700">No store has a Region yet — set one on your stores first.</span>}
+            {regionOptions.map((r) => (
+              <label key={r} className={`text-xs rounded-full border px-2.5 py-1 cursor-pointer ${form.regions.includes(r) ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-300 text-slate-600 bg-white"}`}>
+                <input type="checkbox" className="hidden" checked={form.regions.includes(r)} onChange={() => setForm({ ...form, regions: toggleRegion(form.regions, r) })} />{r}
+              </label>
+            ))}
+          </div>
+        )}
+        <div className="mt-2 text-[11px] text-slate-400">{USER_ROLES.find((r) => r.id === form.role)?.hint}</div>
+        <button type="submit" disabled={inviting} className={btnPrimary + " mt-2"}><Mail size={14} /> {inviting ? "Sending…" : "Send invitation"}</button>
+      </form>
+
       {users === null && !error && <p className="text-xs text-slate-400 italic">Loading users…</p>}
       {users && (
         <div className="divide-y divide-slate-100 border border-slate-200 rounded-md">
           {users.map((u) => (
-            <div key={u.id} className="flex items-center gap-3 px-3 py-2">
-              <div className="flex-1 min-w-0">
-                <div className="text-sm text-slate-800 truncate">{u.display_name || u.email}{u.id === currentUserId && <span className="ml-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-400">You</span>}</div>
-                {u.display_name && u.display_name !== u.email && <div className="text-xs text-slate-400 truncate">{u.email}</div>}
+            <div key={u.id} className="px-3 py-2">
+              <div className="flex items-center gap-3 flex-wrap">
+                <div className="flex-1 min-w-[180px]">
+                  <div className="text-sm text-slate-800 truncate">{u.display_name || u.email}{u.id === currentUserId && <span className="ml-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-400">You</span>}</div>
+                  {u.display_name && u.display_name !== u.email && <div className="text-xs text-slate-400 truncate">{u.email}</div>}
+                </div>
+                <select className={inputCls + " w-44"} value={u.role || "store_associate"} disabled={savingId === u.id || u.id === currentUserId}
+                  title={u.id === currentUserId ? "You can't change your own role" : undefined} onChange={(e) => update(u, { role: e.target.value })}>
+                  {USER_ROLES.map((r) => <option key={r.id} value={r.id}>{r.label}</option>)}
+                </select>
+                {u.role === "store_associate" && (
+                  <select className={inputCls + " w-52"} value={u.store_id || ""} disabled={savingId === u.id} onChange={(e) => update(u, { store_id: e.target.value })}>
+                    <option value="">No store yet…</option>
+                    {storeOptions.map((x) => <option key={x.id} value={x.id}>{x.name}{x.storeNumber ? ` (#${x.storeNumber})` : ""}</option>)}
+                  </select>
+                )}
               </div>
-              <select
-                className={inputCls + " w-48"}
-                value={u.role || "store_associate"}
-                disabled={savingId === u.id || u.id === currentUserId}
-                title={u.id === currentUserId ? "You can't change your own role" : undefined}
-                onChange={(e) => changeRole(u, e.target.value)}
-              >
-                {USER_ROLES.map((r) => <option key={r.id} value={r.id}>{r.label}</option>)}
-              </select>
+              {u.role === "regional_manager" && (
+                <div className="mt-1.5 flex flex-wrap gap-1.5 items-center">
+                  <span className="text-[11px] text-slate-400">Regions:</span>
+                  {regionOptions.map((r) => (
+                    <label key={r} className={`text-[11px] rounded-full border px-2 py-0.5 cursor-pointer ${(u.regions || []).includes(r) ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-300 text-slate-500 bg-white"}`}>
+                      <input type="checkbox" className="hidden" disabled={savingId === u.id} checked={(u.regions || []).includes(r)} onChange={() => update(u, { regions: toggleRegion(u.regions || [], r) })} />{r}
+                    </label>
+                  ))}
+                  {(u.regions || []).length === 0 && <span className="text-[11px] text-amber-700">none yet</span>}
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -10734,20 +10977,445 @@ function UserRolesPanel({ currentUserId }) {
   );
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Reset Impact — how each reset performed once its version went Live. */
+/* Computed server-side by the reset-impact Edge Function; here we only */
+/* group and show it. "vs similar stores" is the lift over stores that  */
+/* did not reset, so a market-wide trend isn't credited to the reset.   */
+/* ------------------------------------------------------------------ */
+
+const IMPACT_METRIC_OPTIONS = [
+  { id: "sales", label: "Sales $", fmt: money0, perWeek: true },
+  { id: "units", label: "Units", fmt: (n) => Math.round(n || 0).toLocaleString(), perWeek: true },
+  { id: "margin", label: "Margin $", fmt: money0, perWeek: true },
+  { id: "perLf", label: "Sales per linear ft", fmt: (n) => money(n), perWeek: true },
+];
+
+function fmtPct(n, digits = 1) {
+  if (n == null || !Number.isFinite(n)) return "—";
+  return `${n > 0 ? "+" : ""}${n.toFixed(digits)}%`;
+}
+function fmtPp(n) {
+  if (n == null || !Number.isFinite(n)) return "—";
+  return `${n > 0 ? "+" : ""}${n.toFixed(1)} pp`;
+}
+const deltaCls = (n) => (n == null || !Number.isFinite(n) ? "text-slate-400" : n > 0.05 ? "text-emerald-600" : n < -0.05 ? "text-red-600" : "text-slate-500");
+
+// one group's figures for the chosen metric -> { pre, post, changePct, liftPp }
+function impactFigures(group, metricId) {
+  if (metricId === "perLf") {
+    const v = group.salesPerLinearFt;
+    return v ? { pre: v.pre, post: v.post, changePct: v.changePct, liftPp: null } : { pre: null, post: null, changePct: null, liftPp: null };
+  }
+  return group.metrics[metricId];
+}
+
+function ImpactRowsTable({ impact, metricId }) {
+  const opt = IMPACT_METRIC_OPTIONS.find((m) => m.id === metricId) || IMPACT_METRIC_OPTIONS[0];
+  const control = impact.control?.change || {};
+  return (
+    <table className="text-xs w-full">
+      <thead>
+        <tr className="text-left text-slate-400 uppercase tracking-wide">
+          <th className="py-1 pr-3 font-semibold">Store</th><th className="py-1 pr-3 font-semibold">Region</th><th className="py-1 pr-3 font-semibold">Went live</th>
+          <th className="py-1 pr-3 font-semibold text-right">Before / wk</th><th className="py-1 pr-3 font-semibold text-right">After / wk</th><th className="py-1 pr-3 font-semibold text-right">Change</th><th className="py-1 font-semibold text-right">vs similar stores</th>
+        </tr>
+      </thead>
+      <tbody className="divide-y divide-slate-100">
+        {impact.rows.map((r) => {
+          const m = metricId === "perLf" ? "sales" : metricId;
+          const change = r.status === "measured" || r.status === "maturing" ? (r.pre[m] > 0 ? (r.post[m] / r.pre[m] - 1) * 100 : null) : null;
+          const lift = r.status === "measured" && control[m] != null && r.pre[m] > 0 ? ((r.post[m] - r.pre[m] * (1 + control[m])) / r.pre[m]) * 100 : null;
+          const lf = impact.space;
+          const perLf = (v, k) => (lf && lf[k] > 0 ? v / lf[k] : null);
+          const pre = metricId === "perLf" ? perLf(r.pre.sales, "preLinearFt") : r.pre?.[m];
+          const post = metricId === "perLf" ? perLf(r.post.sales, "postLinearFt") : r.post?.[m];
+          const changeShown = metricId === "perLf" && pre > 0 && post != null ? (post / pre - 1) * 100 : change;
+          return (
+            <tr key={r.storeId} className={r.status === "measured" ? "" : "text-slate-400"}>
+              <td className="py-1 pr-3">{r.storeName}{r.storeNumber ? ` (#${r.storeNumber})` : ""}</td>
+              <td className="py-1 pr-3">{r.region || "—"}</td>
+              <td className="py-1 pr-3">{r.goLiveDate || "—"}</td>
+              {r.status === "measured" || r.status === "maturing" ? (
+                <>
+                  <td className="py-1 pr-3 text-right">{pre != null ? opt.fmt(pre) : "—"}</td>
+                  <td className="py-1 pr-3 text-right">{post != null ? opt.fmt(post) : "—"}</td>
+                  <td className={`py-1 pr-3 text-right font-medium ${deltaCls(changeShown)}`}>{fmtPct(changeShown)}</td>
+                  <td className={`py-1 text-right font-medium ${deltaCls(lift)}`}>
+                    {r.status === "maturing" ? <span className="text-slate-400 font-normal">only {r.postWeeks} wk{r.postWeeks === 1 ? "" : "s"} so far</span> : metricId === "perLf" ? "—" : fmtPp(lift)}
+                  </td>
+                </>
+              ) : (
+                <td className="py-1 text-right italic" colSpan={4}>{r.status === "not_executed" ? "Reset not completed in this store yet" : "Not enough sales history before the reset"}</td>
+              )}
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+function ResetImpactModule({ planograms }) {
+  const [state, setState] = useState({ status: "loading", rows: [], error: "" });
+  const [measuring, setMeasuring] = useState(false);
+  const [message, setMessage] = useState(null); // {type: "ok"|"error", text}
+  const [groupBy, setGroupBy] = useState("region");
+  const [metricId, setMetricId] = useState("sales");
+  const [category, setCategory] = useState("All");
+  const [region, setRegion] = useState("All");
+  const [preWeeks, setPreWeeks] = useState(8);
+  const [postWeeks, setPostWeeks] = useState(8);
+  const [expanded, setExpanded] = useState(null);
+
+  const load = useCallback(async () => {
+    const r = await loadResetImpacts();
+    setState(r.ok ? { status: "ready", rows: r.rows, error: "" } : { status: "error", rows: [], error: r.error || "" });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const measureAll = async () => {
+    setMeasuring(true); setMessage(null);
+    try {
+      const data = await invokeEdgeFunction("reset-impact", { all: true, preWeeks, postWeeks });
+      const ok = (data.results || []).filter((r) => r.ok && r.status === "ok").length;
+      setMessage({ type: "ok", text: ok > 0 ? `Measured ${ok} reset${ok === 1 ? "" : "s"}.` : "No Live version with a Historical baseline to measure yet." });
+      await load();
+    } catch (e) {
+      setMessage({ type: "error", text: e?.message || "Couldn't measure resets." });
+    } finally { setMeasuring(false); }
+  };
+
+  const impacts = state.rows.map((r) => ({ ...r.result, planogramId: r.planogram_id, proposalId: r.proposal_id, computedAt: r.computed_at })).filter((i) => i.status === "ok");
+  const categories = ["All", ...new Set(impacts.map((i) => i.planogram.category).filter(Boolean))];
+  const regions = ["All", ...new Set(impacts.flatMap((i) => i.rows.map((r) => r.region)).filter(Boolean))];
+  const filtered = impacts
+    .filter((i) => category === "All" || i.planogram.category === category)
+    .map((i) => ({ ...i, rows: region === "All" ? i.rows : i.rows.filter((r) => r.region === region) }));
+  const roll = rollupResetImpact(filtered, groupBy);
+  const opt = IMPACT_METRIC_OPTIONS.find((m) => m.id === metricId) || IMPACT_METRIC_OPTIONS[0];
+  const planogramName = (id) => planograms.find((p) => p.id === id)?.name;
+
+  const FigureCells = ({ g, bold }) => {
+    const f = impactFigures(g, metricId);
+    return (
+      <>
+        <td className={`px-3 py-2 text-right ${bold ? "font-semibold" : ""}`}>{f.pre != null ? opt.fmt(f.pre) : "—"}</td>
+        <td className={`px-3 py-2 text-right ${bold ? "font-semibold" : ""}`}>{f.post != null ? opt.fmt(f.post) : "—"}</td>
+        <td className={`px-3 py-2 text-right font-medium ${deltaCls(f.changePct)}`}>{fmtPct(f.changePct)}</td>
+        <td className={`px-3 py-2 text-right font-medium ${deltaCls(f.liftPp)}`}>{metricId === "perLf" ? "—" : fmtPp(f.liftPp)}</td>
+      </>
+    );
+  };
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <h2 className="text-lg font-bold text-slate-800">Reset Impact</h2>
+        <div className="flex items-center gap-2 flex-wrap">
+          <label className="text-xs text-slate-500 flex items-center gap-1">Weeks before
+            <input type="number" min={2} max={52} className={inputCls + " w-16"} value={preWeeks} onChange={(e) => setPreWeeks(Math.max(2, Math.min(52, parseInt(e.target.value, 10) || 8)))} /></label>
+          <label className="text-xs text-slate-500 flex items-center gap-1">after
+            <input type="number" min={4} max={52} className={inputCls + " w-16"} value={postWeeks} onChange={(e) => setPostWeeks(Math.max(4, Math.min(52, parseInt(e.target.value, 10) || 8)))} /></label>
+          <button className={btnPrimary} onClick={measureAll} disabled={measuring}>
+            {measuring ? <RefreshCw size={14} className="animate-spin" /> : <TrendingUp size={14} />} {measuring ? "Measuring…" : "Measure all Live resets"}
+          </button>
+        </div>
+      </div>
+      <p className="text-sm text-slate-500 mb-3">How sales changed after each new version went Live, using the Historical version as the baseline — and how that compares with similar stores that didn't reset.</p>
+      {message && <div className={`text-sm rounded-md px-3 py-2 mb-3 ${message.type === "ok" ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-red-50 text-red-700 border border-red-200"}`}>{message.text}</div>}
+      {state.status === "error" && <div className="text-sm rounded-md px-3 py-2 mb-3 bg-amber-50 text-amber-700 border border-amber-200">Results couldn't be loaded{state.error ? ` (${state.error})` : ""}. If the latest <code>supabase/schema.sql</code> hasn't been run yet, run it in the Supabase SQL editor.</div>}
+      {state.status === "loading" && <p className="text-sm text-slate-400">Loading…</p>}
+      {state.status === "ready" && impacts.length === 0 && (
+        <div className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-8 text-center">
+          Nothing measured yet. A reset can be measured once its new version is Live, stores have completed it, and Performance data covers a few weeks after.
+        </div>
+      )}
+      {impacts.length > 0 && (
+        <>
+          <div className="flex items-center gap-3 flex-wrap mb-3">
+            <label className="text-xs text-slate-500 flex items-center gap-1.5">Summarize by
+              <select className={inputCls + " w-40"} value={groupBy} onChange={(e) => setGroupBy(e.target.value)}>{IMPACT_DIMENSIONS.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}</select></label>
+            <label className="text-xs text-slate-500 flex items-center gap-1.5">Measure
+              <select className={inputCls + " w-44"} value={metricId} onChange={(e) => setMetricId(e.target.value)}>{IMPACT_METRIC_OPTIONS.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}</select></label>
+            <label className="text-xs text-slate-500 flex items-center gap-1.5">Category
+              <select className={inputCls + " w-36"} value={category} onChange={(e) => setCategory(e.target.value)}>{categories.map((c) => <option key={c}>{c}</option>)}</select></label>
+            <label className="text-xs text-slate-500 flex items-center gap-1.5">Region
+              <select className={inputCls + " w-36"} value={region} onChange={(e) => setRegion(e.target.value)}>{regions.map((c) => <option key={c}>{c}</option>)}</select></label>
+          </div>
+          <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto mb-2">
+            <table className="text-sm w-full">
+              <thead>
+                <tr className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500 uppercase tracking-wide">
+                  <th className="text-left font-semibold px-3 py-2">{(IMPACT_DIMENSIONS.find((d) => d.id === groupBy) || {}).label}</th>
+                  <th className="text-right font-semibold px-3 py-2">Stores</th>
+                  <th className="text-right font-semibold px-3 py-2">Before / wk</th>
+                  <th className="text-right font-semibold px-3 py-2">After / wk</th>
+                  <th className="text-right font-semibold px-3 py-2" title="Raw change, not adjusted for anything">Change</th>
+                  <th className="text-right font-semibold px-3 py-2" title="Change minus what similar stores that did not reset did over the same weeks">vs similar stores</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {roll.groups.map((g) => (
+                  <tr key={g.label}><td className="px-3 py-2 text-slate-800">{g.label}</td><td className="px-3 py-2 text-right text-slate-500">{g.stores}</td><FigureCells g={g} /></tr>
+                ))}
+                {roll.total && roll.groups.length > 1 && (
+                  <tr className="bg-slate-50"><td className="px-3 py-2 font-semibold text-slate-800">All</td><td className="px-3 py-2 text-right text-slate-500">{roll.total.stores}</td><FigureCells g={roll.total} bold /></tr>
+                )}
+                {roll.groups.length === 0 && <tr><td className="px-3 py-4 text-slate-400 italic" colSpan={6}>No stores have a full set of after-reset weeks yet.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-[11px] text-slate-400 mb-5">
+            Figures are weekly averages. <strong>Change</strong> is the raw before/after difference; <strong>vs similar stores</strong> (percentage points) subtracts what stores of the same products that did not reset did over the same weeks.
+            {roll.maturing > 0 && ` ${roll.maturing} store${roll.maturing === 1 ? " is" : "s are"} still maturing (fewer than 4 weeks after) and left out of the totals.`}
+          </p>
+
+          <h3 className="text-sm font-semibold text-slate-700 mb-2">By planogram</h3>
+          <div className="space-y-2">
+            {filtered.map((imp) => {
+              const f = imp.summary ? impactFigures(imp.summary, metricId) : null;
+              const open = expanded === imp.planogramId;
+              return (
+                <div key={imp.planogramId} className="bg-white border border-slate-200 rounded-lg">
+                  <button className="w-full flex items-center gap-3 px-4 py-3 text-left" onClick={() => setExpanded(open ? null : imp.planogramId)}>
+                    {open ? <ChevronUp size={14} className="text-slate-400" /> : <ChevronDown size={14} className="text-slate-400" />}
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-sm font-semibold text-slate-800 truncate">{planogramName(imp.planogramId) || imp.planogram.name}{imp.proposalId && <span className="ml-2 text-[10px] font-bold uppercase tracking-wide bg-blue-50 text-blue-700 border border-blue-200 rounded px-1 py-0.5">From AI proposal</span>}</span>
+                      <span className="block text-xs text-slate-400">{imp.planogram.category || "No category"} · live {imp.goLiveDate} · {imp.counts.measured} measured{imp.counts.maturing ? `, ${imp.counts.maturing} maturing` : ""}{imp.counts.notExecuted ? `, ${imp.counts.notExecuted} not executed` : ""} · {imp.control.stores} comparison store{imp.control.stores === 1 ? "" : "s"}</span>
+                    </span>
+                    {f && f.changePct != null && <span className={`text-sm font-semibold ${deltaCls(f.changePct)}`}>{fmtPct(f.changePct)}</span>}
+                    {f && f.liftPp != null && metricId !== "perLf" && <span className={`text-xs ${deltaCls(f.liftPp)}`}>{fmtPp(f.liftPp)} vs similar</span>}
+                  </button>
+                  {open && <div className="px-4 pb-3 overflow-x-auto"><ImpactRowsTable impact={imp} metricId={metricId} /></div>}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Execution follow-up — stores stuck or past due on a reset. A check   */
+/* first previews what would happen; nothing is sent until it's         */
+/* confirmed. Escalations land here for the Category Manager.           */
+/* ------------------------------------------------------------------ */
+
+const FOLLOWUP_KIND_LABEL = { past_due: "Past due", stuck: "Stuck", past_due_and_stuck: "Past due & stuck" };
+
+function ExecutionFollowupModule({ onEscalationsChanged, onStoresChanged }) {
+  const [stuckDays, setStuckDays] = useState(3);
+  const [escalateAfterDays, setEscalateAfterDays] = useState(5);
+  const [plan, setPlan] = useState(null);
+  const [busy, setBusy] = useState(null); // "check" | "apply"
+  const [message, setMessage] = useState(null);
+  const [esc, setEsc] = useState({ status: "loading", rows: [] });
+
+  const loadEsc = useCallback(async () => {
+    const r = await loadEscalations();
+    setEsc(r.ok ? { status: "ready", rows: r.rows } : { status: "error", rows: [] });
+    if (r.ok && onEscalationsChanged) onEscalationsChanged(r.rows.filter((x) => x.status === "open").length);
+  }, [onEscalationsChanged]);
+  useEffect(() => { loadEsc(); }, [loadEsc]);
+
+  const run = async (apply) => {
+    setBusy(apply ? "apply" : "check"); setMessage(null);
+    try {
+      const data = await invokeEdgeFunction("execution-followup", { apply, stuckDays, escalateAfterDays });
+      setPlan(apply ? null : data.plan);
+      if (apply) {
+        const p = data.plan;
+        setMessage({ type: "ok", text: `Sent ${p.reminders.length} reminder${p.reminders.length === 1 ? "" : "s"}, escalated ${p.escalations.length}, closed ${p.resolutions.length} that finished.` });
+        await loadEsc();
+        if (onStoresChanged) onStoresChanged();
+      }
+    } catch (e) {
+      setMessage({ type: "error", text: e?.message || "The check failed." });
+    } finally { setBusy(null); }
+  };
+  const resolve = async (row) => {
+    try { await resolveEscalation(row.id, "Resolved by a person"); await loadEsc(); }
+    catch (e) { setMessage({ type: "error", text: e?.message || "Couldn't resolve it." }); }
+  };
+
+  const open = esc.rows.filter((r) => r.status === "open");
+  const recent = esc.rows.filter((r) => r.status === "resolved").slice(0, 10);
+  const willRemind = plan ? new Set(plan.reminders.map((r) => `${r.planogramId}|${r.storeId}`)) : new Set();
+  const willEscalate = plan ? new Set(plan.escalations.map((r) => `${r.planogramId}|${r.storeId}`)) : new Set();
+  const nothingToDo = plan && plan.reminders.length === 0 && plan.escalations.length === 0 && plan.resolutions.length === 0;
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <h2 className="text-lg font-bold text-slate-800">Execution Follow-up</h2>
+        <div className="flex items-center gap-2 flex-wrap">
+          <label className="text-xs text-slate-500 flex items-center gap-1" title="A store left in Partially Completed longer than this is treated as stuck">Stuck after
+            <input type="number" min={1} max={60} className={inputCls + " w-16"} value={stuckDays} onChange={(e) => setStuckDays(Math.max(1, Math.min(60, parseInt(e.target.value, 10) || 3)))} /> days</label>
+          <label className="text-xs text-slate-500 flex items-center gap-1" title="Escalate to the Category Manager once a store is this many days overdue or stuck">Escalate after
+            <input type="number" min={1} max={90} className={inputCls + " w-16"} value={escalateAfterDays} onChange={(e) => setEscalateAfterDays(Math.max(1, Math.min(90, parseInt(e.target.value, 10) || 5)))} /> days</label>
+          <button className={btnPrimary} onClick={() => run(false)} disabled={!!busy}>
+            {busy === "check" ? <RefreshCw size={14} className="animate-spin" /> : <Search size={14} />} {busy === "check" ? "Checking…" : "Check stores"}
+          </button>
+        </div>
+      </div>
+      <p className="text-sm text-slate-500 mb-3">Finds stores whose reset is past its due date or stuck in Partially Completed. Checking shows what would happen; nothing is sent until you confirm.</p>
+      {message && <div className={`text-sm rounded-md px-3 py-2 mb-3 ${message.type === "ok" ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-red-50 text-red-700 border border-red-200"}`}>{message.text}</div>}
+
+      {plan && (
+        <div className="bg-white border border-slate-200 rounded-lg p-4 mb-5">
+          <div className="flex items-center gap-2 mb-2 flex-wrap">
+            <h3 className="text-sm font-semibold text-slate-700">{plan.findings.length} store{plan.findings.length === 1 ? "" : "s"} behind</h3>
+            <span className="text-xs text-slate-400">checked {plan.today}</span>
+            {!nothingToDo && (
+              <button className={btnPrimary + " ml-auto"} onClick={() => run(true)} disabled={!!busy}>
+                {busy === "apply" ? <RefreshCw size={14} className="animate-spin" /> : <Check size={14} />} Send {plan.reminders.length} reminder{plan.reminders.length === 1 ? "" : "s"}{plan.escalations.length > 0 ? ` & escalate ${plan.escalations.length}` : ""}
+              </button>
+            )}
+          </div>
+          {nothingToDo && <p className="text-sm text-slate-500">Everything is on track, or every late store already has a reminder open.</p>}
+          {plan.findings.length > 0 && (
+            <table className="text-xs w-full">
+              <thead><tr className="text-left text-slate-400 uppercase tracking-wide"><th className="py-1 pr-3 font-semibold">Store</th><th className="py-1 pr-3 font-semibold">Planogram</th><th className="py-1 pr-3 font-semibold">Problem</th><th className="py-1 pr-3 font-semibold text-right">Days</th><th className="py-1 font-semibold">Will</th></tr></thead>
+              <tbody className="divide-y divide-slate-100">
+                {plan.findings.map((f) => {
+                  const k = `${f.planogramId}|${f.storeId}`;
+                  return (
+                    <tr key={k}>
+                      <td className="py-1.5 pr-3 text-slate-800">{f.storeName}</td>
+                      <td className="py-1.5 pr-3">{f.planogramName}</td>
+                      <td className="py-1.5 pr-3 text-slate-600">{FOLLOWUP_KIND_LABEL[f.kind]} — {f.reason}</td>
+                      <td className="py-1.5 pr-3 text-right font-medium text-red-600">{f.daysOverdue}</td>
+                      <td className="py-1.5">{[willRemind.has(k) ? "send reminder" : "reminder already open", willEscalate.has(k) ? "escalate" : null].filter(Boolean).join(" + ")}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+          {plan.resolutions.length > 0 && <p className="text-xs text-slate-500 mt-3">{plan.resolutions.length} store{plan.resolutions.length === 1 ? " has" : "s have"} finished since the last check ({plan.resolutions.map((r) => r.storeName).join(", ")}); their reminders and escalations will be closed.</p>}
+        </div>
+      )}
+
+      <h3 className="text-sm font-semibold text-slate-700 mb-2 flex items-center gap-1.5"><AlertTriangle size={14} className="text-amber-500" /> Escalations{open.length > 0 && <span className="text-xs font-normal text-slate-400">({open.length} open)</span>}</h3>
+      {esc.status === "error" && <div className="text-sm rounded-md px-3 py-2 mb-3 bg-amber-50 text-amber-700 border border-amber-200">Escalations couldn't be loaded. If the latest <code>supabase/schema.sql</code> hasn't been run yet, run it in the Supabase SQL editor.</div>}
+      {esc.status === "ready" && open.length === 0 && <p className="text-sm text-slate-400 italic mb-4">No open escalations.</p>}
+      <div className="space-y-2 mb-5">
+        {open.map((r) => (
+          <div key={r.id} className="bg-white border border-amber-300 rounded-lg px-4 py-3 flex items-start gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-semibold text-slate-800">{r.store_name} — {r.planogram_name}
+                {r.prior_escalations > 0 && <span className="ml-2 text-[10px] font-bold uppercase tracking-wide bg-red-50 text-red-700 border border-red-200 rounded px-1 py-0.5">Repeat · {r.prior_escalations} before in 90 days</span>}</div>
+              <div className="text-xs text-slate-500">{FOLLOWUP_KIND_LABEL[r.kind] || r.kind} · {r.days_overdue} days · {r.reason}</div>
+              <div className="text-[11px] text-slate-400">Escalated {new Date(r.created_at).toLocaleDateString()}</div>
+            </div>
+            <button className={btnGhost} onClick={() => resolve(r)}><Check size={12} /> Mark resolved</button>
+          </div>
+        ))}
+      </div>
+      {recent.length > 0 && (
+        <>
+          <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Recently resolved</h4>
+          <ul className="text-xs text-slate-500 space-y-0.5">
+            {recent.map((r) => <li key={r.id}>{r.store_name} — {r.planogram_name} · {r.resolution || "resolved"} {r.resolved_at ? `(${new Date(r.resolved_at).toLocaleDateString()})` : ""}</li>)}
+          </ul>
+        </>
+      )}
+    </div>
+  );
+}
+
+function AccessMessageScreen({ title, body, onRetry, onSignOut }) {
+  return (
+    <div className="min-h-screen bg-slate-100 flex items-center justify-center p-6">
+      <div className="w-full max-w-sm bg-white border border-slate-200 rounded-lg p-6">
+        <div className="flex items-center gap-2 mb-3">
+          <div className="w-7 h-7 rounded bg-amber-500 flex items-center justify-center text-slate-900 font-black text-sm">T</div>
+          <span className="font-bold text-slate-800">Tandom Studio</span>
+        </div>
+        <h2 className="text-base font-semibold text-slate-800 mb-1">{title}</h2>
+        <p className="text-sm text-slate-500 mb-4">{body}</p>
+        <div className="flex gap-2">
+          {onRetry && <button className={btnPrimary} onClick={onRetry}><RefreshCw size={14} /> Try again</button>}
+          {onSignOut && <button className={btnGhost} onClick={onSignOut}><LogOut size={14} /> Sign out</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Escalations for the stores a regional manager covers (the database only returns those).
+function RegionalEscalationsView() {
+  const [state, setState] = useState({ status: "loading", rows: [] });
+  const [error, setError] = useState("");
+  const load = useCallback(async () => {
+    const r = await loadEscalations();
+    setState(r.ok ? { status: "ready", rows: r.rows } : { status: "error", rows: [] });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+  const resolve = async (row) => {
+    try { await resolveEscalation(row.id, "Resolved by the regional manager"); setError(""); await load(); }
+    catch (e) { setError(e?.message || "Couldn't resolve it."); }
+  };
+  const open = state.rows.filter((r) => r.status === "open");
+  return (
+    <div>
+      <h2 className="text-lg font-bold text-slate-800 mb-1">Escalations</h2>
+      <p className="text-sm text-slate-500 mb-4">Stores in your regions that stayed late on a reset long enough to need attention.</p>
+      {error && <div className="text-sm rounded-md px-3 py-2 mb-3 bg-red-50 text-red-700 border border-red-200">{error}</div>}
+      {state.status === "error" && <div className="text-sm rounded-md px-3 py-2 mb-3 bg-amber-50 text-amber-700 border border-amber-200">Escalations couldn't be loaded.</div>}
+      {state.status === "ready" && open.length === 0 && <p className="text-sm text-slate-400 italic">No open escalations in your regions.</p>}
+      <div className="space-y-2">
+        {open.map((r) => (
+          <div key={r.id} className="bg-white border border-amber-300 rounded-lg px-4 py-3 flex items-start gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-semibold text-slate-800">{r.store_name} — {r.planogram_name}
+                {r.prior_escalations > 0 && <span className="ml-2 text-[10px] font-bold uppercase tracking-wide bg-red-50 text-red-700 border border-red-200 rounded px-1 py-0.5">Repeat · {r.prior_escalations} before in 90 days</span>}</div>
+              <div className="text-xs text-slate-500">{r.days_overdue} days · {r.reason}</div>
+            </div>
+            <button className={btnGhost} onClick={() => resolve(r)}><Check size={12} /> Mark resolved</button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function AppContent({ session }) {
   const [tab, setTab] = useState("planograms");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
-  const [userRole, setUserRole] = useState(null); // profiles.role: admin | category_manager | store_associate
-  useEffect(() => {
-    let cancelled = false;
-    if (!session?.user?.id) return undefined;
-    supabase.from("profiles").select("role").eq("id", session.user.id).maybeSingle()
-      .then(({ data }) => { if (!cancelled) setUserRole(data?.role || null); })
-      .catch(() => { if (!cancelled) setUserRole(null); });
-    return () => { cancelled = true; };
+  // profiles row: { role, store_id, regions, display_name }. undefined = still loading, null = none (no access).
+  const [profile, setProfile] = useState(undefined);
+  const loadProfile = useCallback(async () => {
+    const uid = session?.user?.id;
+    if (!uid) return;
+    try {
+      let r = await supabase.from("profiles").select("role, store_id, regions, display_name").eq("id", uid).maybeSingle();
+      if (r.error) r = await supabase.from("profiles").select("role").eq("id", uid).maybeSingle(); // older database without store/regions yet
+      setProfile(r.error || !r.data?.role ? null : r.data);
+    } catch (e) { setProfile(null); }
   }, [session?.user?.id]);
+  useEffect(() => { loadProfile(); }, [loadProfile]);
+  const userRole = profile?.role || null;
   const isAdmin = userRole === "admin";
+  const isStoreScoped = userRole === "store_associate" || userRole === "regional_manager"; // lands on Store Assistant only
+  const isEventPlanner = userRole === "event_planner"; // lands on Event Planner only
+  const isRestricted = isStoreScoped || isEventPlanner;
+  const signOut = () => supabase.auth.signOut();
+  const isPlanner = userRole === "admin" || userRole === "category_manager"; // may see Reset Impact and Execution follow-up
+  const [openEscalations, setOpenEscalations] = useState(0);
+  useEffect(() => {
+    if (!isPlanner) return;
+    loadEscalations().then((r) => { if (r.ok) setOpenEscalations(r.rows.filter((x) => x.status === "open").length); });
+  }, [isPlanner]);
+  // the follow-up agent edits stores (reminder tasks) on the server; pull them back in
+  const refreshStores = useCallback(async () => {
+    try { const rows = await loadIndexed("store"); if (Array.isArray(rows) && rows.length > 0) setStores(rows); } catch (e) { /* keep what is on screen */ }
+  }, []);
 
   const [productSchema, setProductSchema] = useState(DEFAULT_PRODUCT_SCHEMA);
   const [fixtureSchema, setFixtureSchema] = useState(DEFAULT_FIXTURE_SCHEMA);
@@ -10764,8 +11432,9 @@ function AppContent({ session }) {
   const [pendingSaveCount, setPendingSaveCount] = useState(0);
   const [appMode, setAppModeState] = useState("planner"); // "planner" | "storeAssistant" | "eventPlanner"
   const [selectedStoreId, setSelectedStoreIdState] = useState(null); // which store is "logged in" to Store Assistant
-  const setAppMode = (mode) => { setAppModeState(mode); safeSet("settings:appMode", mode); };
-  const setSelectedStoreId = (id) => { setSelectedStoreIdState(id); safeSet("settings:selectedStoreId", id || ""); };
+  // restricted roles never write these shared settings (they have no access to them, and their screen is fixed by role)
+  const setAppMode = (mode) => { setAppModeState(mode); if (!isRestricted) safeSet("settings:appMode", mode); };
+  const setSelectedStoreId = (id) => { setSelectedStoreIdState(id); if (!isRestricted) safeSet("settings:selectedStoreId", id || ""); };
   const [events, setEvents] = useState([]); // Event Planner — reset/promo/etc events
   const [eventTypes, setEventTypes] = useState(DEFAULT_EVENT_TYPES); // customizable event type list
   const [taskTypes, setTaskTypes] = useState(DEFAULT_TASK_TYPES); // customizable Store Assistant task type list
@@ -11384,16 +12053,36 @@ function AppContent({ session }) {
     );
   }
 
-  if (appMode === "storeAssistant") {
+  if (profile === undefined) {
+    return <div className="min-h-[400px] flex items-center justify-center text-slate-400 text-sm gap-2"><RefreshCw size={16} className="animate-spin" /> Checking your access…</div>;
+  }
+  if (!profile) {
+    return <AccessMessageScreen title="Your account isn't set up yet" body="This account has no role. Ask an administrator to invite you or assign your role, then try again." onRetry={() => { setProfile(undefined); loadProfile(); }} onSignOut={signOut} />;
+  }
+  if (userRole === "store_associate" && !profile.store_id) {
+    return <AccessMessageScreen title="No store assigned" body="Your account isn't assigned to a store yet. Ask an administrator to choose your store, then try again." onRetry={() => { setProfile(undefined); loadProfile(); }} onSignOut={signOut} />;
+  }
+  if (userRole === "regional_manager" && (profile.regions || []).length === 0) {
+    return <AccessMessageScreen title="No regions assigned" body="Your account isn't assigned to a region yet. Ask an administrator to choose your regions, then try again." onRetry={() => { setProfile(undefined); loadProfile(); }} onSignOut={signOut} />;
+  }
+
+  // each role lands on its own screen; restricted roles can't reach the others
+  const effectiveMode = isStoreScoped ? "storeAssistant" : isEventPlanner ? "eventPlanner" : appMode;
+  const effectiveStoreId = userRole === "store_associate" ? profile.store_id : selectedStoreId;
+
+  if (effectiveMode === "storeAssistant") {
     return (
       <StoreAssistantModule
+        isRegional={userRole === "regional_manager"}
+        lockedStore={userRole === "store_associate"}
+        onSignOut={isRestricted ? signOut : undefined}
         stores={stores}
         planograms={planograms}
         products={products}
         fixtures={fixtures}
-        selectedStoreId={selectedStoreId}
+        selectedStoreId={effectiveStoreId}
         onSelectStore={setSelectedStoreId}
-        onExitToPlanner={() => setAppMode("planner")}
+        onExitToPlanner={isRestricted ? undefined : () => setAppMode("planner")}
         onSetExecutionStatus={setPlanogramExecutionStatus}
         onCompleteExecution={completeStoreExecution}
         onMarkReviewed={markPlanogramReviewed}
@@ -11411,9 +12100,10 @@ function AppContent({ session }) {
     );
   }
 
-  if (appMode === "eventPlanner") {
+  if (effectiveMode === "eventPlanner") {
     return (
       <EventPlannerModule
+        onSignOut={isRestricted ? signOut : undefined}
         events={events}
         eventTypes={eventTypes}
         planograms={planograms}
@@ -11421,7 +12111,7 @@ function AppContent({ session }) {
         onUpdateEvent={updateEvent}
         onDeleteEvent={deleteEvent}
         onUpdateEventTypes={updateEventTypes}
-        onExitToPlanner={() => setAppMode("planner")}
+        onExitToPlanner={isRestricted ? undefined : () => setAppMode("planner")}
       />
     );
   }
@@ -11435,7 +12125,7 @@ function AppContent({ session }) {
           .print-area { border: none !important; box-shadow: none !important; }
         }
       `}</style>
-      <AskTandomLauncher onTaskSynced={syncStoreTask} />
+      <AskTandomLauncher onTaskSynced={syncStoreTask} planogram={activePlanogram ? { id: activePlanogram.id, name: activePlanogram.name || "Untitled planogram" } : null} />
       <div className="bg-slate-900 text-white px-6 py-3.5 flex items-center gap-3 no-print">
         <div className="w-7 h-7 rounded bg-amber-500 flex items-center justify-center text-slate-900 font-black text-sm">T</div>
         <span className="font-bold tracking-tight">Tandom Studio</span>
@@ -11496,6 +12186,8 @@ function AppContent({ session }) {
           <TabButton active={tab === "performance"} onClick={() => setTab("performance")} icon={TrendingUp}>Performance</TabButton>
           <TabButton active={tab === "analysis"} onClick={() => setTab("analysis")} icon={BarChart3}>Analysis</TabButton>
           <TabButton active={tab === "storeFeedback"} onClick={() => setTab("storeFeedback")} icon={AlertTriangle}>Store Feedback</TabButton>
+          {isPlanner && <TabButton active={tab === "resetImpact"} onClick={() => setTab("resetImpact")} icon={TrendingUp}>Reset Impact</TabButton>}
+          {isPlanner && <TabButton active={tab === "execution"} onClick={() => setTab("execution")} icon={Mail} badge={openEscalations}>Execution</TabButton>}
           <TabButton active={tab === "schema"} onClick={() => setTab("schema")} icon={Settings2}>Settings</TabButton>
           <TabButton active={tab === "help"} onClick={() => setTab("help")} icon={HelpCircle}>Help</TabButton>
         </div>
@@ -11601,6 +12293,10 @@ function AppContent({ session }) {
             performance={performance}
             productSchema={productSchema}
           />
+        ) : tab === "resetImpact" && isPlanner ? (
+          <ResetImpactModule planograms={planograms} />
+        ) : tab === "execution" && isPlanner ? (
+          <ExecutionFollowupModule onEscalationsChanged={setOpenEscalations} onStoresChanged={refreshStores} />
         ) : tab === "storeFeedback" ? (
           <StoreFeedbackView planograms={planograms} onResolveIssue={resolvePlanogramIssue} onOpenPlanogram={setActivePlanogramId} />
         ) : tab === "help" ? (
@@ -11803,7 +12499,7 @@ function AppContent({ session }) {
               <ResetThresholdsEditor planograms={planograms} resetThresholds={resetThresholds} onChange={updateResetThresholds} />
             </div>
 
-            {isAdmin && <UserRolesPanel currentUserId={session?.user?.id} />}
+            {isAdmin && <UserRolesPanel currentUserId={session?.user?.id} stores={stores} />}
 
             <div className="bg-white rounded-lg border border-slate-200 p-4 mt-6">
               <h3 className="text-sm font-semibold text-slate-800 mb-1 flex items-center gap-1.5"><Sparkles size={15} className="text-amber-500" /> Days of Supply Targets</h3>
@@ -11843,13 +12539,23 @@ function SetupNeededScreen() {
   );
 }
 
-function AuthScreen() {
-  const [mode, setMode] = useState("signin"); // signin | signup
+// Read once, before Supabase clears the URL: invite/recovery links arrive as #access_token=…&type=invite|recovery,
+// and expired or reused links arrive as #error_description=….
+function readAuthLinkInfo() {
+  try {
+    const params = new window.URLSearchParams((window.location.hash || "").replace(/^#/, ""));
+    const type = params.get("type");
+    const err = params.get("error_description");
+    return { needsPassword: type === "invite" || type === "recovery", error: err ? err.replace(/\+/g, " ") : null };
+  } catch (e) { return { needsPassword: false, error: null }; }
+}
+
+function AuthScreen({ linkError }) {
+  const [mode, setMode] = useState("signin"); // signin | forgot
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(null);
+  const [error, setError] = useState(linkError ? `${linkError} Ask an administrator to send a new invitation, or use "Forgot password".` : null);
   const [notice, setNotice] = useState(null);
 
   const submit = async (e) => {
@@ -11858,14 +12564,10 @@ function AuthScreen() {
     setError(null);
     setNotice(null);
     try {
-      if (mode === "signup") {
-        const { error } = await supabase.auth.signUp({
-          email,
-          password,
-          options: { data: { display_name: displayName || email } },
-        });
+      if (mode === "forgot") {
+        const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin });
         if (error) throw error;
-        setNotice("Account created. If email confirmation is on for this project, check your inbox before signing in.");
+        setNotice("If that email has an account, a link to set a new password is on its way.");
       } else {
         const { error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) throw error;
@@ -11884,20 +12586,9 @@ function AuthScreen() {
           <div className="w-7 h-7 rounded bg-amber-500 flex items-center justify-center text-slate-900 font-black text-sm">T</div>
           <span className="font-bold text-slate-800">Tandom Studio</span>
         </div>
-        <p className="text-xs text-slate-500 mb-5">Teams Delivering Merchandising in Tandom</p>
-
-        <div className="flex gap-1.5 mb-4">
-          <button onClick={() => setMode("signin")} className={`flex-1 text-sm rounded-md py-1.5 border font-medium ${mode === "signin" ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-200 text-slate-600"}`}>Sign In</button>
-          <button onClick={() => setMode("signup")} className={`flex-1 text-sm rounded-md py-1.5 border font-medium ${mode === "signup" ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-200 text-slate-600"}`}>Create Account</button>
-        </div>
+        <p className="text-xs text-slate-500 mb-5">{mode === "forgot" ? "Enter your email and we'll send a link to set a new password." : "Sign in with the account your administrator invited you with."}</p>
 
         <form onSubmit={submit} className="space-y-3">
-          {mode === "signup" && (
-            <div>
-              <label className={labelCls}>Name</label>
-              <input className={inputCls} value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="Jane Planner" />
-            </div>
-          )}
           <div>
             <label className={labelCls}>Email</label>
             <div className="relative">
@@ -11905,31 +12596,83 @@ function AuthScreen() {
               <input type="email" required className={inputCls + " pl-8"} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@company.com" />
             </div>
           </div>
-          <div>
-            <label className={labelCls}>Password</label>
-            <div className="relative">
-              <Lock size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-300" />
-              <input type="password" required minLength={6} className={inputCls + " pl-8"} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" />
+          {mode === "signin" && (
+            <div>
+              <label className={labelCls}>Password</label>
+              <div className="relative">
+                <Lock size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-300" />
+                <input type="password" required minLength={6} className={inputCls + " pl-8"} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" />
+              </div>
             </div>
-          </div>
+          )}
           {error && <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{error}</div>}
           {notice && <div className="text-sm rounded-md px-3 py-2 bg-emerald-50 text-emerald-700 border border-emerald-200">{notice}</div>}
           <button type="submit" disabled={busy} className={btnPrimary + " w-full justify-center"}>
-            {busy ? "Please wait…" : mode === "signup" ? "Create Account" : "Sign In"}
+            {busy ? "Please wait…" : mode === "forgot" ? "Send reset link" : "Sign In"}
           </button>
         </form>
+        <button type="button" className="text-xs text-slate-400 hover:underline mt-4"
+          onClick={() => { setMode(mode === "forgot" ? "signin" : "forgot"); setError(null); setNotice(null); }}>
+          {mode === "forgot" ? "← Back to sign in" : "Forgot password?"}
+        </button>
       </div>
+    </div>
+  );
+}
+
+// Shown after an invitation or password-reset link: the person is signed in by the link and picks a password.
+function SetPasswordScreen({ onDone }) {
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(null);
+    if (password.length < 8) { setError("Use at least 8 characters."); return; }
+    if (password !== confirm) { setError("The two passwords don't match."); return; }
+    setBusy(true);
+    const { error: err } = await supabase.auth.updateUser({ password });
+    setBusy(false);
+    if (err) { setError(err.message || "Couldn't set the password."); return; }
+    try { window.history.replaceState(null, "", window.location.pathname); } catch (x) { /* ignore */ }
+    onDone();
+  };
+  return (
+    <div className="min-h-screen bg-slate-100 flex items-center justify-center p-6">
+      <form onSubmit={submit} className="w-full max-w-sm bg-white border border-slate-200 rounded-lg p-6 space-y-3">
+        <div className="flex items-center gap-2 mb-1">
+          <div className="w-7 h-7 rounded bg-amber-500 flex items-center justify-center text-slate-900 font-black text-sm">T</div>
+          <span className="font-bold text-slate-800">Welcome to Tandom Studio</span>
+        </div>
+        <p className="text-xs text-slate-500">Choose a password for your account.</p>
+        <div>
+          <label className={labelCls}>New password</label>
+          <input type="password" required minLength={8} className={inputCls} value={password} onChange={(e) => setPassword(e.target.value)} />
+        </div>
+        <div>
+          <label className={labelCls}>Confirm password</label>
+          <input type="password" required minLength={8} className={inputCls} value={confirm} onChange={(e) => setConfirm(e.target.value)} />
+        </div>
+        {error && <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{error}</div>}
+        <button type="submit" disabled={busy} className={btnPrimary + " w-full justify-center"}>{busy ? "Saving…" : "Save password and continue"}</button>
+      </form>
     </div>
   );
 }
 
 export default function App() {
   const [session, setSession] = useState(undefined); // undefined = checking, null = signed out, object = signed in
+  const [linkInfo] = useState(readAuthLinkInfo);
+  const [settingPassword, setSettingPassword] = useState(linkInfo.needsPassword);
 
   useEffect(() => {
     if (!supabaseConfigured) { setSession(null); return; }
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => setSession(newSession));
+    const { data: listener } = supabase.auth.onAuthStateChange((event, newSession) => {
+      if (event === "PASSWORD_RECOVERY") setSettingPassword(true);
+      setSession(newSession);
+    });
     return () => listener.subscription.unsubscribe();
   }, []);
 
@@ -11937,6 +12680,7 @@ export default function App() {
   if (session === undefined) {
     return <div className="min-h-screen flex items-center justify-center text-slate-400 text-sm gap-2"><RefreshCw size={16} className="animate-spin" /> Checking session…</div>;
   }
-  if (!session) return <AuthScreen />;
+  if (!session) return <AuthScreen linkError={linkInfo.error} />;
+  if (settingPassword) return <SetPasswordScreen onDone={() => setSettingPassword(false)} />;
   return <AppContent session={session} />;
 }

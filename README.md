@@ -214,10 +214,35 @@ which never gets uploaded).
 
 Users whose `profiles.role` is `admin` see a checkbox on every product (grid and list), a **Select All (n)** button (selects everything the current search/filter shows) and **Delete Selected (n)**, which asks "Are you sure…" before deleting. Other roles don't see these controls. This is a UI gate; the database's own delete policy (admin and category manager) is unchanged, so no `schema.sql` change is needed.
 
-## Users & Roles (admin only)
+## Users, roles and where each person lands (admin only)
 
-Settings → **Users & Roles** lists every signed-up user with a role dropdown (Admin, Category Manager, Store Associate). You can't change your own role, and the last remaining Admin can't be demoted. The database still enforces who may change roles (admin-only policy + trigger); no `schema.sql` change. New sign-ups start as Store Associate. The very first Admin still has to be set once in Supabase: `update profiles set role = 'admin' where email = '...';`.
+Accounts are **invitation only**. In Settings → **Users & Roles** an Admin enters an email, name and role (plus a store, or regions); the person gets an email, sets a password, and lands on their own screen:
+
+| Role | Lands on | Scope |
+|---|---|---|
+| Admin | Tandom Studio | everything, including Users & Roles |
+| Category Manager | Tandom Studio | planograms, products, fixtures, stores, reports |
+| Regional Manager | Store Assistant | every store in their assigned region(s) (matches each store's Region); also sees Escalations for those stores |
+| Event Planner | Event Planner | events; read-only view of planograms and stores |
+| Store Associate | Store Assistant | their one assigned store only |
+
+Store Associates and Regional Managers have no way to reach Tandom Studio, and the **database** (not just the screens) limits them: they read only their stores and the live/approved planograms assigned to them, never Performance, and write only task/photo/execution/issue data for those stores (`supabase/schema.sql`, "Access model v2"; tested against real Postgres with `bash scripts/test-access-rules.sh`).
+
+One-time setup:
+1. Re-run `supabase/schema.sql`, then deploy the `manage-users` function (the GitHub Action does this).
+2. Supabase → Authentication: turn **off** "Allow new users to sign up", and add the app URL (e.g. `https://tandom-studio.netlify.app`) to the redirect allow-list so invite links come back to the app.
+3. Existing store associates must be given a store in Users & Roles; until then they see "No store assigned". Regional managers need at least one region (set a Region on each store).
+4. The first Admin is still set once in SQL: `update profiles set role = 'admin' where email = '...';`
+
+You can't change your own role and the last Admin can't be demoted. Not included yet: removing a user, and email/push notification of escalations. Forgot-password sends a reset link.
 
 ## Ask Tandom
 
 A chat assistant (Edge Function `ask-tandom`): planners get an **Ask Tandom** button at the bottom right; store associates get an **Ask Tandom** item in the Store Assistant menu. It answers from your data (where products go, what changes in a reset, tasks, issues, case packs, the help guide) and can mark a store task open/completed after the person confirms. See `supabase/functions/README.md` for setup (`ANTHROPIC_API_KEY` repository secret, then re-run `schema.sql`).
+When a planogram is open (in the editor, or a store's execution guide) the chat is told which one, so "this planogram" works; a planogram outside the user's scope is ignored.
+
+## Reset Impact and Execution Follow-up (agents)
+
+- **Reset Impact tab** (Admin / Category Manager): sales before vs after a version went Live, summarized by Region, Store, Category, Department, Cluster, Store format or Planogram, for Sales $, Units, Margin $ or Sales per linear foot, each shown raw and against similar stores that did not reset. The outcome also appears on the planogram's Activity panel (including for approved AI proposals).
+- **Execution tab:** *Check stores* previews stores past due or stuck in Partially Completed; confirming adds a "Reset Follow-up" task to each store's Task Management and escalates stores overdue beyond a set number of days to a list for the Category Manager.
+- Needs the latest `schema.sql` (two new tables) and the two new Edge Functions (`reset-impact`, `execution-followup`); see `supabase/functions/README.md`.

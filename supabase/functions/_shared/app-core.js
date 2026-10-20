@@ -158,6 +158,67 @@ function aggregateProductPerformanceRange(productId, performanceMap, startISO, e
 }
 
 
+// Reset Impact (see supabase/functions/_shared/reset-impact.js). Rolling store rows up into groups.
+// A row carries weekly-average `pre`/`post` {sales, units, margin}, the `controlChange` of its
+// planogram (what similar stores that did not reset did, as a fraction, or null) and that planogram's
+// `space` {preLinearFt, postLinearFt}. Lift = actual after-total minus what the control trend predicts
+// (pre x (1 + control change)), as points of the before-total, so groups of any mix add up correctly.
+const IMPACT_METRICS = ["sales", "units", "margin"];
+
+function rollupImpactRows(rows, label = "All stores") {
+  const metrics = {};
+  IMPACT_METRICS.forEach((m) => {
+    const pre = rows.reduce((t, r) => t + r.pre[m], 0);
+    const post = rows.reduce((t, r) => t + r.post[m], 0);
+    const adj = rows.filter((r) => r.controlChange && r.controlChange[m] != null);
+    const adjPre = adj.reduce((t, r) => t + r.pre[m], 0);
+    const adjPost = adj.reduce((t, r) => t + r.post[m], 0);
+    const expected = adj.reduce((t, r) => t + r.pre[m] * (1 + r.controlChange[m]), 0);
+    metrics[m] = { pre, post, changePct: pre > 0 ? (post / pre - 1) * 100 : null, liftPp: adjPre > 0 ? ((adjPost - expected) / adjPre) * 100 : null };
+  });
+  const lfRows = rows.filter((r) => r.space && r.space.preLinearFt > 0 && r.space.postLinearFt > 0);
+  const lfPre = lfRows.reduce((t, r) => t + r.space.preLinearFt, 0);
+  const lfPost = lfRows.reduce((t, r) => t + r.space.postLinearFt, 0);
+  const sPre = lfRows.reduce((t, r) => t + r.pre.sales, 0);
+  const sPost = lfRows.reduce((t, r) => t + r.post.sales, 0);
+  const salesPerLinearFt = lfPre > 0 && lfPost > 0 && sPre > 0 ? { pre: sPre / lfPre, post: sPost / lfPost, changePct: ((sPost / lfPost) / (sPre / lfPre) - 1) * 100 } : null;
+  return { label, stores: new Set(rows.map((r) => r.storeId)).size, rows: rows.length, planograms: new Set(rows.map((r) => r.planogramId).filter(Boolean)).size, metrics, salesPerLinearFt };
+}
+
+
+const IMPACT_DIMENSIONS = [
+  { id: "region", label: "Region" },
+  { id: "store", label: "Store" },
+  { id: "category", label: "Category" },
+  { id: "department", label: "Department" },
+  { id: "cluster", label: "Cluster" },
+  { id: "format", label: "Store format" },
+  { id: "planogram", label: "Planogram" },
+];
+
+// impacts: computeResetImpact results (status "ok"). Only stores with a full after-window ("measured") count;
+// maturing stores are tallied separately so nobody reads a half-finished result as final.
+function rollupResetImpact(impacts, dimension) {
+  const groups = new Map();
+  let maturing = 0;
+  (impacts || []).filter((i) => i && i.status === "ok").forEach((imp) => {
+    (imp.rows || []).forEach((r) => {
+      if (r.status === "maturing") maturing++;
+      if (r.status !== "measured") return;
+      const label = ({
+        region: r.region, store: `${r.storeName}${r.storeNumber ? ` (#${r.storeNumber})` : ""}`, format: r.format,
+        category: imp.planogram.category, department: imp.planogram.department, cluster: imp.planogram.cluster, planogram: imp.planogram.name,
+      }[dimension]) || `(No ${(IMPACT_DIMENSIONS.find((d) => d.id === dimension) || {}).label || dimension})`;
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label).push({ ...r, planogramId: imp.planogramId, space: imp.space, controlChange: imp.control ? imp.control.change : null });
+    });
+  });
+  const out = [...groups.entries()].map(([label, rows]) => rollupImpactRows(rows, label));
+  out.sort((a, b) => (b.metrics.sales.post - b.metrics.sales.pre) - (a.metrics.sales.post - a.metrics.sales.pre));
+  return { groups: out, total: out.length ? rollupImpactRows([...groups.values()].flat(), "All") : null, maturing };
+}
+
+
 // Space consumed by one placement, in inches: the product's (or merch-style's) width for
 // whichever orientation it's rotated to, compressed by its squeeze factor, times facings.
 // Mirrors the per-item width formula layoutFixtureBoxes uses to pack a shelf — this just sums
@@ -228,6 +289,30 @@ const HELP_SECTIONS = [
     ],
   },
   {
+    id: "resetImpact",
+    title: "Reset Impact",
+    blocks: [
+      { type: "p", text: "The **Reset Impact** tab (Admins and Category Managers) shows how sales changed after a new planogram version went Live, using the Historical version as the baseline. Press **Measure all Live resets** to calculate it; the same figures appear as an **outcome** card in that planogram's Activity panel, including for resets that came from an approved AI proposal." },
+      { type: "ul", items: [
+        "**Before / after:** weekly averages for the weeks before each store completed the reset and the full weeks after. A store needs at least 4 weeks after to count; until then it shows as maturing and is left out of totals.",
+        "**vs similar stores:** the change minus what stores that did not reset did over the same weeks, in percentage points, so a market-wide trend isn't credited to the reset.",
+        "**Summarize by** Region, Store, Category, Department, Cluster, Store format or Planogram, and **Measure** Sales $, Units, Margin $ or Sales per linear foot (sales divided by the shelf space the category had before and after).",
+      ] },
+    ],
+  },
+  {
+    id: "executionFollowup",
+    title: "Execution Follow-up",
+    blocks: [
+      { type: "p", text: "The **Execution** tab (Admins and Category Managers) finds stores whose reset is **past its due date** (the planogram's Event Date) or **stuck in Partially Completed**. **Check stores** previews what would happen; nothing is sent until you confirm." },
+      { type: "ul", items: [
+        "Each late store gets one **Reset Follow-up** reminder in its Task Management list. A store is never sent a second reminder while the first is open.",
+        "A store that is overdue (or stuck) by the **Escalate after** number of days is escalated to the Category Manager and listed under Escalations, flagged as a repeat when it was escalated before in the last 90 days.",
+        "When a store finishes, running the check again closes its reminder and escalation.",
+      ] },
+    ],
+  },
+  {
     id: "askTandom",
     title: "Ask Tandom",
     blocks: [
@@ -236,6 +321,7 @@ const HELP_SECTIONS = [
         "Ask where a product goes, what changes in the next reset (new, deleted and changed items), which tasks are open, what a product's case pack is, or how to do something in the app.",
         "Store associates only see their own store's planograms, tasks and issues. Planners and admins can ask about anything.",
         "Ask it to mark a task complete (or reopen it) and it shows a confirmation card; the task only changes when you press **Confirm**.",
+        "Open a planogram first and Ask Tandom knows which one you mean, so you can ask \"what changes in this planogram?\". Store associates get the same button inside the step-by-step execution guide.",
         "It looks answers up in your data rather than guessing, and says so when it can't find something. It can't edit planograms or products.",
       ] },
     ],
@@ -713,4 +799,4 @@ function applyResetDraftChanges(sections, changes) {
 }
 
 
-export { ORIENTATIONS, PENDING_LEAD_DAYS, todayISO, addDaysISO, effectivePlanogramStatus, getFamilyMasterId, getFamilyMembers, getPredecessorPlanogram, cloneSectionsWithNewIds, makePlanogramVersion, uid, getAttrByLabel, getLatestWeekEnding, getCutoffISO, aggregateProductPerformanceRange, getPlacementSpaceIn, DOS_EXCESS_FACTOR, getDosTargetDays, getDaysOfSupply, getCasePackFill, DEFAULT_RESET_THRESHOLDS, getResetThreshold, HELP_SECTIONS, getEffectiveDims, getOrientedFaceDims, getStackConfig, getStackDims, getShelfClearanceIn, getStackHeightProblem, getStackDepthProblem, AUTO_STACK_MAX, getAutoStackHigh, refitAutoStacks, layoutFixtureBoxes, applyResetDraftChanges };
+export { ORIENTATIONS, PENDING_LEAD_DAYS, todayISO, addDaysISO, effectivePlanogramStatus, getFamilyMasterId, getFamilyMembers, getPredecessorPlanogram, cloneSectionsWithNewIds, makePlanogramVersion, uid, getAttrByLabel, getLatestWeekEnding, getCutoffISO, aggregateProductPerformanceRange, IMPACT_METRICS, rollupImpactRows, IMPACT_DIMENSIONS, rollupResetImpact, getPlacementSpaceIn, DOS_EXCESS_FACTOR, getDosTargetDays, getDaysOfSupply, getCasePackFill, DEFAULT_RESET_THRESHOLDS, getResetThreshold, HELP_SECTIONS, getEffectiveDims, getOrientedFaceDims, getStackConfig, getStackDims, getShelfClearanceIn, getStackHeightProblem, getStackDepthProblem, AUTO_STACK_MAX, getAutoStackHigh, refitAutoStacks, layoutFixtureBoxes, applyResetDraftChanges };

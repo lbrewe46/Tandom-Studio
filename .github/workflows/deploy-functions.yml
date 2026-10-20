@@ -33,6 +33,9 @@ jobs:
       - run: supabase functions deploy draft-reset --project-ref "$SUPABASE_PROJECT_ID"
       - run: supabase functions deploy apply-proposal --project-ref "$SUPABASE_PROJECT_ID"
       - run: supabase functions deploy ask-tandom --project-ref "$SUPABASE_PROJECT_ID"
+      - run: supabase functions deploy reset-impact --project-ref "$SUPABASE_PROJECT_ID"
+      - run: supabase functions deploy execution-followup --project-ref "$SUPABASE_PROJECT_ID"
+      - run: supabase functions deploy manage-users --project-ref "$SUPABASE_PROJECT_ID"
       - name: Set the Ask Tandom model API key (only if the repository secret exists)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

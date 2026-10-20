@@ -18,7 +18,7 @@ export function preflightOrWrongMethod(req) {
 }
 
 // Verifies the caller's Supabase session and that their profile role is allowed.
-//   -> { user, role }            the caller may proceed
+//   -> { user, role, profile }   the caller may proceed (profile = { role, store_id, regions })
 //   -> { response }              401 (no/invalid session) or 403 (role not allowed) — return it as is
 export async function authenticate(req, db, allowedRoles, roleDeniedMessage) {
   const token = (req.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
@@ -26,7 +26,7 @@ export async function authenticate(req, db, allowedRoles, roleDeniedMessage) {
   const { data: userData, error: userErr } = await db.auth.getUser(token);
   if (userErr || !userData?.user) return { response: json(401, { error: "Invalid or expired session" }) };
 
-  const { data: profile } = await db.from("profiles").select("role").eq("id", userData.user.id).maybeSingle();
+  const { data: profile } = await db.from("profiles").select("role, store_id, regions").eq("id", userData.user.id).maybeSingle();
   if (!profile || !allowedRoles.includes(profile.role)) return { response: json(403, { error: roleDeniedMessage }) };
-  return { user: userData.user, role: profile.role };
+  return { user: userData.user, role: profile.role, profile };
 }

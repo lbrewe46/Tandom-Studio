@@ -241,3 +241,51 @@ export async function loadProposal(proposalId) {
 export function applyProposal(proposalId) {
   return invokeEdgeFunction("apply-proposal", { proposalId });
 }
+
+// -------------------------------------------------------------------
+// Reset Impact + Execution Follow-up agents
+// -------------------------------------------------------------------
+
+// Measured resets (one row per Live version). `ids`, when given, limits to those versions or the
+// versions that replaced them (so a source version's Activity can show how its reset turned out).
+export async function loadResetImpacts(ids) {
+  if (!supabase) return { ok: false, rows: [] };
+  try {
+    let q = supabase.from("reset_impacts").select("planogram_id, baseline_planogram_id, proposal_id, go_live_date, params, result, computed_at");
+    const list = [...new Set((ids || []).filter(Boolean))];
+    if (ids) {
+      if (list.length === 0) return { ok: true, rows: [] };
+      const inList = `(${list.map((x) => `"${String(x).replace(/"/g, "")}"`).join(",")})`;
+      q = q.or(`planogram_id.in.${inList},baseline_planogram_id.in.${inList}`);
+    }
+    const { data, error } = await q.order("computed_at", { ascending: false }).limit(1000);
+    if (error || !data) return { ok: false, rows: [], error: error?.message };
+    return { ok: true, rows: data };
+  } catch (e) {
+    return { ok: false, rows: [], error: e?.message };
+  }
+}
+
+export async function loadEscalations() {
+  if (!supabase) return { ok: false, rows: [] };
+  try {
+    const { data, error } = await supabase
+      .from("escalations")
+      .select("id, planogram_id, planogram_name, store_id, store_name, kind, days_overdue, reason, prior_escalations, status, created_at, resolved_at, resolution")
+      .order("created_at", { ascending: false })
+      .limit(200);
+    if (error || !data) return { ok: false, rows: [], error: error?.message };
+    return { ok: true, rows: data };
+  } catch (e) {
+    return { ok: false, rows: [], error: e?.message };
+  }
+}
+
+export async function resolveEscalation(id, note) {
+  if (!supabase) throw new Error("Supabase isn't configured.");
+  const { data: auth } = await supabase.auth.getUser();
+  const { error } = await supabase.from("escalations")
+    .update({ status: "resolved", resolved_at: new Date().toISOString(), resolved_by: auth?.user?.id || null, resolution: note || "Resolved by a person" })
+    .eq("id", id);
+  if (error) throw new Error(error.message);
+}
