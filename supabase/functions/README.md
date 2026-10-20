@@ -69,6 +69,7 @@ above covers that once deployed.
 
 ## Limits worth knowing
 
+
 Supabase allows **2 s of CPU and 256 MB of memory per request** (waiting on the database does not
 count toward CPU). The function reads the whole `performance` table, as the app itself does on load.
 Measured locally: 50 planograms against 5,000 products × 52 weekly records ≈ 20 MB read and well
