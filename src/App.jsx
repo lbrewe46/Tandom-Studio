@@ -1811,6 +1811,7 @@ function ProductColumnsPopover({ schema, visibleColumns, onToggle, onReorder, on
 
 function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLookup, onCreate, onUpdate, onDelete, isAdmin }) {
   const [editing, setEditing] = useState(null); // null | "new" | product
+  const [listEditError, setListEditError] = useState("");
   const [importStatus, setImportStatus] = useState(null); // {type:'ok'|'error', message}
   const [importing, setImporting] = useState(false);
   const [importProgress, setImportProgress] = useState(null); // {current, total}
@@ -2239,6 +2240,9 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
           {pendingOnly ? "No products are pending approval." : `No products match "${query}".`}
         </div>
       ) : viewMode === "list" ? (
+        <div>
+          <div className="text-xs text-slate-400 mb-2">{onUpdate ? "Click a cell to edit it. Changes save as you go. Size is edited with Edit." : ""}</div>
+          {listEditError && <div className="text-xs rounded-md px-3 py-2 mb-2 bg-amber-50 text-amber-700 border border-amber-200 flex items-center justify-between">{listEditError}<button className="text-amber-700 hover:underline ml-3" onClick={() => setListEditError("")}>Dismiss</button></div>}
         <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
           <table className="text-xs" style={{ tableLayout: "fixed", width: "100%", minWidth: 480 + visibleColumns.length * 100 }}>
             <colgroup>
@@ -2284,11 +2288,42 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
                       )}
                     </div>
                   </td>
-                  {visibleColumns.map((colId) => (
-                    <td key={colId} className="px-3 py-2 text-slate-700 whitespace-nowrap overflow-hidden text-ellipsis" title={getProductColumnValue(p, colId, schema)}>
-                      {getProductColumnValue(p, colId, schema)}
-                    </td>
-                  ))}
+                  {visibleColumns.map((colId) => {
+                    const field = schema.find((f) => f.id === colId);
+                    const editableCell = !!onUpdate && (colId === "name" || colId === "sku" || !!field);
+                    if (!editableCell) {
+                      return (
+                        <td key={colId} className="px-3 py-2 text-slate-700 whitespace-nowrap overflow-hidden text-ellipsis" title={getProductColumnValue(p, colId, schema)}>
+                          {getProductColumnValue(p, colId, schema)}
+                        </td>
+                      );
+                    }
+                    const cellCls = "w-full bg-transparent border border-transparent hover:border-slate-300 focus:border-amber-400 focus:bg-white rounded px-1.5 py-1 text-xs text-slate-800 outline-none";
+                    // a change that would give two products the same matching key (SKU, or UPC when that is the key) is refused
+                    const keyTaken = (candidate) => {
+                      const next = colId === "sku" ? { ...p, sku: candidate } : { ...p, attributes: { ...(p.attributes || {}), [colId]: candidate } };
+                      const k = getPrimaryKeyValue(next, schema, primaryKeyField);
+                      return !!k && products.some((o) => o.id !== p.id && getPrimaryKeyValue(o, schema, primaryKeyField) === k);
+                    };
+                    const refuse = (what) => setListEditError(`${what} is already used by another product, so it wasn't changed.`);
+                    return (
+                      <td key={colId} className="px-1.5 py-1 overflow-hidden" title={getProductColumnValue(p, colId, schema)}>
+                        {colId === "name" ? (
+                          <DebouncedTextInput className={cellCls + " font-medium"} value={p.name} onCommit={(v) => { if (v.trim() && v.trim() !== p.name) onUpdate({ ...p, name: v.trim() }); }} />
+                        ) : colId === "sku" ? (
+                          <DebouncedTextInput className={cellCls + " font-mono"} value={p.sku || ""} onCommit={(v) => { const t = v.trim(); if (t === (p.sku || "")) return; if (keyTaken(t)) { refuse(`"${t}"`); return; } setListEditError(""); onUpdate({ ...p, sku: t }); }} />
+                        ) : (
+                          <AttributeInput field={field} className={cellCls} value={p.attributes?.[colId]} onChange={(v) => {
+                            const next = attrCoerce(field, v);
+                            if ((p.attributes?.[colId] ?? "") === next) return;
+                            if (next !== "" && keyTaken(next)) { refuse(`"${next}"`); return; }
+                            setListEditError("");
+                            onUpdate({ ...p, attributes: { ...(p.attributes || {}), [colId]: next } });
+                          }} />
+                        )}
+                      </td>
+                    );
+                  })}
                   <td className="px-3 py-2 text-right whitespace-nowrap">
                     <button className="text-xs text-amber-600 font-medium hover:underline mr-3" onClick={() => setEditing(p)}>Edit</button>
                     <button className="text-xs text-red-500 font-medium hover:underline" onClick={() => onDelete(p.id)}>Delete</button>
@@ -2297,6 +2332,7 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
               ))}
             </tbody>
           </table>
+        </div>
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
