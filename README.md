@@ -246,3 +246,8 @@ When a planogram is open (in the editor, or a store's execution guide) the chat 
 - **Reset Impact tab** (Admin / Category Manager): sales before vs after a version went Live, summarized by Region, Store, Category, Department, Cluster, Store format or Planogram, for Sales $, Units, Margin $ or Sales per linear foot, each shown raw and against similar stores that did not reset. The outcome also appears on the planogram's Activity panel (including for approved AI proposals).
 - **Execution tab:** *Check stores* previews stores past due or stuck in Partially Completed; confirming adds a "Reset Follow-up" task to each store's Task Management and escalates stores overdue beyond a set number of days to a list for the Category Manager.
 - Needs the latest `schema.sql` (two new tables) and the two new Edge Functions (`reset-impact`, `execution-followup`); see `supabase/functions/README.md`.
+
+
+## Performance import from a Google Sheet
+
+Performance Data accepts an Excel file (.xlsx/.xls), a CSV, or a **Google Sheet link** (button "From Google Sheet"). The sheet uses the same columns as the template and must be shared as **Anyone with the link → Viewer**; the tab in the link (`gid=`) is the one read. Private sheets can't be read, and the app says how to share them. The link is read by the `fetch-sheet` Edge Function (Admin and Category Manager only; deploy it with the other functions, no `schema.sql` change); nothing from the sheet is stored except the imported weekly rows.

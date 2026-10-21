@@ -5,7 +5,7 @@ import {
   RotateCw, X, Layers, Package, Boxes, Ruler, ArrowLeft, Check, Grid3x3,
   Pencil, Save, AlertTriangle, RefreshCw, Download, Upload, FileSpreadsheet, CalendarDays, TrendingUp,
   Maximize2, Minimize2, Store, ChevronDown, ChevronUp, AlignLeft, AlignCenter, AlignRight, Search, Eye, Printer, Copy,
-  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe, HelpCircle, BarChart3, Sparkles, Users, Send
+  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe, HelpCircle, BarChart3, Sparkles, Users, Send, Link2
 } from "lucide-react";
 import {
   supabase, supabaseConfigured, pendingWriteListeners,
@@ -1291,7 +1291,7 @@ function toISODate(v) {
   return "";
 }
 
-function downloadPerformanceTemplate(primaryKeyField) {
+function downloadPerformanceTemplate(primaryKeyField, format = "xlsx") {
   const keyLabel = primaryKeyField === "upc" ? "UPC" : "SKU";
   const headers = ["Store Name", "Store Number", "Product Name", keyLabel, "Week Ending (YYYY-MM-DD)", "Unit Cost", "Retail Price", "Units Sold"];
   const ws = XLSX.utils.aoa_to_sheet([headers]);
@@ -1314,6 +1314,17 @@ function downloadPerformanceTemplate(primaryKeyField) {
   const ws2 = XLSX.utils.aoa_to_sheet(instrRows);
   ws2["!cols"] = [{ wch: 24 }, { wch: 60 }];
   XLSX.utils.book_append_sheet(wb, ws2, "Instructions");
+  if (format === "csv") {
+    // CSV holds one sheet only: the header row to fill in (the field notes stay in the Excel versions)
+    const blob = new Blob([XLSX.utils.sheet_to_csv(ws)], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "performance_import_template.csv";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return;
+  }
+  if (format === "xls") { XLSX.writeFile(wb, "performance_import_template.xls", { bookType: "biff8" }); return; }
   XLSX.writeFile(wb, "performance_import_template.xlsx");
 }
 
@@ -1323,7 +1334,8 @@ function parsePerformanceWorkbook(file, products, stores, productSchema, primary
     reader.onload = (e) => {
       try {
         const data = new Uint8Array(e.target.result);
-        const wb = XLSX.read(data, { type: "array", cellDates: true });
+        const isCsv = /\.csv$/i.test(file.name || "");
+        const wb = XLSX.read(data, { type: "array", cellDates: true, raw: isCsv }); // CSV keeps cell text as-is (UPCs stay text)
         const sheetName = wb.SheetNames.find((n) => n.toLowerCase() === "performance") || wb.SheetNames[0];
         const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { defval: "" });
 
@@ -3491,6 +3503,11 @@ function AnalysisModule({ products, planograms, stores, performance, productSche
 function PerformanceModule({ products, performance, stores, productSchema, primaryKeyField, onSaveProductPerformance, onDeleteProductPerformance, onClearAllPerformance }) {
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [importStatus, setImportStatus] = useState(null);
+  const [showSheetLink, setShowSheetLink] = useState(false);
+  const [showTemplateMenu, setShowTemplateMenu] = useState(false);
+  const [sheetLink, setSheetLink] = useState("");
+  const [sheetLinkError, setSheetLinkError] = useState("");
+  const [fetchingSheet, setFetchingSheet] = useState(false);
   const [importing, setImporting] = useState(false);
   const [importProgress, setImportProgress] = useState(null);
   const [weeks, setWeeks] = useState(13);
@@ -3559,10 +3576,31 @@ function PerformanceModule({ products, performance, stores, productSchema, prima
         });
       }
     } catch (err) {
-      setImportStatus({ type: "error", message: "Couldn't read that file. Make sure it's a .xlsx based on the template." });
+      setImportStatus({ type: "error", message: "Couldn't read that file. Make sure it's an Excel (.xlsx/.xls) or CSV file laid out like the template." });
     } finally {
       setImporting(false); setImportProgress(null);
       if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  // Google Sheet link -> the fetch-sheet function reads it (the sheet must be shared "Anyone with the link") ->
+  // the same import path as a chosen file.
+  const importFromSheet = async () => {
+    setSheetLinkError("");
+    if (!sheetLink.trim()) return;
+    setFetchingSheet(true);
+    try {
+      const res = await invokeEdgeFunction("fetch-sheet", { url: sheetLink.trim() });
+      const bin = atob(res.base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const file = new File([bytes], res.filename || "google-sheet.csv", { type: "text/csv" });
+      setShowSheetLink(false); setSheetLink("");
+      await handleFileChosen(file);
+    } catch (e) {
+      setSheetLinkError(e?.message || "Couldn't read that sheet.");
+    } finally {
+      setFetchingSheet(false);
     }
   };
 
@@ -3591,17 +3629,52 @@ function PerformanceModule({ products, performance, stores, productSchema, prima
       <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
         <h2 className="text-lg font-bold text-slate-800">Performance Data</h2>
         <div className="flex items-center gap-2">
-          <button className={btnGhost} onClick={() => downloadPerformanceTemplate(primaryKeyField)}><Download size={14} /> Download Template</button>
+          <div className="relative">
+            <button className={btnGhost} onClick={() => setShowTemplateMenu((v) => !v)}><Download size={14} /> Download Template <ChevronDown size={12} /></button>
+            {showTemplateMenu && (
+              <div className="absolute right-0 z-30 mt-1 w-56 bg-white border border-slate-200 rounded-lg shadow-lg p-1.5">
+                {[
+                  { id: "xlsx", label: "Excel (.xlsx)", hint: "with field instructions" },
+                  { id: "xls", label: "Excel 97-2003 (.xls)", hint: "with field instructions" },
+                  { id: "csv", label: "CSV (.csv)", hint: "header row only" },
+                ].map((f) => (
+                  <button key={f.id} className="w-full text-left px-2 py-1.5 rounded hover:bg-slate-50" onClick={() => { downloadPerformanceTemplate(primaryKeyField, f.id); setShowTemplateMenu(false); }}>
+                    <div className="text-xs font-medium text-slate-700">{f.label}</div>
+                    <div className="text-[10px] text-slate-400">{f.hint}</div>
+                  </button>
+                ))}
+                <div className="text-[10px] text-slate-400 px-2 pt-1 border-t border-slate-100 mt-1">For Google Sheets, open the CSV or Excel file in Sheets.</div>
+              </div>
+            )}
+          </div>
           <button className={btnGhost} disabled={importing} onClick={() => fileInputRef.current && fileInputRef.current.click()}>
             <Upload size={14} />
             {importing ? (importProgress?.phase === "importing" ? `Loading ${importProgress.current}/${importProgress.total}…` : "Reading file…") : "Upload Performance Data"}
           </button>
-          <input ref={fileInputRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={(e) => handleFileChosen(e.target.files[0])} />
+          <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={(e) => handleFileChosen(e.target.files[0])} />
+          <button className={btnGhost} disabled={importing} onClick={() => { setShowSheetLink((v) => !v); setSheetLinkError(""); }}>
+            <Link2 size={14} /> From Google Sheet
+          </button>
           {Object.keys(performance).length > 0 && (
             <button className={btnDanger} onClick={() => setConfirmingClear(true)}><Trash2 size={13} /> Clear All</button>
           )}
         </div>
       </div>
+
+      {showSheetLink && (
+        <div className="bg-white border border-slate-200 rounded-lg p-3 mb-3 space-y-2">
+          <div className="text-xs text-slate-500">
+            Paste the link to a Google Sheet laid out like the template. The sheet must be shared as <span className="font-semibold">Anyone with the link → Viewer</span>.
+            The tab in the link is the one that's read (open the right tab before copying the link).
+          </div>
+          <div className="flex items-center gap-2">
+            <input className={inputCls} value={sheetLink} onChange={(e) => setSheetLink(e.target.value)} placeholder="https://docs.google.com/spreadsheets/d/…" onKeyDown={(e) => { if (e.key === "Enter") importFromSheet(); }} />
+            <button className={btnPrimary} disabled={fetchingSheet || !sheetLink.trim()} onClick={importFromSheet}>{fetchingSheet ? "Reading…" : "Import"}</button>
+            <button className={btnGhost} onClick={() => setShowSheetLink(false)}>Cancel</button>
+          </div>
+          {sheetLinkError && <div className="text-xs rounded-md px-2.5 py-1.5 bg-red-50 text-red-700 border border-red-200">{sheetLinkError}</div>}
+        </div>
+      )}
 
       {confirmingClear && (
         <div className="flex items-center justify-between gap-3 text-sm rounded-md px-3 py-2 mb-3 bg-red-50 text-red-700 border border-red-200">
@@ -3613,7 +3686,7 @@ function PerformanceModule({ products, performance, stores, productSchema, prima
         </div>
       )}
       <p className="text-xs text-slate-400 mb-3 flex items-center gap-1.5">
-        <FileSpreadsheet size={13} /> Load weekly unit cost, retail price, and units sold per product per store. Products are matched by <span className="font-semibold text-slate-500">{primaryKeyField === "upc" ? "UPC" : "SKU"}</span> (set in Settings).
+        <FileSpreadsheet size={13} /> Load weekly unit cost, retail price, and units sold per product per store from an Excel file (.xlsx/.xls), a CSV, or a Google Sheet link. Products are matched by <span className="font-semibold text-slate-500">{primaryKeyField === "upc" ? "UPC" : "SKU"}</span> (set in Settings).
       </p>
       {primaryKeyField === "upc" && !hasUpcField(productSchema) && (
         <div className="text-sm rounded-md px-3 py-2 mb-3 bg-amber-50 text-amber-700 border border-amber-200">
@@ -4673,34 +4746,66 @@ function ProSpaceImportModal({ products, fixtures, productSchema, onClose, onImp
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const fileInputRef = useRef(null);
 
-  const handleFile = (file) => {
-    if (!file) return;
+  const [fileErrors, setFileErrors] = useState([]); // [{ name, message }] for files that couldn't be imported
+  const [fileSummaries, setFileSummaries] = useState([]); // [{ name, planograms }] for files that were read
+
+  const readText = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => resolve(String(e.target.result || ""));
+    reader.onerror = () => reject(new Error("Couldn't read that file."));
+    reader.readAsText(file, "windows-1252");
+  });
+
+  // Reads each chosen file in turn. Files are mapped one after another against a running copy of the library,
+  // so a product or fixture that is new in the first file is matched, not duplicated, when it shows up again
+  // in the next. One bad file doesn't stop the others; it is listed with its reason.
+  const handleFiles = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
     setPhase("reading");
     setError("");
-    const reader = new FileReader();
-    reader.onload = (e) => {
+    const errors = [];
+    const summaries = [];
+    const merged = { planogramDrafts: [], newProducts: [], newFixtures: [], schemaPatch: [], warnings: [], stats: { planogramCount: 0, matchedProductCount: 0, newProductCount: 0, matchedFixtureCount: 0, newFixtureCount: 0, placementCount: 0, skippedPlacements: 0 } };
+    let runningProducts = products;
+    let runningFixtures = fixtures;
+    let runningSchema = productSchema;
+    for (const file of files) {
       try {
-        const parsed = parsePSAFile(String(e.target.result || ""));
+        const parsed = parsePSAFile(await readText(file));
         // Cm→inch conversion (unit math only, not layout logic) hasn't been validated against a
         // real metric ProSpace export yet, so rather than silently convert and risk a subtly
-        // wrong import, we block metric files here with a clear reason — same file just re-runs
-        // once metric import is actually supported.
+        // wrong import, we block metric files here with a clear reason.
         if (parsed.metric) {
-          setError("This ProSpace file uses Metric units (centimeters). Metric import isn't supported yet — only Imperial (inch-based) ProSpace planogram files can be imported right now.");
-          setPhase("error");
-          return;
+          errors.push({ name: file.name, message: "Uses Metric units (centimeters). Only Imperial (inch-based) files can be imported right now." });
+          continue;
         }
-        const mapped = mapProSpaceImport(parsed, { existingProducts: products, existingFixtures: fixtures, productSchema });
-        setResult(mapped);
-        setSelectedIds(new Set(mapped.planogramDrafts.map((p) => p.id)));
-        setPhase("preview");
+        const mapped = mapProSpaceImport(parsed, { existingProducts: runningProducts, existingFixtures: runningFixtures, productSchema: runningSchema });
+        mapped.planogramDrafts.forEach((pg) => { pg.sourceFileName = file.name; });
+        runningProducts = [...runningProducts, ...mapped.newProducts];
+        runningFixtures = [...runningFixtures, ...mapped.newFixtures];
+        runningSchema = [...runningSchema, ...mapped.schemaPatch];
+        merged.planogramDrafts.push(...mapped.planogramDrafts);
+        merged.newProducts.push(...mapped.newProducts);
+        merged.newFixtures.push(...mapped.newFixtures);
+        merged.schemaPatch.push(...mapped.schemaPatch);
+        merged.warnings.push(...mapped.warnings.map((w) => (files.length > 1 ? `${file.name}: ${w}` : w)));
+        Object.keys(merged.stats).forEach((k) => { merged.stats[k] += mapped.stats[k] || 0; });
+        summaries.push({ name: file.name, planograms: mapped.planogramDrafts.length });
       } catch (err) {
-        setError("Couldn't parse that file — make sure it's a ProSpace .psa export.");
-        setPhase("error");
+        errors.push({ name: file.name, message: "Couldn't parse it. Make sure it's a ProSpace .psa export." });
       }
-    };
-    reader.onerror = () => { setError("Couldn't read that file."); setPhase("error"); };
-    reader.readAsText(file, "windows-1252");
+    }
+    setFileErrors(errors);
+    setFileSummaries(summaries);
+    if (merged.planogramDrafts.length === 0) {
+      setError(errors.length ? "None of the files could be imported." : "No Planogram objects were found in the selected file(s).");
+      setPhase("error");
+      return;
+    }
+    setResult(merged);
+    setSelectedIds(new Set(merged.planogramDrafts.map((p) => p.id)));
+    setPhase("preview");
   };
 
   const toggleSelected = (id) => setSelectedIds((prev) => {
@@ -4711,7 +4816,7 @@ function ProSpaceImportModal({ products, fixtures, productSchema, onClose, onImp
 
   const doImport = () => {
     if (!result) return;
-    const chosen = result.planogramDrafts.filter((p) => selectedIds.has(p.id));
+    const chosen = result.planogramDrafts.filter((p) => selectedIds.has(p.id)).map(({ sourceFileName, ...pg }) => pg);
     if (chosen.length === 0) return;
     // only carry through new products/fixtures actually referenced by the chosen planograms
     const usedProductIds = new Set();
@@ -4729,14 +4834,14 @@ function ProSpaceImportModal({ products, fixtures, productSchema, onClose, onImp
     <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center z-50 p-4">
       <div className="bg-white rounded-lg border border-slate-200 shadow-xl w-full max-w-2xl max-h-[85vh] overflow-y-auto p-5 space-y-4">
         <div className="flex items-center justify-between">
-          <h3 className="font-bold text-slate-800">Import from ProSpace</h3>
+          <h3 className="font-bold text-slate-800">Import .psa file</h3>
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
         </div>
 
         {phase === "pick" && (
           <div className="space-y-3">
             <p className="text-sm text-slate-500">
-              Upload a ProSpace/Blue Yonder <code>.psa</code> project file. Each Planogram it contains is imported as its own,
+              Choose one or more ProSpace/Blue Yonder <code>.psa</code> project files. Each Planogram they contain is imported as its own,
               independent Tandom planogram. Products and fixtures are matched against your existing library where possible
               (by UPC and by dimensions) — anything new is created and flagged <span className="font-semibold text-amber-600">Pending Approval</span> for
               you to review afterward.
@@ -4749,23 +4854,28 @@ function ProSpaceImportModal({ products, fixtures, productSchema, onClose, onImp
               ref={fileInputRef}
               type="file"
               accept=".psa,.txt,.csv"
+              multiple
               className="hidden"
-              onChange={(e) => handleFile(e.target.files[0])}
+              onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }}
             />
             <button className={btnPrimary} onClick={() => fileInputRef.current && fileInputRef.current.click()}>
-              <Upload size={14} /> Choose .psa file
+              <Upload size={14} /> Choose .psa file(s)
             </button>
           </div>
         )}
 
         {phase === "reading" && (
           <div className="flex items-center gap-2 text-sm text-slate-500 py-6 justify-center">
-            <RefreshCw size={16} className="animate-spin" /> Reading and parsing file…
+            <RefreshCw size={16} className="animate-spin" /> Reading and parsing files…
           </div>
         )}
 
         {phase === "error" && (
-          <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{error}</div>
+          <div className="space-y-2">
+            <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{error}</div>
+            {fileErrors.map((fe) => <div key={fe.name} className="text-xs text-red-700"><span className="font-semibold">{fe.name}</span> — {fe.message}</div>)}
+            <button className={btnGhost} onClick={() => { setPhase("pick"); setFileErrors([]); }}>Choose different files</button>
+          </div>
         )}
 
         {phase === "preview" && result && (
@@ -4785,6 +4895,17 @@ function ProSpaceImportModal({ products, fixtures, productSchema, onClose, onImp
               </div>
             </div>
 
+            {fileErrors.length > 0 && (
+              <div className="text-xs rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200 space-y-0.5">
+                <div className="font-semibold">{fileErrors.length} file{fileErrors.length !== 1 ? "s" : ""} couldn't be imported:</div>
+                {fileErrors.map((fe) => <div key={fe.name}><span className="font-semibold">{fe.name}</span> — {fe.message}</div>)}
+              </div>
+            )}
+            {result.warnings.length > 0 && (
+              <div className="text-xs rounded-md px-3 py-2 bg-amber-50 text-amber-700 border border-amber-200 space-y-0.5 max-h-28 overflow-y-auto">
+                {result.warnings.map((w, i) => <div key={i}>{w}</div>)}
+              </div>
+            )}
             <div className="space-y-2">
               {result.planogramDrafts.map((pg) => {
                 const fixtureCount = pg.sections.reduce((s, sec) => s + sec.fixtures.length, 0);
@@ -4795,7 +4916,7 @@ function ProSpaceImportModal({ products, fixtures, productSchema, onClose, onImp
                     <div className="min-w-0">
                       <div className="font-semibold text-sm text-slate-800">{pg.name}</div>
                       <div className="text-xs text-slate-500">
-                        {pg.dims.w}×{pg.dims.h}×{pg.dims.d} in · {pg.sections.length} section{pg.sections.length !== 1 ? "s" : ""} · {fixtureCount} fixture{fixtureCount !== 1 ? "s" : ""} · {placementCount} placement{placementCount !== 1 ? "s" : ""}
+                        {fileSummaries.length > 1 && pg.sourceFileName ? `${pg.sourceFileName} · ` : ""}{pg.dims.w}×{pg.dims.h}×{pg.dims.d} in · {pg.sections.length} section{pg.sections.length !== 1 ? "s" : ""} · {fixtureCount} fixture{fixtureCount !== 1 ? "s" : ""} · {placementCount} placement{placementCount !== 1 ? "s" : ""}
                       </div>
                     </div>
                   </label>
@@ -4890,7 +5011,20 @@ function NewPlanogramForm({ existingCategories, onCreate, onCancel }) {
   );
 }
 
-function PlanogramList({ planograms, stores, products, fixtures, productSchema, onCreate, onOpen, onDelete, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace, onDraftResetBulk, draftingReset, proposals, profileNames, onOpenProposal }) {
+// Columns of the Planograms list view. `editable` columns can be changed in place; the rest are shown for reference.
+const PLANOGRAM_LIST_COLUMNS = [
+  { id: "name", label: "Name", editable: true, defaultOn: true, locked: true },
+  { id: "status", label: "Status", defaultOn: true },
+  { id: "category", label: "Category", editable: true, defaultOn: true },
+  { id: "department", label: "Department", editable: true, defaultOn: true },
+  { id: "cluster", label: "Cluster", editable: true, defaultOn: true },
+  { id: "eventDate", label: "Event Date", editable: true, type: "date", defaultOn: true },
+  { id: "sections", label: "# Sections", defaultOn: true },
+  { id: "stores", label: "Stores assigned", defaultOn: true },
+  { id: "dims", label: "Size (in)", defaultOn: false },
+];
+
+function PlanogramList({ planograms, stores, products, fixtures, productSchema, onCreate, onOpen, onDelete, onUpdate, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace, onDraftResetBulk, draftingReset, proposals, profileNames, onOpenProposal }) {
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
   const [bulkLookbackWeeks, setBulkLookbackWeeks] = useState(13);
@@ -4904,8 +5038,31 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
   const [assigningId, setAssigningId] = useState(null);
   const [selectedIds, setSelectedIds] = useState(() => new Set()); // for bulk actions (e.g. Create Versions)
   const [viewMode, setViewMode] = useState("grid"); // grid | list
+  const [visibleCols, setVisibleCols] = useState(() => {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem("tandom:planogramListColumns") || "null");
+      if (Array.isArray(saved)) return saved.filter((id) => PLANOGRAM_LIST_COLUMNS.some((c) => c.id === id));
+    } catch (e) { /* storage unavailable: use defaults */ }
+    return PLANOGRAM_LIST_COLUMNS.filter((c) => c.defaultOn).map((c) => c.id);
+  });
+  const [showColumnMenu, setShowColumnMenu] = useState(false);
+  const [bulkField, setBulkField] = useState("category");
+  const [bulkValue, setBulkValue] = useState("");
 
   const categories = Array.from(new Set(planograms.map((p) => p.category).filter(Boolean))).sort();
+  const toggleColumn = (id) => setVisibleCols((prev) => {
+    const next = prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id];
+    try { window.localStorage.setItem("tandom:planogramListColumns", JSON.stringify(next)); } catch (e) { /* ignore */ }
+    return next;
+  });
+  const applyBulk = () => {
+    const col = PLANOGRAM_LIST_COLUMNS.find((c) => c.id === bulkField);
+    if (!col || !col.editable || !onUpdate) return;
+    const value = bulkValue.trim();
+    if (col.id === "name") return;
+    planograms.filter((p) => selectedIds.has(p.id)).forEach((p) => onUpdate({ ...p, [col.id]: value }));
+    setBulkValue("");
+  };
 
   if (creating) return <NewPlanogramForm existingCategories={categories} onCancel={() => setCreating(false)} onCreate={(p) => { onCreate(p); setCreating(false); onOpen(p.id); }} />;
 
@@ -4928,13 +5085,15 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
     .filter((p) => !dateFrom || (p.eventDate && p.eventDate >= dateFrom))
     .filter((p) => !dateTo || (p.eventDate && p.eventDate <= dateTo))
     .sort((a, b) => {
-      if (sortBy === "eventDate") return (a.eventDate || "9999-99-99").localeCompare(b.eventDate || "9999-99-99");
-      if (sortBy === "category") return (a.category || "").localeCompare(b.category || "") || a.name.localeCompare(b.name);
+      // names compare case-insensitively and with numbers in numeric order, so "8FT" comes before "12FT"
+      const byName = (a.name || "").localeCompare(b.name || "", undefined, { numeric: true, sensitivity: "base" });
+      if (sortBy === "eventDate") return (a.eventDate || "9999-99-99").localeCompare(b.eventDate || "9999-99-99") || byName;
+      if (sortBy === "category") return (a.category || "").localeCompare(b.category || "") || byName;
       if (sortBy === "status") {
         const order = PLANOGRAM_STATUSES.indexOf(effectivePlanogramStatus(a)) - PLANOGRAM_STATUSES.indexOf(effectivePlanogramStatus(b));
-        return order || a.name.localeCompare(b.name);
+        return order || byName;
       }
-      return a.name.localeCompare(b.name);
+      return byName;
     });
 
   const selectedCount = selectedIds.size;
@@ -4991,7 +5150,7 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
               List
             </button>
           </div>
-          <button className={btnGhost} onClick={() => setImporting(true)}><Upload size={14} /> Import from ProSpace</button>
+          <button className={btnGhost} onClick={() => setImporting(true)}><Upload size={14} /> Import .psa file</button>
           <button className={btnPrimary} onClick={() => setCreating(true)}><Plus size={14} /> New Planogram</button>
         </div>
       </div>
@@ -5104,6 +5263,23 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
               </button>
             </>
           )}
+          {onUpdate && (
+            <div className="flex items-center gap-1.5 border-l border-amber-200 pl-3">
+              <span className="text-xs text-amber-800">Set</span>
+              <select className="text-xs border border-slate-300 rounded-md px-1.5 py-1 bg-white" value={bulkField} onChange={(e) => { setBulkField(e.target.value); setBulkValue(""); }}>
+                {PLANOGRAM_LIST_COLUMNS.filter((c) => c.editable && c.id !== "name").map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+              </select>
+              <input
+                type={bulkField === "eventDate" ? "date" : "text"}
+                className="text-xs border border-slate-300 rounded-md px-1.5 py-1 bg-white w-32"
+                value={bulkValue}
+                onChange={(e) => setBulkValue(e.target.value)}
+                placeholder="blank clears it"
+                list={bulkField === "category" ? "planogram-category-options" : undefined}
+              />
+              <button className={btnGhost} onClick={applyBulk} title={`Set ${PLANOGRAM_LIST_COLUMNS.find((c) => c.id === bulkField)?.label} on all ${selectedCount} selected`}><Check size={13} /> Apply</button>
+            </div>
+          )}
           <button className="text-xs text-slate-500 hover:underline ml-auto" onClick={() => setSelectedIds(new Set())}>Clear selection</button>
         </div>
       )}
@@ -5124,46 +5300,104 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
           No planograms match your search or filters.
         </div>
       ) : viewMode === "list" ? (
-        <div className="bg-white border border-slate-200 rounded-lg divide-y divide-slate-100">
-          {familyGroups.map((members) => (
-            <div key={members[0].id}>
-              {members.map((p, idx) => (
-                <div key={p.id}>
-                  <div
-                    className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer transition-colors ${selectedIds.has(p.id) ? "bg-amber-50" : "hover:bg-slate-50"}`}
-                    style={{ paddingLeft: idx > 0 ? 40 : 12 }}
-                    onClick={() => onOpen(p.id)}
-                  >
-                    <input
-                      type="checkbox"
-                      className="accent-amber-500 w-3.5 h-3.5 shrink-0"
-                      checked={selectedIds.has(p.id)}
-                      onClick={(e) => e.stopPropagation()}
-                      onChange={() => toggleSelected(p.id)}
-                    />
-                    {idx > 0 && <span className="text-slate-300 text-xs shrink-0">↳</span>}
-                    <span className="font-medium text-sm text-slate-800 truncate" style={{ maxWidth: 260 }}>{p.name}</span>
-                    {p.masterId && <span className="text-[10px] font-mono font-semibold text-slate-400 border border-slate-200 rounded px-1 shrink-0">v{p.versionNumber || 1}</span>}
-                    <PlanogramStatusBadge status={effectivePlanogramStatus(p)} className="shrink-0" />
-                    {p.resetDraft && !p.resetDraft.reviewed && <span className="text-[10px] font-semibold uppercase tracking-wide rounded-full px-2 py-0.5 shrink-0 bg-blue-50 text-blue-700 border border-blue-200 flex items-center gap-1"><Sparkles size={10} /> AI Draft Ready</span>}
-                    {p.category && <span className="text-[10px] font-semibold uppercase tracking-wide rounded-full px-2 py-0.5 shrink-0" style={{ background: hashColor(p.category) + "33", color: hashColor(p.category) }}>{p.category}</span>}
-                    {p.eventDate && <span className="text-xs text-slate-400 flex items-center gap-1 shrink-0"><CalendarDays size={11} /> {p.eventDate}</span>}
-                    <span className="text-xs text-slate-400 shrink-0">{(p.storeIds || []).length} store{(p.storeIds || []).length !== 1 ? "s" : ""}</span>
-                    <div className="ml-auto flex items-center gap-2.5 shrink-0">
-                      <button
-                        title="Create a new version of this planogram, linked back to its master"
-                        className="text-xs text-slate-500 font-medium hover:underline flex items-center gap-1"
-                        onClick={(e) => { e.stopPropagation(); onCreateVersion(p); }}
-                      >
-                        <Copy size={11} /> Version
-                      </button>
-                      <button className="text-xs text-red-500 font-medium hover:underline" onClick={(e) => { e.stopPropagation(); onDelete(p.id); }}>Delete</button>
-                    </div>
-                  </div>
+        <div>
+          <datalist id="planogram-category-options">{categories.map((c) => <option key={c} value={c} />)}</datalist>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs text-slate-400">{onUpdate ? "Click a cell to edit it. Changes save as you go." : ""}</span>
+            <div className="relative">
+              <button className={btnGhost} onClick={() => setShowColumnMenu((v) => !v)}><Settings2 size={13} /> Columns</button>
+              {showColumnMenu && (
+                <div className="absolute right-0 z-30 mt-1 w-48 bg-white border border-slate-200 rounded-lg shadow-lg p-2" onClick={(e) => e.stopPropagation()}>
+                  {PLANOGRAM_LIST_COLUMNS.map((c) => (
+                    <label key={c.id} className={`flex items-center gap-2 text-xs px-1.5 py-1 rounded ${c.locked ? "text-slate-400" : "text-slate-700 hover:bg-slate-50 cursor-pointer"}`}>
+                      <input type="checkbox" className="accent-amber-500" disabled={c.locked} checked={c.locked || visibleCols.includes(c.id)} onChange={() => toggleColumn(c.id)} />
+                      {c.label}
+                    </label>
+                  ))}
+                  <button className="text-xs text-slate-500 hover:underline mt-1 px-1.5" onClick={() => setShowColumnMenu(false)}>Done</button>
                 </div>
-              ))}
+              )}
             </div>
-          ))}
+          </div>
+          <div className="bg-white border border-slate-200 rounded-lg">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-slate-200 bg-slate-50 text-left">
+                  <th className="w-8 px-3 py-2"></th>
+                  {PLANOGRAM_LIST_COLUMNS.filter((c) => c.locked || visibleCols.includes(c.id)).map((c) => (
+                    <th key={c.id} className="px-2 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">{c.label}</th>
+                  ))}
+                  <th className="px-2 py-2"></th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {familyGroups.flatMap((members) => members.map((p, idx) => {
+                  const cell = (c) => {
+                    const cellInput = "w-full bg-transparent border border-transparent hover:border-slate-300 focus:border-amber-400 focus:bg-white rounded px-1.5 py-1 text-xs text-slate-800 outline-none";
+                    if (c.id === "name") {
+                      return (
+                        <div className="flex items-center gap-1.5" style={{ paddingLeft: idx > 0 ? 20 : 0 }}>
+                          {idx > 0 && <span className="text-slate-300 shrink-0">↳</span>}
+                          {onUpdate
+                            ? <DebouncedTextInput className={cellInput + " font-medium min-w-[160px]"} value={p.name} onCommit={(name) => { if (name.trim() && name !== p.name) onUpdate({ ...p, name: name.trim() }); }} />
+                            : <span className="font-medium text-slate-800">{p.name}</span>}
+                          {p.masterId && <span className="text-[10px] font-mono font-semibold text-slate-400 border border-slate-200 rounded px-1 shrink-0">v{p.versionNumber || 1}</span>}
+                          {p.resetDraft && !p.resetDraft.reviewed && <span className="text-[10px] font-semibold uppercase tracking-wide rounded-full px-1.5 py-0.5 shrink-0 bg-blue-50 text-blue-700 border border-blue-200 flex items-center gap-1"><Sparkles size={10} /> AI Draft</span>}
+                        </div>
+                      );
+                    }
+                    if (c.id === "status") return <PlanogramStatusBadge status={effectivePlanogramStatus(p)} />;
+                    if (c.id === "sections") return <span className="text-slate-500">{p.sections.length}</span>;
+                    if (c.id === "dims") return <span className="text-slate-500 font-mono">{p.dims.w}×{p.dims.h}×{p.dims.d}</span>;
+                    if (c.id === "stores") {
+                      const n = (p.storeIds || []).length;
+                      return (
+                        <div className="relative">
+                          <button
+                            onClick={() => setAssigningId(assigningId === p.id ? null : p.id)}
+                            className={`text-xs font-medium flex items-center gap-1 rounded-full px-2 py-0.5 border whitespace-nowrap ${n > 0 ? "border-emerald-300 bg-emerald-50 text-emerald-700" : "border-slate-300 text-slate-500 hover:bg-slate-50"}`}
+                          >
+                            <Store size={11} /> {n} store{n !== 1 ? "s" : ""}
+                          </button>
+                          {assigningId === p.id && (
+                            <StoreAssignmentPopover
+                              stores={stores}
+                              selectedIds={p.storeIds || []}
+                              onToggle={(storeId) => {
+                                const current = p.storeIds || [];
+                                onAssignStores(p.id, current.includes(storeId) ? current.filter((id) => id !== storeId) : [...current, storeId]);
+                              }}
+                              onClose={() => setAssigningId(null)}
+                            />
+                          )}
+                        </div>
+                      );
+                    }
+                    if (!onUpdate) return <span className="text-slate-600">{p[c.id] || ""}</span>;
+                    if (c.type === "date") {
+                      return <input type="date" className={cellInput + " w-32"} value={p[c.id] || ""} onChange={(e) => onUpdate({ ...p, [c.id]: e.target.value })} />;
+                    }
+                    return <DebouncedTextInput className={cellInput + " min-w-[100px]"} value={p[c.id] || ""} onCommit={(v) => { if ((p[c.id] || "") !== v.trim()) onUpdate({ ...p, [c.id]: v.trim() }); }} />;
+                  };
+                  return (
+                    <tr key={p.id} className={selectedIds.has(p.id) ? "bg-amber-50" : "hover:bg-slate-50"}>
+                      <td className="px-3 py-1.5">
+                        <input type="checkbox" className="accent-amber-500 w-3.5 h-3.5" checked={selectedIds.has(p.id)} onChange={() => toggleSelected(p.id)} />
+                      </td>
+                      {PLANOGRAM_LIST_COLUMNS.filter((c) => c.locked || visibleCols.includes(c.id)).map((c) => (
+                        <td key={c.id} className="px-1.5 py-1.5 align-middle">{cell(c)}</td>
+                      ))}
+                      <td className="px-2 py-1.5 whitespace-nowrap text-right">
+                        <button className="text-xs text-amber-700 font-semibold hover:underline mr-2.5" onClick={() => onOpen(p.id)}>Open</button>
+                        <button title="Create a new version of this planogram, linked back to its master" className="text-xs text-slate-500 font-medium hover:underline mr-2.5" onClick={() => onCreateVersion(p)}>Version</button>
+                        <button className="text-xs text-red-500 font-medium hover:underline" onClick={() => onDelete(p.id)}>Delete</button>
+                      </td>
+                    </tr>
+                  );
+                }))}
+              </tbody>
+            </table>
+          </div>
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
@@ -9877,6 +10111,7 @@ const PHOTO_PURPOSES = [
 // Tasks are stored on the store entity, the same way photos and issues already are here.
 function TaskManagementView({ store, taskTypes, onAddTask, onUpdateTask, onDeleteTask, onUpdateTaskTypes }) {
   const [showAdd, setShowAdd] = useState(false);
+  const [editingId, setEditingId] = useState(null); // task being edited in the shared form, or null when adding
   const [taskType, setTaskType] = useState(taskTypes[0]?.id || "");
   const [description, setDescription] = useState("");
   const [dueDate, setDueDate] = useState("");
@@ -9888,13 +10123,29 @@ function TaskManagementView({ store, taskTypes, onAddTask, onUpdateTask, onDelet
 
   const cancelAdd = () => {
     setShowAdd(false);
+    setEditingId(null);
     setTaskType(taskTypes[0]?.id || "");
     setDescription("");
     setDueDate("");
   };
 
+  const startEdit = (task) => {
+    setEditingId(task.id);
+    setTaskType(task.type || taskTypes[0]?.id || "");
+    setDescription(task.description || "");
+    setDueDate(task.dueDate || "");
+    setShowAdd(true);
+    try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch (e) { /* ignore */ }
+  };
+
   const submitAdd = () => {
     if (!description.trim()) return;
+    if (editingId) {
+      const existing = (store.tasks || []).find((t) => t.id === editingId);
+      if (existing) onUpdateTask(store.id, { ...existing, type: taskType, description: description.trim(), dueDate });
+      cancelAdd();
+      return;
+    }
     onAddTask(store.id, {
       id: uid("task"),
       type: taskType,
@@ -9921,16 +10172,18 @@ function TaskManagementView({ store, taskTypes, onAddTask, onUpdateTask, onDelet
         <h2 className="text-lg font-bold text-slate-800">Task Management</h2>
         <div className="flex items-center gap-2">
           <button className={btnGhost} onClick={() => setManagingTypes(true)}><Settings2 size={14} /> Manage Types</button>
-          <button className={btnPrimary} onClick={() => setShowAdd((s) => !s)}><Plus size={14} /> Add Task</button>
+          <button className={btnPrimary} onClick={() => { if (showAdd) cancelAdd(); else setShowAdd(true); }}><Plus size={14} /> Add Task</button>
         </div>
       </div>
       <p className="text-sm text-slate-500 mb-4">Day-to-day operational tasks for {store.name}.</p>
 
       {showAdd && (
         <div className="bg-white border border-slate-200 rounded-lg p-4 mb-4 space-y-3">
+          {editingId && <div className="text-xs font-semibold text-amber-700">Editing task</div>}
           <div className="grid grid-cols-2 gap-3">
             <Field label="Task Type">
               <select className={inputCls} value={taskType} onChange={(e) => setTaskType(e.target.value)}>
+                {taskType && !taskTypes.some((t) => t.id === taskType) && <option value={taskType}>{taskType === "reset_followup" ? "Reset Follow-up" : taskType}</option>}
                 {taskTypes.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
               </select>
             </Field>
@@ -9949,7 +10202,7 @@ function TaskManagementView({ store, taskTypes, onAddTask, onUpdateTask, onDelet
           </Field>
           <div className="flex justify-end gap-2">
             <button className={btnGhost} onClick={cancelAdd}>Cancel</button>
-            <button className={btnPrimary} disabled={!description.trim()} onClick={submitAdd}>Add Task</button>
+            <button className={btnPrimary} disabled={!description.trim()} onClick={submitAdd}>{editingId ? "Save Changes" : "Add Task"}</button>
           </div>
         </div>
       )}
@@ -9987,6 +10240,7 @@ function TaskManagementView({ store, taskTypes, onAddTask, onUpdateTask, onDelet
                 </div>
                 <p className={`text-sm mt-1 ${task.status === "completed" ? "line-through text-slate-400" : "text-slate-800"}`}>{task.description}</p>
               </div>
+              <button className="text-xs text-slate-600 font-medium hover:underline shrink-0" onClick={() => startEdit(task)}>Edit</button>
               <button className="text-xs text-red-500 font-medium hover:underline shrink-0" onClick={() => onDeleteTask(store.id, task.id)}>Delete</button>
             </div>
           ))}
@@ -12237,6 +12491,7 @@ function AppContent({ session }) {
             onCreate={createPlanogram}
             onOpen={setActivePlanogramId}
             onDelete={deletePlanogramEntity}
+            onUpdate={updatePlanogramEntity}
             onAssignStores={assignStoresToPlanogram}
             onCreateVersion={(source) => { const v = createPlanogramVersion(source); setActivePlanogramId(v.id); }}
             onCreateVersions={createPlanogramVersionsBulk}
