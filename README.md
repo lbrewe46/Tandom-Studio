@@ -241,10 +241,10 @@ You can't change your own role and the last Admin can't be demoted. Not included
 A chat assistant (Edge Function `ask-tandom`): planners get an **Ask Tandom** button at the bottom right; store associates get an **Ask Tandom** item in the Store Assistant menu. It answers from your data (where products go, what changes in a reset, tasks, issues, case packs, the help guide) and can mark a store task open/completed after the person confirms. See `supabase/functions/README.md` for setup (`ANTHROPIC_API_KEY` repository secret, then re-run `schema.sql`).
 When a planogram is open (in the editor, or a store's execution guide) the chat is told which one, so "this planogram" works; a planogram outside the user's scope is ignored.
 
-## Reset Impact and Execution Follow-up (agents)
+## Reset Impact and Execution Monitoring (agents)
 
 - **Reset Impact tab** (Admin / Category Manager): sales before vs after a version went Live, summarized by Region, Store, Category, Department, Cluster, Store format or Planogram, for Sales $, Units, Margin $ or Sales per linear foot, each shown raw and against similar stores that did not reset. The outcome also appears on the planogram's Activity panel (including for approved AI proposals).
-- **Execution tab:** *Check stores* previews stores past due or stuck in Partially Completed; confirming adds a "Reset Follow-up" task to each store's Task Management and escalates stores overdue beyond a set number of days to a list for the Category Manager.
+- **Execution Monitoring tab:** *Check stores* previews stores past due or stuck in Partially Completed; confirming adds a "Reset Follow-up" task to each store's Task Management and escalates stores overdue beyond a set number of days to a list for the Category Manager.
 - Needs the latest `schema.sql` (two new tables) and the two new Edge Functions (`reset-impact`, `execution-followup`); see `supabase/functions/README.md`.
 
 
@@ -254,7 +254,7 @@ Performance Data accepts an Excel file (.xlsx/.xls), a CSV, or a **Google Sheet 
 
 ## Assortment (new items and SKU rationalization)
 
-The **Assortment** tab (Admins and Category Managers) has four views: Segments (growth and space by shopper-decision attribute), Slow movers, New items (template import from Excel/CSV/Google Sheet or manual entry; items go into the product library as Pending) and Recommendations (which planograms each new item should go on, and what to remove).
+The **Assortment Planner** module (top-bar switcher, between Event Planner and Space Planner; Admins and Category Managers) has four views: Segments (growth and space by shopper-decision attribute), Slow movers, New items (template import from Excel/CSV/Google Sheet or manual entry; items go into the product library as Pending) and Recommendations (which planograms each new item should go on, and what to remove).
 
 - The analysis runs in the browser from data already loaded. **Draft changes for review** calls the new `draft-assortment` Edge Function, which re-runs the same engine (`supabase/functions/_shared/assortment.js`) on the server and files proposals under the `assortment-agent`, so they appear in the existing AI Draft Review Queue.
 - Admin steps: re-run `supabase/schema.sql` (adds the `assortment-agent` row), then let the GitHub Action deploy `draft-assortment` (and `fetch-sheet` if not yet deployed).

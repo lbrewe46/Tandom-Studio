@@ -301,14 +301,14 @@ const HELP_SECTIONS = [
     id: "assortment",
     title: "Assortment",
     blocks: [
-      { type: "p", text: "The **Assortment** tab (Admins and Category Managers) helps you decide which new items earn shelf space, and what comes out to make room. Choose a **Category**, who to **look at** (all stores, a region, a store cluster, a format or one store), the **Period** and what to **compare with**." },
+      { type: "p", text: "The **Assortment Planner** (Admins and Category Managers; switch to it from the buttons at the top, between Event Planner and Space Planner) helps you decide which new items earn shelf space, and what comes out to make room. Choose a **Category**, who to **look at** (all stores, a region, a store cluster, a format or one store), the **Period** and what to **compare with**." },
       { type: "ul", items: [
         "**Segments:** list the product attributes in the order a shopper decides at the shelf (for cereal: Age group, then Sugar level, then Brand). The table splits the category that way and shows each segment's sales, share of sales, share of shelf space, space index (over 100 earns more than the room it takes), growth, and which segment holds the most space.",
         "**Slow movers:** every item ranked slowest first by units per store per week, with the bottom quarter flagged. Compare across regions, clusters, formats or stores to see where an item is slow in most places versus just one.",
         "**New items:** import what the category manager sent (Excel, CSV or a Google Sheet link; download the template first) or add items by hand. Each is added to the product library as Pending. Give it a forecast, or pick similar items and say how much it sells compared with them. It also needs its size, and a price (or a similar item's price).",
         "**Recommendations:** for each new item, every planogram in the category is checked. It goes into free space if there is any; otherwise the slowest items are removed, but only if the new item is expected to beat what is given up, and never so many that a segment loses all its variety. Untick a planogram to leave an item off it, lock an item to protect it, then press **Draft changes for review**.",
-        "Drafts land in the **AI Draft Review Queue** on the Planograms tab like any other draft. Approving one builds a new Work-in-Progress version; live planograms are not touched.",
-        "Growth needs sales history for both periods, so load at least twice the period's weeks on the Performance tab. Set each store's **Cluster** on the Stores tab to look at clusters.",
+        "Drafts land in the **AI Draft Review Queue** on the Space Planner's Planograms tab like any other draft (the Review link takes you there). Approving one builds a new Work-in-Progress version; live planograms are not touched.",
+        "Growth needs sales history for both periods, so load at least twice the period's weeks on the Performance Load tab. Set each store's **Cluster** on the Stores tab to look at clusters.",
       ] },
     ],
   },
@@ -339,9 +339,9 @@ const HELP_SECTIONS = [
   },
   {
     id: "executionFollowup",
-    title: "Execution Follow-up",
+    title: "Execution Monitoring",
     blocks: [
-      { type: "p", text: "The **Execution** tab (Admins and Category Managers) finds stores whose reset is **past its due date** (the planogram's Event Date) or **stuck in Partially Completed**. **Check stores** previews what would happen; nothing is sent until you confirm." },
+      { type: "p", text: "The **Execution Monitoring** tab (Admins and Category Managers) finds stores whose reset is **past its due date** (the planogram's Event Date) or **stuck in Partially Completed**. **Check stores** previews what would happen; nothing is sent until you confirm." },
       { type: "ul", items: [
         "Each late store gets one **Reset Follow-up** reminder in its Task Management list. A store is never sent a second reminder while the first is open.",
         "A store that is overdue (or stuck) by the **Escalate after** number of days is escalated to the Category Manager and listed under Escalations, flagged as a repeat when it was escalated before in the last 90 days.",
@@ -509,9 +509,9 @@ const HELP_SECTIONS = [
   },
   {
     id: "performance",
-    title: "Performance",
+    title: "Performance Load",
     blocks: [
-      { type: "p", text: "The Performance tab imports per-product, per-store sales data (its own Excel template and upload, matched by SKU or UPC) and feeds the sales, margin, and unit-profit figures used by Tandom's analysis tools." },
+      { type: "p", text: "The Performance Load tab imports per-product, per-store sales data (its own Excel template and upload, matched by SKU or UPC) and feeds the sales, margin, and unit-profit figures used by Tandom's analysis tools." },
     ],
   },
   {

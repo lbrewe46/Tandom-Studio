@@ -1748,6 +1748,14 @@ function getProductColumnValue(p, columnId, schema) {
   return String(v);
 }
 
+// Per-browser view preferences. Storage can be blocked or empty, so every access is guarded and falls back.
+function readLocalJSON(key, fallback) {
+  try { const raw = window.localStorage.getItem(key); return raw === null ? fallback : JSON.parse(raw); } catch (e) { return fallback; }
+}
+function writeLocalJSON(key, value) {
+  try { window.localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* ignore */ }
+}
+
 function ProductColumnsPopover({ schema, visibleColumns, onToggle, onReorder, onClose }) {
   const availableColumns = [...PRODUCT_LIST_BASE_COLUMNS.map((c) => c.id), ...schema.map((f) => f.id)].filter((id) => !visibleColumns.includes(id));
   return (
@@ -1812,6 +1820,7 @@ function ProductColumnsPopover({ schema, visibleColumns, onToggle, onReorder, on
 function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLookup, onCreate, onUpdate, onDelete, isAdmin }) {
   const [editing, setEditing] = useState(null); // null | "new" | product
   const [listEditError, setListEditError] = useState("");
+  const [listEditNonce, setListEditNonce] = useState(0);
   const [importStatus, setImportStatus] = useState(null); // {type:'ok'|'error', message}
   const [importing, setImporting] = useState(false);
   const [importProgress, setImportProgress] = useState(null); // {current, total}
@@ -1821,11 +1830,22 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
   const [matchingWeb, setMatchingWeb] = useState(false);
   const [webMatchProgress, setWebMatchProgress] = useState(null);
   const [webMatchStatus, setWebMatchStatus] = useState(null);
-  const [viewMode, setViewMode] = useState("grid"); // grid | list
-  const [visibleColumns, setVisibleColumns] = useState(DEFAULT_PRODUCT_LIST_COLUMNS);
+  // The view, the chosen columns (and their order) and the column widths are remembered per browser, so they
+  // survive moving to another screen and back.
+  const [viewMode, setViewMode] = useState(() => readLocalJSON("tandom:productListView", "grid")); // grid | list
+  const [visibleColumns, setVisibleColumns] = useState(() => { const v = readLocalJSON("tandom:productListColumns", null); return Array.isArray(v) ? v : DEFAULT_PRODUCT_LIST_COLUMNS; });
+  useEffect(() => { writeLocalJSON("tandom:productListView", viewMode); }, [viewMode]);
+  useEffect(() => { writeLocalJSON("tandom:productListColumns", visibleColumns); }, [visibleColumns]);
+  // an attribute that has since been deleted from Settings is dropped from the saved columns
+  useEffect(() => {
+    if (!schema || schema.length === 0) return;
+    const known = new Set([...PRODUCT_LIST_BASE_COLUMNS.map((c) => c.id), ...schema.map((f) => f.id)]);
+    setVisibleColumns((prev) => (prev.every((id) => known.has(id)) ? prev : prev.filter((id) => known.has(id))));
+  }, [schema]);
   const [columnsPickerOpen, setColumnsPickerOpen] = useState(false);
   const toggleColumn = (colId) => setVisibleColumns((prev) => (prev.includes(colId) ? prev.filter((c) => c !== colId) : [...prev, colId]));
-  const [columnWidths, setColumnWidths] = useState({}); // colId -> px; falls back to a default when unset
+  const [columnWidths, setColumnWidths] = useState(() => { const v = readLocalJSON("tandom:productListWidths", {}); return v && typeof v === "object" && !Array.isArray(v) ? v : {}; }); // colId -> px; falls back to a default when unset
+  useEffect(() => { writeLocalJSON("tandom:productListWidths", columnWidths); }, [columnWidths]);
   const resizingRef = useRef(null);
   const [query, setQuery] = useState("");
   const [pendingOnly, setPendingOnly] = useState(false);
@@ -2303,11 +2323,12 @@ function ProductLibrary({ schema, products, primaryKeyField, imageRepo, upcLooku
                     const keyTaken = (candidate) => {
                       const next = colId === "sku" ? { ...p, sku: candidate } : { ...p, attributes: { ...(p.attributes || {}), [colId]: candidate } };
                       const k = getPrimaryKeyValue(next, schema, primaryKeyField);
+                      if (k === getPrimaryKeyValue(p, schema, primaryKeyField)) return false; // this edit doesn't change the matching key
                       return !!k && products.some((o) => o.id !== p.id && getPrimaryKeyValue(o, schema, primaryKeyField) === k);
                     };
-                    const refuse = (what) => setListEditError(`${what} is already used by another product, so it wasn't changed.`);
+                    const refuse = (what) => { setListEditError(`${what} is already used by another product, so it wasn't changed.`); setListEditNonce((n) => n + 1); }; // the nonce re-mounts the cells so they show the stored value again
                     return (
-                      <td key={colId} className="px-1.5 py-1 overflow-hidden" title={getProductColumnValue(p, colId, schema)}>
+                      <td key={`${colId}-${listEditNonce}`} className="px-1.5 py-1 overflow-hidden" title={getProductColumnValue(p, colId, schema)}>
                         {colId === "name" ? (
                           <DebouncedTextInput className={cellCls + " font-medium"} value={p.name} onCommit={(v) => { if (v.trim() && v.trim() !== p.name) onUpdate({ ...p, name: v.trim() }); }} />
                         ) : colId === "sku" ? (
@@ -3819,7 +3840,7 @@ function PerformanceModule({ products, performance, stores, productSchema, prima
   return (
     <div>
       <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
-        <h2 className="text-lg font-bold text-slate-800">Performance Data</h2>
+        <h2 className="text-lg font-bold text-slate-800">Performance Load</h2>
         <div className="flex items-center gap-2">
           <div className="relative">
             <button className={btnGhost} onClick={() => setShowTemplateMenu((v) => !v)}><Download size={14} /> Download Template <ChevronDown size={12} /></button>
@@ -4006,14 +4027,14 @@ const HELP_SECTIONS = [
     id: "assortment",
     title: "Assortment",
     blocks: [
-      { type: "p", text: "The **Assortment** tab (Admins and Category Managers) helps you decide which new items earn shelf space, and what comes out to make room. Choose a **Category**, who to **look at** (all stores, a region, a store cluster, a format or one store), the **Period** and what to **compare with**." },
+      { type: "p", text: "The **Assortment Planner** (Admins and Category Managers; switch to it from the buttons at the top, between Event Planner and Space Planner) helps you decide which new items earn shelf space, and what comes out to make room. Choose a **Category**, who to **look at** (all stores, a region, a store cluster, a format or one store), the **Period** and what to **compare with**." },
       { type: "ul", items: [
         "**Segments:** list the product attributes in the order a shopper decides at the shelf (for cereal: Age group, then Sugar level, then Brand). The table splits the category that way and shows each segment's sales, share of sales, share of shelf space, space index (over 100 earns more than the room it takes), growth, and which segment holds the most space.",
         "**Slow movers:** every item ranked slowest first by units per store per week, with the bottom quarter flagged. Compare across regions, clusters, formats or stores to see where an item is slow in most places versus just one.",
         "**New items:** import what the category manager sent (Excel, CSV or a Google Sheet link; download the template first) or add items by hand. Each is added to the product library as Pending. Give it a forecast, or pick similar items and say how much it sells compared with them. It also needs its size, and a price (or a similar item's price).",
         "**Recommendations:** for each new item, every planogram in the category is checked. It goes into free space if there is any; otherwise the slowest items are removed, but only if the new item is expected to beat what is given up, and never so many that a segment loses all its variety. Untick a planogram to leave an item off it, lock an item to protect it, then press **Draft changes for review**.",
-        "Drafts land in the **AI Draft Review Queue** on the Planograms tab like any other draft. Approving one builds a new Work-in-Progress version; live planograms are not touched.",
-        "Growth needs sales history for both periods, so load at least twice the period's weeks on the Performance tab. Set each store's **Cluster** on the Stores tab to look at clusters.",
+        "Drafts land in the **AI Draft Review Queue** on the Space Planner's Planograms tab like any other draft (the Review link takes you there). Approving one builds a new Work-in-Progress version; live planograms are not touched.",
+        "Growth needs sales history for both periods, so load at least twice the period's weeks on the Performance Load tab. Set each store's **Cluster** on the Stores tab to look at clusters.",
       ] },
     ],
   },
@@ -4044,9 +4065,9 @@ const HELP_SECTIONS = [
   },
   {
     id: "executionFollowup",
-    title: "Execution Follow-up",
+    title: "Execution Monitoring",
     blocks: [
-      { type: "p", text: "The **Execution** tab (Admins and Category Managers) finds stores whose reset is **past its due date** (the planogram's Event Date) or **stuck in Partially Completed**. **Check stores** previews what would happen; nothing is sent until you confirm." },
+      { type: "p", text: "The **Execution Monitoring** tab (Admins and Category Managers) finds stores whose reset is **past its due date** (the planogram's Event Date) or **stuck in Partially Completed**. **Check stores** previews what would happen; nothing is sent until you confirm." },
       { type: "ul", items: [
         "Each late store gets one **Reset Follow-up** reminder in its Task Management list. A store is never sent a second reminder while the first is open.",
         "A store that is overdue (or stuck) by the **Escalate after** number of days is escalated to the Category Manager and listed under Escalations, flagged as a repeat when it was escalated before in the last 90 days.",
@@ -4214,9 +4235,9 @@ const HELP_SECTIONS = [
   },
   {
     id: "performance",
-    title: "Performance",
+    title: "Performance Load",
     blocks: [
-      { type: "p", text: "The Performance tab imports per-product, per-store sales data (its own Excel template and upload, matched by SKU or UPC) and feeds the sales, margin, and unit-profit figures used by Tandom's analysis tools." },
+      { type: "p", text: "The Performance Load tab imports per-product, per-store sales data (its own Excel template and upload, matched by SKU or UPC) and feeds the sales, margin, and unit-profit figures used by Tandom's analysis tools." },
     ],
   },
   {
@@ -9925,6 +9946,34 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
 /* else here — no new backend table needed for this phase.              */
 /* ------------------------------------------------------------------ */
 
+// The top-level modules, in the order they are offered. Assortment Planner is for Admins and Category Managers.
+const APP_MODES = [
+  { id: "eventPlanner", label: "Event Planner", icon: CalendarDays },
+  { id: "assortment", label: "Assortment Planner", icon: Grid3x3, plannerOnly: true },
+  { id: "planner", label: "Space Planner", icon: Layers },
+  { id: "storeAssistant", label: "Store Assistant", icon: Store },
+];
+function ModeSwitcher({ current, onSwitch, canAssort }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      {APP_MODES.filter((m) => !m.plannerOnly || canAssort).map((m) => {
+        const Icon = m.icon;
+        const on = m.id === current;
+        return (
+          <button
+            key={m.id}
+            onClick={() => { if (!on) onSwitch(m.id); }}
+            aria-current={on ? "page" : undefined}
+            className={`text-xs flex items-center gap-1.5 rounded-full px-3 py-1.5 border ${on ? "bg-amber-500 border-amber-500 text-slate-900 font-semibold" : "bg-slate-800 hover:bg-slate-700 border-slate-700 text-white"}`}
+          >
+            <Icon size={13} /> {m.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function StoreSelectorScreen({ stores, onSelectStore, onExitToPlanner, onSignOut }) {
   const [query, setQuery] = useState("");
   const filtered = stores.filter((s) => (s.name + " " + (s.storeNumber || "")).toLowerCase().includes(query.toLowerCase()));
@@ -10902,7 +10951,7 @@ const STORE_ASSISTANT_NAV = [
   { id: "askTandom", label: "Ask Tandom", icon: Sparkles },
 ];
 
-function StoreAssistantModule({ isRegional, lockedStore, onSignOut, stores, planograms, products, fixtures, selectedStoreId, onSelectStore, onExitToPlanner, onSetExecutionStatus, onCompleteExecution, onMarkReviewed, onToggleItemCheck, onAddIssue, onAddPhoto, onDeletePhoto, onAddTask, onUpdateTask, onDeleteTask, onTaskSynced, taskTypes, onUpdateTaskTypes }) {
+function StoreAssistantModule({ onSwitchMode, canAssort, isRegional, lockedStore, onSignOut, stores, planograms, products, fixtures, selectedStoreId, onSelectStore, onExitToPlanner, onSetExecutionStatus, onCompleteExecution, onMarkReviewed, onToggleItemCheck, onAddIssue, onAddPhoto, onDeletePhoto, onAddTask, onUpdateTask, onDeleteTask, onTaskSynced, taskTypes, onUpdateTaskTypes }) {
   const [section, setSection] = useState("myActivities");
   const store = stores.find((s) => s.id === selectedStoreId);
 
@@ -10938,7 +10987,7 @@ function StoreAssistantModule({ isRegional, lockedStore, onSignOut, stores, plan
               <RefreshCw size={11} /> Switch store
             </button>
           )}
-          {onExitToPlanner && (
+          {onSwitchMode ? <ModeSwitcher current="storeAssistant" onSwitch={onSwitchMode} canAssort={canAssort} /> : onExitToPlanner && (
             <button onClick={onExitToPlanner} className="text-xs text-slate-400 hover:text-white flex items-center gap-1">
               <LogOut size={11} /> Exit to Tandom Studio
             </button>
@@ -11146,7 +11195,7 @@ function EventForm({ event, eventTypes, planograms, onSave, onCancel, onDelete }
   );
 }
 
-function EventPlannerModule({ onSignOut, events, eventTypes, planograms, onCreateEvent, onUpdateEvent, onDeleteEvent, onUpdateEventTypes, onExitToPlanner }) {
+function EventPlannerModule({ onSwitchMode, canAssort, onSignOut, events, eventTypes, planograms, onCreateEvent, onUpdateEvent, onDeleteEvent, onUpdateEventTypes, onExitToPlanner }) {
   const today = new Date();
   const [viewMonth, setViewMonth] = useState(today.getMonth()); // 0-11
   const [viewYear, setViewYear] = useState(today.getFullYear());
@@ -11220,7 +11269,7 @@ function EventPlannerModule({ onSignOut, events, eventTypes, planograms, onCreat
           >
             <Plus size={13} /> New Event
           </button>
-          {onExitToPlanner && (
+          {onSwitchMode ? <ModeSwitcher current="eventPlanner" onSwitch={onSwitchMode} canAssort={canAssort} /> : onExitToPlanner && (
             <button
               onClick={onExitToPlanner}
               className="text-xs flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 rounded-full px-3 py-1.5 border border-slate-700"
@@ -11770,7 +11819,7 @@ function ExecutionFollowupModule({ onEscalationsChanged, onStoresChanged }) {
   return (
     <div>
       <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
-        <h2 className="text-lg font-bold text-slate-800">Execution Follow-up</h2>
+        <h2 className="text-lg font-bold text-slate-800">Execution Monitoring</h2>
         <div className="flex items-center gap-2 flex-wrap">
           <label className="text-xs text-slate-500 flex items-center gap-1" title="A store left in Partially Completed longer than this is treated as stuck">Stuck after
             <input type="number" min={1} max={60} className={inputCls + " w-16"} value={stuckDays} onChange={(e) => setStuckDays(Math.max(1, Math.min(60, parseInt(e.target.value, 10) || 3)))} /> days</label>
@@ -13448,7 +13497,7 @@ function AppContent({ session }) {
   }
 
   // each role lands on its own screen; restricted roles can't reach the others
-  const effectiveMode = isStoreScoped ? "storeAssistant" : isEventPlanner ? "eventPlanner" : appMode;
+  const effectiveMode = isStoreScoped ? "storeAssistant" : isEventPlanner ? "eventPlanner" : appMode === "assortment" && !isPlanner ? "planner" : appMode;
   const effectiveStoreId = userRole === "store_associate" ? profile.store_id : selectedStoreId;
 
   if (effectiveMode === "storeAssistant") {
@@ -13464,6 +13513,8 @@ function AppContent({ session }) {
         selectedStoreId={effectiveStoreId}
         onSelectStore={setSelectedStoreId}
         onExitToPlanner={isRestricted ? undefined : () => setAppMode("planner")}
+        onSwitchMode={isRestricted ? undefined : setAppMode}
+        canAssort={isPlanner}
         onSetExecutionStatus={setPlanogramExecutionStatus}
         onCompleteExecution={completeStoreExecution}
         onMarkReviewed={markPlanogramReviewed}
@@ -13493,7 +13544,40 @@ function AppContent({ session }) {
         onDeleteEvent={deleteEvent}
         onUpdateEventTypes={updateEventTypes}
         onExitToPlanner={isRestricted ? undefined : () => setAppMode("planner")}
+        onSwitchMode={isRestricted ? undefined : setAppMode}
+        canAssort={isPlanner}
       />
+    );
+  }
+
+  if (effectiveMode === "assortment") {
+    return (
+      <div className="min-h-screen bg-slate-100 text-slate-800" style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
+        <div className="bg-slate-900 text-white px-6 py-3.5 flex items-center gap-3 flex-wrap">
+          <div className="w-7 h-7 rounded bg-amber-500 flex items-center justify-center text-slate-900 font-black text-sm">T</div>
+          <span className="font-bold tracking-tight">Tandom Studio</span>
+          <span className={`text-xs flex items-center gap-1.5 ${pendingSaveCount > 0 ? "text-amber-300" : "text-slate-500"}`}>
+            {pendingSaveCount > 0 ? <><RefreshCw size={12} className="animate-spin" /> Saving…</> : <><Check size={12} /> All changes saved</>}
+          </span>
+          <div className="ml-auto flex items-center gap-3 flex-wrap">
+            <ModeSwitcher current="assortment" onSwitch={setAppMode} canAssort={isPlanner} />
+            {session?.user?.email && (
+              <span className="text-xs text-slate-400 flex items-center gap-2 border-l border-slate-700 pl-3">
+                {session.user.email}
+                <button onClick={() => supabase.auth.signOut()} className="flex items-center gap-1 text-slate-300 hover:text-white" title="Sign out"><LogOut size={12} /> Sign out</button>
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="p-6 max-w-[1400px] mx-auto">
+          <AssortmentModule
+            products={products} planograms={planograms} fixtures={fixtures} stores={stores} performance={performance}
+            productSchema={productSchema} storeSchema={storeSchema} planogramSchema={planogramSchema} primaryKeyField={primaryKeyField}
+            onCreateProduct={createProduct} onUpdateProduct={updateProductEntity} onDeleteProduct={deleteProductEntity}
+            onOpenProposal={(id) => { setAppMode("planner"); setTab("planograms"); setReviewingProposalId(id); }} onDrafted={refreshProposals}
+          />
+        </div>
+      </div>
     );
   }
 
@@ -13531,18 +13615,7 @@ function AppContent({ session }) {
               <AlertTriangle size={12} /> {openIssueCount} open issue{openIssueCount !== 1 ? "s" : ""}
             </button>
           )}
-          <button
-            onClick={() => setAppMode("eventPlanner")}
-            className="text-xs flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 rounded-full px-3 py-1.5 border border-slate-700"
-          >
-            <CalendarDays size={13} /> Event Planner
-          </button>
-          <button
-            onClick={() => setAppMode("storeAssistant")}
-            className="text-xs flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 rounded-full px-3 py-1.5 border border-slate-700"
-          >
-            <Store size={13} /> Store Assistant
-          </button>
+          <ModeSwitcher current="planner" onSwitch={setAppMode} canAssort={isPlanner} />
           {session?.user?.email && (
             <span className="text-xs text-slate-400 flex items-center gap-2 border-l border-slate-700 pl-3">
               {session.user.email}
@@ -13564,12 +13637,11 @@ function AppContent({ session }) {
           <TabButton active={tab === "products"} onClick={() => setTab("products")} icon={Package}>Products</TabButton>
           <TabButton active={tab === "fixtures"} onClick={() => setTab("fixtures")} icon={Boxes}>Fixtures</TabButton>
           <TabButton active={tab === "stores"} onClick={() => setTab("stores")} icon={Store}>Stores</TabButton>
-          <TabButton active={tab === "performance"} onClick={() => setTab("performance")} icon={TrendingUp}>Performance</TabButton>
+          <TabButton active={tab === "performance"} onClick={() => setTab("performance")} icon={TrendingUp}>Performance Load</TabButton>
           <TabButton active={tab === "analysis"} onClick={() => setTab("analysis")} icon={BarChart3}>Analysis</TabButton>
-          <TabButton active={tab === "storeFeedback"} onClick={() => setTab("storeFeedback")} icon={AlertTriangle}>Store Feedback</TabButton>
-          {isPlanner && <TabButton active={tab === "assortment"} onClick={() => setTab("assortment")} icon={Grid3x3}>Assortment</TabButton>}
           {isPlanner && <TabButton active={tab === "resetImpact"} onClick={() => setTab("resetImpact")} icon={TrendingUp}>Reset Impact</TabButton>}
-          {isPlanner && <TabButton active={tab === "execution"} onClick={() => setTab("execution")} icon={Mail} badge={openEscalations}>Execution</TabButton>}
+          <TabButton active={tab === "storeFeedback"} onClick={() => setTab("storeFeedback")} icon={AlertTriangle}>Store Feedback</TabButton>
+          {isPlanner && <TabButton active={tab === "execution"} onClick={() => setTab("execution")} icon={Mail} badge={openEscalations}>Execution Monitoring</TabButton>}
           <TabButton active={tab === "schema"} onClick={() => setTab("schema")} icon={Settings2}>Settings</TabButton>
           <TabButton active={tab === "help"} onClick={() => setTab("help")} icon={HelpCircle}>Help</TabButton>
         </div>
@@ -13679,13 +13751,6 @@ function AppContent({ session }) {
             stores={stores}
             performance={performance}
             productSchema={productSchema}
-          />
-        ) : tab === "assortment" && isPlanner ? (
-          <AssortmentModule
-            products={products} planograms={planograms} fixtures={fixtures} stores={stores} performance={performance}
-            productSchema={productSchema} storeSchema={storeSchema} planogramSchema={planogramSchema} primaryKeyField={primaryKeyField}
-            onCreateProduct={createProduct} onUpdateProduct={updateProductEntity} onDeleteProduct={deleteProductEntity}
-            onOpenProposal={setReviewingProposalId} onDrafted={refreshProposals}
           />
         ) : tab === "resetImpact" && isPlanner ? (
           <ResetImpactModule planograms={planograms} stores={stores} storeSchema={storeSchema} planogramSchema={planogramSchema} />
