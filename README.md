@@ -251,3 +251,13 @@ When a planogram is open (in the editor, or a store's execution guide) the chat 
 ## Performance import from a Google Sheet
 
 Performance Data accepts an Excel file (.xlsx/.xls), a CSV, or a **Google Sheet link** (button "From Google Sheet"). The sheet uses the same columns as the template and must be shared as **Anyone with the link → Viewer**; the tab in the link (`gid=`) is the one read. Private sheets can't be read, and the app says how to share them. The link is read by the `fetch-sheet` Edge Function (Admin and Category Manager only; deploy it with the other functions, no `schema.sql` change); nothing from the sheet is stored except the imported weekly rows.
+
+## Assortment (new items and SKU rationalization)
+
+The **Assortment** tab (Admins and Category Managers) has four views: Segments (growth and space by shopper-decision attribute), Slow movers, New items (template import from Excel/CSV/Google Sheet or manual entry; items go into the product library as Pending) and Recommendations (which planograms each new item should go on, and what to remove).
+
+- The analysis runs in the browser from data already loaded. **Draft changes for review** calls the new `draft-assortment` Edge Function, which re-runs the same engine (`supabase/functions/_shared/assortment.js`) on the server and files proposals under the `assortment-agent`, so they appear in the existing AI Draft Review Queue.
+- Admin steps: re-run `supabase/schema.sql` (adds the `assortment-agent` row), then let the GitHub Action deploy `draft-assortment` (and `fetch-sheet` if not yet deployed).
+- Stores have a new optional **Cluster** field (Stores tab) used for the cluster scope.
+- Products need Category plus the attributes you want to segment by. Growth needs sales history for at least twice the chosen period.
+- Tests: `node scripts/test-assortment.mjs`, `node scripts/test-draft-assortment.mjs` (both are part of `npm run test:edge`).

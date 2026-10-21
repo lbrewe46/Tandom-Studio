@@ -312,6 +312,12 @@ values ('reset-drafting-agent', 'Reset Drafting Agent',
 on conflict (id) do nothing;
 
 insert into agents (id, name, description, allowed_target_types)
+values ('assortment-agent', 'Assortment Agent',
+        'Places new items on the planograms where they earn the most, trading out the slowest items when a shelf is full, and drafts those changes for review.',
+        array['planogram_version'])
+on conflict (id) do nothing;
+
+insert into agents (id, name, description, allowed_target_types)
 values ('ask-tandom', 'Ask Tandom',
         'Answers store and planner questions about planograms, resets, tasks and products; can mark a store task open/completed after the person confirms.',
         array['store_task'])

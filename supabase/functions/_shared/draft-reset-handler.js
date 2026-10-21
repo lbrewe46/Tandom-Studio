@@ -60,12 +60,12 @@ function summarize(r) {
 // `results` in place: a draft that couldn't be recorded becomes a failure (its proposal is the
 // audit trail), while a failed activity write is only logged — the Proposal itself is the record
 // of record and review_proposal() writes its own activity rows.
-async function recordProposals(db, results, requestedBy) {
+export async function recordProposals(db, results, requestedBy, agentId = AGENT_ID) {
   const drafted = results.filter((r) => r.ok);
   if (drafted.length === 0) return;
   const rows = drafted.map((r) => ({
-    agent_id: AGENT_ID, target_type: TARGET_TYPE, target_id: r.planogramId,
-    proposed_change: r.result, reason: summarize(r), score: r.score, status: "pending", requested_by: requestedBy,
+    agent_id: agentId, target_type: TARGET_TYPE, target_id: r.planogramId,
+    proposed_change: r.result, reason: r.reason || summarize(r), score: r.score, status: "pending", requested_by: requestedBy,
   }));
   let data, error;
   try { ({ data, error } = await db.from("proposals").insert(rows).select("id, target_id")); }
@@ -81,7 +81,7 @@ async function recordProposals(db, results, requestedBy) {
   try {
     const { error: logError } = await db.from("activity_log").insert(
       drafted.map((r) => ({
-        actor_type: "agent", actor_id: AGENT_ID, action: "proposal_created", target_type: TARGET_TYPE, target_id: r.planogramId,
+        actor_type: "agent", actor_id: agentId, action: "proposal_created", target_type: TARGET_TYPE, target_id: r.planogramId,
         detail: { proposalId: r.proposalId, score: r.score, changes: r.result.changes.length, skipped: r.result.skipped.length, lookbackWeeks: r.result.lookbackWeeks, requestedBy },
       })),
     );

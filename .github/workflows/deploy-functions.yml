@@ -37,6 +37,7 @@ jobs:
       - run: supabase functions deploy execution-followup --project-ref "$SUPABASE_PROJECT_ID"
       - run: supabase functions deploy manage-users --project-ref "$SUPABASE_PROJECT_ID"
       - run: supabase functions deploy fetch-sheet --project-ref "$SUPABASE_PROJECT_ID"
+      - run: supabase functions deploy draft-assortment --project-ref "$SUPABASE_PROJECT_ID"
       - name: Set the Ask Tandom model API key (only if the repository secret exists)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

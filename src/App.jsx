@@ -13,6 +13,7 @@ import {
   loadPendingProposals, reviewProposal, loadProfileNames, loadActivity, loadProposal, applyProposal, invokeEdgeFunction,
   loadResetImpacts, loadEscalations, resolveEscalation,
 } from "./lib/db.js";
+import { buildContext, segmentTree, slowMovers, forecastFor, recommend, scopeOptions, DEFAULT_ASSUMPTIONS } from "../supabase/functions/_shared/assortment.js";
 
 /* ------------------------------------------------------------------ */
 /* Constants & helpers                                                 */
@@ -133,11 +134,13 @@ function getPlacedProductIds(planogram) {
 }
 
 // New Items = Get Inventory, Deleted Items = Remove from Shelf & Markdown, Keep Items = no
-// change needed. Comparing against the predecessor's placements — if there is no predecessor
-// (this is the very first version), everything currently placed counts as New.
+// change needed. Comparing against the predecessor's placements. With no predecessor (the first
+// planogram for a space) there is nothing to compare, so all three lists are empty and callers
+// show a "first planogram, no comparison available" notice instead of calling everything New.
 function computeItemChanges(planogram, predecessor, products) {
+  if (!predecessor) return { newItems: [], deletedItems: [], keepItems: [] };
   const currentIds = getPlacedProductIds(planogram);
-  const previousIds = predecessor ? getPlacedProductIds(predecessor) : new Set();
+  const previousIds = getPlacedProductIds(predecessor);
   const toProducts = (ids) => [...ids].map((id) => products.find((p) => p.id === id)).filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
   return {
     newItems: toProducts([...currentIds].filter((id) => !previousIds.has(id))),
@@ -2464,6 +2467,7 @@ function StoreForm({ initial, onSave, onCancel }) {
   const [storeNumber, setStoreNumber] = useState(initial?.storeNumber || "");
   const [address, setAddress] = useState(initial?.address || "");
   const [region, setRegion] = useState(initial?.region || "");
+  const [cluster, setCluster] = useState(initial?.cluster || "");
   const [format, setFormat] = useState(initial?.format || STORE_FORMATS[0]);
   const [squareFootage, setSquareFootage] = useState(initial?.squareFootage || "");
   const [status, setStatus] = useState(initial ? storeEffectiveStatus(initial) : "Live");
@@ -2476,6 +2480,7 @@ function StoreForm({ initial, onSave, onCancel }) {
       storeNumber: storeNumber.trim(),
       address: address.trim(),
       region: region.trim(),
+      cluster: cluster.trim(),
       format,
       squareFootage: Number(squareFootage) || 0,
       status,
@@ -2489,8 +2494,11 @@ function StoreForm({ initial, onSave, onCancel }) {
         <Field label="Store Number"><input className={inputCls} value={storeNumber} onChange={(e) => setStoreNumber(e.target.value)} placeholder="e.g. 4821" /></Field>
       </div>
       <Field label="Address"><input className={inputCls} value={address} onChange={(e) => setAddress(e.target.value)} /></Field>
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-2 gap-3">
         <Field label="Region"><input className={inputCls} value={region} onChange={(e) => setRegion(e.target.value)} placeholder="e.g. Midwest" /></Field>
+        <Field label="Cluster"><input className={inputCls} value={cluster} onChange={(e) => setCluster(e.target.value)} placeholder="e.g. Urban Large" /></Field>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
         <Field label="Format">
           <select className={inputCls} value={format} onChange={(e) => setFormat(e.target.value)}>
             {STORE_FORMATS.map((f) => <option key={f} value={f}>{f}</option>)}
@@ -2537,7 +2545,7 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
   const q = query.trim().toLowerCase();
   const statusFiltered = statusFilter === "All" ? stores : stores.filter((s) => storeEffectiveStatus(s) === statusFilter);
   const filtered = !q ? statusFiltered : statusFiltered.filter((s) =>
-    [s.name, s.storeNumber, s.address, s.region, s.format].filter(Boolean).join(" ").toLowerCase().includes(q)
+    [s.name, s.storeNumber, s.address, s.region, s.cluster, s.format].filter(Boolean).join(" ").toLowerCase().includes(q)
   );
   const statusCounts = {};
   stores.forEach((s) => { const st = storeEffectiveStatus(s); statusCounts[st] = (statusCounts[st] || 0) + 1; });
@@ -2673,6 +2681,13 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
 /* Store assignment — multi-select popover used in the planogram list  */
 /* and editor to associate a planogram with one or more stores         */
 /* ------------------------------------------------------------------ */
+
+// A planogram's assigned stores that still exist, without duplicates. storeIds can hold ids of stores that were
+// deleted or re-created, and those can't be seen or unchecked in the picker, so counts and edits use this list.
+function validStoreIds(planogram, stores) {
+  const known = new Set((stores || []).map((x) => x.id));
+  return Array.from(new Set(planogram.storeIds || [])).filter((id) => known.has(id));
+}
 
 function StoreAssignmentPopover({ stores, selectedIds, onToggle, onClose }) {
   const [query, setQuery] = useState("");
@@ -3808,6 +3823,21 @@ const HELP_SECTIONS = [
       { type: "p", text: "Tandom Studio is an enterprise retail space-planning platform, used several ways. A separate **Event Planner** module coordinates resets, promos, and campaigns across the calendar that drives all planning and execution for merchandising planograms." },
       { type: "p", text: "Once Events are planned, Space Planners can create planograms that can be store-specific or cluster planograms, then publish to **Store Assistant** so store associates can track and execute a reset once it reaches their store." },
       { type: "p", text: "This guide walks through every screen, roughly in the order you'd use them. Use the search box on the left to jump straight to a topic." },
+    ],
+  },
+  {
+    id: "assortment",
+    title: "Assortment",
+    blocks: [
+      { type: "p", text: "The **Assortment** tab (Admins and Category Managers) helps you decide which new items earn shelf space, and what comes out to make room. Choose a **Category**, who to **look at** (all stores, a region, a store cluster, a format or one store), the **Period** and what to **compare with**." },
+      { type: "ul", items: [
+        "**Segments:** list the product attributes in the order a shopper decides at the shelf (for cereal: Age group, then Sugar level, then Brand). The table splits the category that way and shows each segment's sales, share of sales, share of shelf space, space index (over 100 earns more than the room it takes), growth, and which segment holds the most space.",
+        "**Slow movers:** every item ranked slowest first by units per store per week, with the bottom quarter flagged. Compare across regions, clusters, formats or stores to see where an item is slow in most places versus just one.",
+        "**New items:** import what the category manager sent (Excel, CSV or a Google Sheet link; download the template first) or add items by hand. Each is added to the product library as Pending. Give it a forecast, or pick similar items and say how much it sells compared with them. It also needs its size, and a price (or a similar item's price).",
+        "**Recommendations:** for each new item, every planogram in the category is checked. It goes into free space if there is any; otherwise the slowest items are removed, but only if the new item is expected to beat what is given up, and never so many that a segment loses all its variety. Untick a planogram to leave an item off it, lock an item to protect it, then press **Draft changes for review**.",
+        "Drafts land in the **AI Draft Review Queue** on the Planograms tab like any other draft. Approving one builds a new Work-in-Progress version; live planograms are not touched.",
+        "Growth needs sales history for both periods, so load at least twice the period's weeks on the Performance tab. Set each store's **Cluster** on the Stores tab to look at clusters.",
+      ] },
     ],
   },
   {
@@ -5024,6 +5054,11 @@ const PLANOGRAM_LIST_COLUMNS = [
   { id: "dims", label: "Size (in)", defaultOn: false },
 ];
 
+// Store name A→Z (case-insensitive, numbers in numeric order), then planogram name — for follow-up lists.
+const byStoreThenPlanogram = (storeKey, planogramKey) => (a, b) =>
+  String(a[storeKey] || "").localeCompare(String(b[storeKey] || ""), undefined, { numeric: true, sensitivity: "base" })
+  || String(a[planogramKey] || "").localeCompare(String(b[planogramKey] || ""), undefined, { numeric: true, sensitivity: "base" });
+
 function PlanogramList({ planograms, stores, products, fixtures, productSchema, onCreate, onOpen, onDelete, onUpdate, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace, onDraftResetBulk, draftingReset, proposals, profileNames, onOpenProposal }) {
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -5350,7 +5385,7 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
                     if (c.id === "sections") return <span className="text-slate-500">{p.sections.length}</span>;
                     if (c.id === "dims") return <span className="text-slate-500 font-mono">{p.dims.w}×{p.dims.h}×{p.dims.d}</span>;
                     if (c.id === "stores") {
-                      const n = (p.storeIds || []).length;
+                      const n = validStoreIds(p, stores).length;
                       return (
                         <div className="relative">
                           <button
@@ -5362,9 +5397,9 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
                           {assigningId === p.id && (
                             <StoreAssignmentPopover
                               stores={stores}
-                              selectedIds={p.storeIds || []}
+                              selectedIds={validStoreIds(p, stores)}
                               onToggle={(storeId) => {
-                                const current = p.storeIds || [];
+                                const current = validStoreIds(p, stores);
                                 onAssignStores(p.id, current.includes(storeId) ? current.filter((id) => id !== storeId) : [...current, storeId]);
                               }}
                               onClose={() => setAssigningId(null)}
@@ -5433,9 +5468,9 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
               <div className="flex items-center justify-between mt-2">
                 <button
                   onClick={(e) => { e.stopPropagation(); setAssigningId(assigningId === p.id ? null : p.id); }}
-                  className={`text-xs font-medium flex items-center gap-1 rounded-full px-2 py-0.5 border ${(p.storeIds || []).length > 0 ? "border-emerald-300 bg-emerald-50 text-emerald-700" : "border-slate-300 text-slate-500 hover:bg-slate-50"}`}
+                  className={`text-xs font-medium flex items-center gap-1 rounded-full px-2 py-0.5 border ${validStoreIds(p, stores).length > 0 ? "border-emerald-300 bg-emerald-50 text-emerald-700" : "border-slate-300 text-slate-500 hover:bg-slate-50"}`}
                 >
-                  <Store size={11} /> {(p.storeIds || []).length > 0 ? `${p.storeIds.length} store${p.storeIds.length !== 1 ? "s" : ""}` : "Assign stores"}
+                  <Store size={11} /> {validStoreIds(p, stores).length > 0 ? `${validStoreIds(p, stores).length} store${validStoreIds(p, stores).length !== 1 ? "s" : ""}` : "Assign stores"}
                 </button>
                 <div className="flex items-center gap-2.5">
                   <button
@@ -5451,9 +5486,9 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
               {assigningId === p.id && (
                 <StoreAssignmentPopover
                   stores={stores}
-                  selectedIds={p.storeIds || []}
+                  selectedIds={validStoreIds(p, stores)}
                   onToggle={(storeId) => {
-                    const current = p.storeIds || [];
+                    const current = validStoreIds(p, stores);
                     const next = current.includes(storeId) ? current.filter((id) => id !== storeId) : [...current, storeId];
                     onAssignStores(p.id, next);
                   }}
@@ -6004,8 +6039,15 @@ function PlanogramExecutionGuide({ planogram, products, fixtures, allPlanograms,
       {isItemChanges ? (
         <div className="space-y-3 mb-4">
           {!predecessor && (
-            <p className="text-xs text-slate-400 italic">No previous version to compare against — every placed item is shown as New.</p>
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+              <div className="text-sm font-semibold text-blue-800 mb-1">First planogram for this space</div>
+              <p className="text-sm text-blue-700">
+                There's no previous version, so no comparison details are available — there are no New, Deleted or Keep items to list.
+                Use the next steps to set up the whole planogram, {sections.length} section{sections.length !== 1 ? "s" : ""} in all.
+              </p>
+            </div>
           )}
+          {predecessor && (<>
           <div className="bg-white border border-slate-200 rounded-lg p-4">
             <div className="text-xs font-semibold text-emerald-700 uppercase tracking-wide mb-2 flex items-center gap-1.5"><Plus size={13} /> New Items — Get Inventory</div>
             {newItems.length === 0 ? <p className="text-xs text-slate-400 italic">No new items in this reset.</p> : newItems.map((p) => <CheckableProductRow key={p.id} product={p} />)}
@@ -6022,6 +6064,7 @@ function PlanogramExecutionGuide({ planogram, products, fixtures, allPlanograms,
               </div>
             )}
           </div>
+          </>)}
         </div>
       ) : isOverview ? (
         <div className="bg-white border border-slate-200 rounded-lg p-4 overflow-x-auto mb-4">
@@ -8049,7 +8092,7 @@ function buildResetDraftQueue(planograms, proposals) {
     });
   const linked = new Set(planograms.map((p) => p.resetDraft?.proposalId).filter(Boolean));
   const fresh = pendingRows
-    .filter((r) => r.agent_id === "reset-drafting-agent" && r.target_type === "planogram_version" && !linked.has(r.id))
+    .filter((r) => (r.agent_id === "reset-drafting-agent" || r.agent_id === "assortment-agent") && r.target_type === "planogram_version" && !linked.has(r.id))
     .map((r) => ({ kind: "proposal", planogram: planograms.find((p) => p.id === r.target_id), proposal: r, score: r.score ?? 100 }))
     .filter((item) => item.planogram); // its source planogram was deleted: nothing left to review against
   return [...drafts, ...fresh].sort((a, b) => a.score - b.score);
@@ -8354,7 +8397,7 @@ function DosTargetsEditor({ planograms, dosTargets, onChange }) {
 }
 
 // Names for agent actors in the Activity log (agents aren't users, so they have no profile row).
-const AGENT_DISPLAY_NAMES = { "reset-drafting-agent": "Reset Drafting Agent", "reset-impact-agent": "Reset Impact Agent", "execution-followup-agent": "Execution Follow-up Agent" };
+const AGENT_DISPLAY_NAMES = { "reset-drafting-agent": "Reset Drafting Agent", "assortment-agent": "Assortment Agent", "reset-impact-agent": "Reset Impact Agent", "execution-followup-agent": "Execution Follow-up Agent" };
 
 // One Activity row -> a sentence a person can read. Unknown actions still render (as the raw
 // action name) so a newer agent's entries don't vanish from an older build of the app.
@@ -9172,16 +9215,16 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
               <label className={labelCls}>Stores</label>
               <button
                 onClick={() => setAssigningStores((s) => !s)}
-                className={`text-xs font-medium flex items-center gap-1.5 rounded-md px-2.5 py-1.5 border ${(planogram.storeIds || []).length > 0 ? "border-emerald-300 bg-emerald-50 text-emerald-700" : "border-slate-300 text-slate-600 hover:bg-slate-50"}`}
+                className={`text-xs font-medium flex items-center gap-1.5 rounded-md px-2.5 py-1.5 border ${validStoreIds(planogram, stores).length > 0 ? "border-emerald-300 bg-emerald-50 text-emerald-700" : "border-slate-300 text-slate-600 hover:bg-slate-50"}`}
               >
-                <Store size={13} /> {(planogram.storeIds || []).length > 0 ? `${planogram.storeIds.length} assigned` : "Assign"}
+                <Store size={13} /> {validStoreIds(planogram, stores).length > 0 ? `${validStoreIds(planogram, stores).length} assigned` : "Assign"}
               </button>
               {assigningStores && (
                 <StoreAssignmentPopover
                   stores={stores}
-                  selectedIds={planogram.storeIds || []}
+                  selectedIds={validStoreIds(planogram, stores)}
                   onToggle={(storeId) => {
-                    const current = planogram.storeIds || [];
+                    const current = validStoreIds(planogram, stores);
                     const next = current.includes(storeId) ? current.filter((id) => id !== storeId) : [...current, storeId];
                     onAssignStores(next);
                   }}
@@ -9308,7 +9351,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
               <div className="text-sm text-slate-500 mt-1.5 flex items-center gap-4 flex-wrap">
                 <span className="font-mono">{planogram.dims.w}×{planogram.dims.h}×{planogram.dims.d} in · base {planogram.base}in</span>
                 {planogram.eventDate && <span className="flex items-center gap-1.5"><CalendarDays size={13} /> {planogram.eventDate}</span>}
-                {(planogram.storeIds || []).length > 0 && (
+                {validStoreIds(planogram, stores).length > 0 && (
                   <span className="flex items-center gap-1.5"><Store size={13} /> {stores.filter((s) => planogram.storeIds.includes(s.id)).map((s) => s.name).join(", ")}</span>
                 )}
               </div>
@@ -11496,7 +11539,7 @@ function ExecutionFollowupModule({ onEscalationsChanged, onStoresChanged }) {
     catch (e) { setMessage({ type: "error", text: e?.message || "Couldn't resolve it." }); }
   };
 
-  const open = esc.rows.filter((r) => r.status === "open");
+  const open = esc.rows.filter((r) => r.status === "open").sort(byStoreThenPlanogram("store_name", "planogram_name"));
   const recent = esc.rows.filter((r) => r.status === "resolved").slice(0, 10);
   const willRemind = plan ? new Set(plan.reminders.map((r) => `${r.planogramId}|${r.storeId}`)) : new Set();
   const willEscalate = plan ? new Set(plan.escalations.map((r) => `${r.planogramId}|${r.storeId}`)) : new Set();
@@ -11535,7 +11578,7 @@ function ExecutionFollowupModule({ onEscalationsChanged, onStoresChanged }) {
             <table className="text-xs w-full">
               <thead><tr className="text-left text-slate-400 uppercase tracking-wide"><th className="py-1 pr-3 font-semibold">Store</th><th className="py-1 pr-3 font-semibold">Planogram</th><th className="py-1 pr-3 font-semibold">Problem</th><th className="py-1 pr-3 font-semibold text-right">Days</th><th className="py-1 font-semibold">Will</th></tr></thead>
               <tbody className="divide-y divide-slate-100">
-                {plan.findings.map((f) => {
+                {plan.findings.slice().sort(byStoreThenPlanogram("storeName", "planogramName")).map((f) => {
                   const k = `${f.planogramId}|${f.storeId}`;
                   return (
                     <tr key={k}>
@@ -11614,7 +11657,7 @@ function RegionalEscalationsView() {
     try { await resolveEscalation(row.id, "Resolved by the regional manager"); setError(""); await load(); }
     catch (e) { setError(e?.message || "Couldn't resolve it."); }
   };
-  const open = state.rows.filter((r) => r.status === "open");
+  const open = state.rows.filter((r) => r.status === "open").sort(byStoreThenPlanogram("store_name", "planogram_name"));
   return (
     <div>
       <h2 className="text-lg font-bold text-slate-800 mb-1">Escalations</h2>
@@ -11634,6 +11677,823 @@ function RegionalEscalationsView() {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Assortment: segments, slow movers, new items, SKU rationalization    */
+/* (the calculations live in supabase/functions/_shared/assortment.js)  */
+/* ------------------------------------------------------------------ */
+
+const ASSORT_DEFAULT_CFG = { category: "", segmentFieldIds: [], scope: { type: "all", value: "" }, weeks: 13, compare: "prior", groupBy: "region", assumptions: { ...DEFAULT_ASSUMPTIONS } };
+const moneyA = (n) => (n === null || n === undefined || !Number.isFinite(n) ? "—" : `${n < 0 ? "-" : ""}$${Math.abs(Math.round(n)).toLocaleString()}`);
+const money2A = (n) => (n === null || n === undefined || !Number.isFinite(n) ? "—" : `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`);
+const growthA = (g) => (g === null || g === undefined ? "—" : `${g >= 0 ? "+" : ""}${(g * 100).toFixed(1)}%`);
+const pctA = (x) => (x === null || x === undefined ? "—" : `${(x * 100).toFixed(1)}%`);
+const growthCls = (g) => (g === null || g === undefined ? "text-slate-400" : g >= 0.02 ? "text-emerald-600" : g <= -0.02 ? "text-red-600" : "text-slate-500");
+
+const NEW_ITEM_HEADERS = ["Product Name", "UPC", "Category", "Width (in)", "Height (in)", "Depth (in)", "Retail Price", "Unit Cost", "Weekly Units per Store (forecast)", "Similar Item UPC(s)", "Similar Item Sales %", "Launch Date"];
+
+function downloadNewItemTemplate(schema, format) {
+  const attrCols = (schema || []).map((f) => f.label).filter((l) => !["upc", "category"].includes(l.trim().toLowerCase()));
+  const headers = [...NEW_ITEM_HEADERS, ...attrCols];
+  const ws = XLSX.utils.aoa_to_sheet([headers]);
+  ws["!cols"] = headers.map((h) => ({ wch: Math.max(14, h.length + 2) }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "New Items");
+  const notes = [
+    ["Field", "Notes"],
+    ["Product Name", "Required."],
+    ["UPC", "Used to recognise the item later (and to match its Performance data once it sells)."],
+    ["Category", "The category it belongs in, as named on your planograms (e.g. Cereal)."],
+    ["Width / Height / Depth (in)", "Needed to check it fits on a shelf. Items without a size are listed but not placed."],
+    ["Retail Price / Unit Cost", "Used to value the forecast. Optional if you name a similar item (its price and cost are used)."],
+    ["Weekly Units per Store (forecast)", "Expected units per store per week. Leave blank to use a similar item instead."],
+    ["Similar Item UPC(s)", "UPC (or exact name) of one or more existing items that should sell like this one; separate several with a comma."],
+    ["Similar Item Sales %", "How the new item compares to the similar item(s): 100 = the same, 80 = four-fifths as much."],
+    ["Launch Date", "YYYY-MM-DD, optional."],
+    [],
+    ["Attribute columns", `Any column named like one of your product attributes (${attrCols.slice(0, 6).join(", ") || "none set up yet"}) fills that attribute. Those are what the Segments view groups by.`],
+  ];
+  if (format === "csv") {
+    const blob = new Blob([XLSX.utils.sheet_to_csv(ws)], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "new_items_template.csv";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return;
+  }
+  const ws2 = XLSX.utils.aoa_to_sheet(notes);
+  ws2["!cols"] = [{ wch: 32 }, { wch: 90 }];
+  XLSX.utils.book_append_sheet(wb, ws2, "Instructions");
+  XLSX.writeFile(wb, format === "xls" ? "new_items_template.xls" : "new_items_template.xlsx", format === "xls" ? { bookType: "biff8" } : undefined);
+}
+
+// Reads a new-item sheet. Items already in the library as new items are updated; established library items are
+// left alone. Nothing is saved here: the caller creates/updates the returned products.
+function parseNewItemWorkbook(file, products, schema, primaryKeyField) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const isCsv = /\.csv$/i.test(file.name || "");
+        const wb = XLSX.read(new Uint8Array(e.target.result), { type: "array", cellDates: true, raw: isCsv });
+        const sheetName = wb.SheetNames.find((n) => /new items?/i.test(n)) || wb.SheetNames[0];
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { defval: "" });
+        const norm = (h) => String(h).trim().toLowerCase();
+        const upcField = (schema || []).find((f) => norm(f.label) === "upc");
+        const catField = (schema || []).find((f) => norm(f.label) === "category");
+        const attrFields = (schema || []).filter((f) => f !== upcField && f !== catField);
+        const upcOf = (p) => (getAttrByLabel(p, schema, ["upc"]) || p.sku || "").trim().toLowerCase();
+        const byUpc = {}, byName = {};
+        (products || []).forEach((p) => { const u = upcOf(p); if (u) byUpc[u] = p; byName[p.name.trim().toLowerCase()] = p; });
+        const created = [], updated = [], skipped = [], warnings = [];
+        const taken = {}; // upc/name -> product made earlier in this same file, so a repeated row updates instead of duplicating
+        const num = (v) => { const n = Number(String(v).replace(/[$,]/g, "")); return Number.isFinite(n) && String(v).trim() !== "" ? n : null; };
+        rows.forEach((raw, i) => {
+          const r = {};
+          Object.keys(raw).forEach((k) => { r[norm(k)] = raw[k]; });
+          const pick = (...keys) => { for (const k of keys) if (r[k] !== undefined && String(r[k]).trim() !== "") return r[k]; return ""; };
+          const name = String(pick("product name", "name", "item", "description")).trim();
+          const upc = String(pick("upc", "upc/ean", "gtin")).trim();
+          if (!name) { if (Object.values(raw).some((v) => String(v).trim())) skipped.push({ row: i + 2, reason: "No product name" }); return; }
+          const existing = (upc && (taken[upc.toLowerCase()] || byUpc[upc.toLowerCase()])) || taken[name.toLowerCase()] || byName[name.toLowerCase()];
+          if (existing && !existing.newItem) { skipped.push({ row: i + 2, reason: `${name} is already an established item in the product library` }); return; }
+          const w = num(pick("width (in)", "width")), h = num(pick("height (in)", "height")), d = num(pick("depth (in)", "depth"));
+          const category = String(pick("category")).trim();
+          const proxyIds = [];
+          String(pick("similar item upc(s)", "similar item upc", "similar items", "similar item")).split(/[,;|]/).map((x) => x.trim().toLowerCase()).filter(Boolean).forEach((key) => {
+            const hit = byUpc[key] || byName[key];
+            if (hit && hit.id) proxyIds.push(hit.id); else warnings.push(`Row ${i + 2}: similar item "${key}" isn't in the library, so it was left off ${name}.`);
+          });
+          const scalePct = num(pick("similar item sales %", "similar item scale %", "similar item scale"));
+          const info = {
+            source: "category_manager", category,
+            launchDate: toISODate(pick("launch date")) || "",
+            retailPrice: num(pick("retail price", "price")) ?? 0,
+            unitCost: num(pick("unit cost", "cost")) ?? 0,
+            forecastUnitsPerStoreWeek: num(pick("weekly units per store (forecast)", "forecast", "weekly units per store")) ?? 0,
+            proxyProductIds: proxyIds,
+            proxyScale: scalePct && scalePct > 0 ? scalePct / 100 : 1,
+          };
+          const attributes = { ...(existing?.attributes || {}) };
+          if (upcField && upc) attributes[upcField.id] = upc;
+          if (catField && category) attributes[catField.id] = category;
+          attrFields.forEach((f) => { const v = r[norm(f.label)]; if (v !== undefined && String(v).trim() !== "") attributes[f.id] = String(v).trim(); });
+          const hasDims = w > 0 && h > 0 && d > 0;
+          if (existing) {
+            const next = {
+              ...existing, attributes, sku: upc || existing.sku || "",
+              dims: hasDims ? { w, h, d } : existing.dims,
+              newItem: { ...existing.newItem, ...Object.fromEntries(Object.entries(info).filter(([k, v]) => !(v === "" || v === 0 || (Array.isArray(v) && v.length === 0)) || k === "source")), dimsMissing: hasDims ? false : existing.newItem?.dimsMissing },
+            };
+            updated.push(next);
+            [upc.toLowerCase(), name.toLowerCase()].filter(Boolean).forEach((k) => { taken[k] = next; });
+            return;
+          }
+          const product = {
+            id: uid("prod"), name, sku: upc, dims: hasDims ? { w, h, d } : { w: 1, h: 1, d: 1 }, attributes, images: {}, overhangIn: 0, squeezeFactor: 1, merchStyles: {},
+            pendingApproval: true, resetProtected: false, newItem: { ...info, dimsMissing: !hasDims, importedAt: new Date().toISOString() },
+          };
+          created.push(product);
+          [upc.toLowerCase(), name.toLowerCase()].filter(Boolean).forEach((k) => { taken[k] = product; });
+        });
+        if (primaryKeyField === "upc" && !upcField) warnings.push('Your Product Primary Key is UPC but there is no "UPC" attribute yet, so these items can\'t be matched to Performance data until you add one under Settings.');
+        resolve({ created, updated, skipped, warnings, totalRows: rows.length });
+      } catch (err) {
+        reject(err);
+      }
+    };
+    reader.onerror = () => reject(new Error("Could not read the file."));
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+// ---- shared pieces -------------------------------------------------------------------------------------------
+
+function AssortSelect({ value, onChange, children, className = "" }) {
+  return <select className={inputCls + " w-auto text-xs py-1 " + className} value={value} onChange={(e) => onChange(e.target.value)}>{children}</select>;
+}
+
+function AssortmentFilterBar({ cfg, setCfg, categories, stores }) {
+  const opts = React.useMemo(() => scopeOptions(stores), [stores]);
+  const set = (patch) => setCfg((c) => ({ ...c, ...patch }));
+  const scopeValues = cfg.scope.type === "store" ? stores.map((s) => ({ v: s.id, l: s.name })).sort((a, b) => a.l.localeCompare(b.l)) : (opts[cfg.scope.type] || []).map((v) => ({ v, l: v }));
+  return (
+    <div className="bg-white border border-slate-200 rounded-lg p-3 mb-4 flex flex-wrap items-end gap-3">
+      <div>
+        <label className={labelCls}>Category</label>
+        <AssortSelect value={cfg.category} onChange={(category) => set({ category })} className="min-w-[160px]">
+          <option value="">Choose a category…</option>
+          {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+        </AssortSelect>
+      </div>
+      <div>
+        <label className={labelCls}>Look at</label>
+        <div className="flex items-center gap-1.5">
+          <AssortSelect value={cfg.scope.type} onChange={(type) => set({ scope: { type, value: "" } })}>
+            <option value="all">All stores</option>
+            <option value="region">A region</option>
+            <option value="cluster">A store cluster</option>
+            <option value="format">A store format</option>
+            <option value="store">One store</option>
+          </AssortSelect>
+          {cfg.scope.type !== "all" && (
+            <AssortSelect value={cfg.scope.value} onChange={(value) => set({ scope: { ...cfg.scope, value } })} className="min-w-[140px]">
+              <option value="">{scopeValues.length ? "Choose…" : cfg.scope.type === "cluster" ? "No clusters set on stores yet" : "None available"}</option>
+              {scopeValues.map((o) => <option key={o.v} value={o.v}>{o.l}</option>)}
+            </AssortSelect>
+          )}
+        </div>
+      </div>
+      <div>
+        <label className={labelCls}>Period</label>
+        <AssortSelect value={String(cfg.weeks)} onChange={(w) => set({ weeks: Number(w) })}>
+          {[4, 8, 13, 26, 52].map((w) => <option key={w} value={w}>Last {w} weeks</option>)}
+        </AssortSelect>
+      </div>
+      <div>
+        <label className={labelCls}>Compare with</label>
+        <AssortSelect value={cfg.compare} onChange={(compare) => set({ compare })}>
+          <option value="prior">The {cfg.weeks} weeks before</option>
+          <option value="yoy">Same weeks last year</option>
+        </AssortSelect>
+      </div>
+    </div>
+  );
+}
+
+// ---- Segments ------------------------------------------------------------------------------------------------
+
+function SegmentsView({ ctx, tree, cfg, setCfg, productSchema }) {
+  const [open, setOpen] = useState(() => new Set());
+  const fieldOptions = productSchema.filter((f) => !["category", "upc"].includes(f.label.trim().toLowerCase()) && !cfg.segmentFieldIds.includes(f.id));
+  const labelOf = (id) => productSchema.find((f) => f.id === id)?.label || "(removed attribute)";
+  const move = (i, d) => setCfg((c) => { const a = [...c.segmentFieldIds]; const j = i + d; if (j < 0 || j >= a.length) return c; [a[i], a[j]] = [a[j], a[i]]; return { ...c, segmentFieldIds: a }; });
+  const toggle = (key) => setOpen((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+
+  const rows = [];
+  const walk = (nodes) => nodes.forEach((nd) => { rows.push(nd); if (open.has(nd.key)) walk(nd.children); });
+  walk(tree.nodes);
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white border border-slate-200 rounded-lg p-4">
+        <h3 className="text-sm font-semibold text-slate-800 mb-1">How does a shopper decide at the shelf?</h3>
+        <p className="text-xs text-slate-500 mb-3">
+          Pick the product attributes in the order a shopper makes the decision. For cereal that might be Age group (adult or kids) first, then Sugar level, then Brand.
+          Each step splits the category further, so you can see which segments are growing, which are declining, and how much shelf each one holds compared with what it sells.
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          {cfg.segmentFieldIds.map((id, i) => (
+            <span key={id} className="inline-flex items-center gap-1 bg-amber-50 border border-amber-300 rounded-full pl-2.5 pr-1 py-0.5 text-xs font-medium text-slate-800">
+              <span className="text-[10px] text-amber-700 font-bold">{i + 1}</span> {labelOf(id)}
+              <button className="text-slate-400 hover:text-slate-700 px-0.5" title="Earlier" disabled={i === 0} onClick={() => move(i, -1)}><ChevronLeft size={12} /></button>
+              <button className="text-slate-400 hover:text-slate-700 px-0.5" title="Later" disabled={i === cfg.segmentFieldIds.length - 1} onClick={() => move(i, 1)}><ChevronRight size={12} /></button>
+              <button className="text-slate-400 hover:text-red-600 px-0.5" title="Remove" onClick={() => setCfg((c) => ({ ...c, segmentFieldIds: c.segmentFieldIds.filter((x) => x !== id) }))}><X size={12} /></button>
+            </span>
+          ))}
+          <AssortSelect value="" onChange={(id) => { if (id) setCfg((c) => ({ ...c, segmentFieldIds: [...c.segmentFieldIds, id] })); }}>
+            <option value="">{cfg.segmentFieldIds.length ? "+ Then…" : "+ First decision…"}</option>
+            {fieldOptions.map((f) => <option key={f.id} value={f.id}>{f.label}</option>)}
+          </AssortSelect>
+        </div>
+        {productSchema.length === 0 && <p className="text-xs text-amber-700 mt-2">No product attributes are set up yet. Add them under Settings, then fill them in on your products.</p>}
+      </div>
+
+      {!cfg.category ? (
+        <p className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-6 text-center">Choose a category above.</p>
+      ) : ctx.storeCount === 0 ? (
+        <p className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-6 text-center">No Live or Pending planograms in <span className="font-semibold">{cfg.category}</span> are assigned to {ctx.scope.label.toLowerCase()}.</p>
+      ) : !ctx.win ? (
+        <p className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-6 text-center">No Performance data is loaded yet.</p>
+      ) : (
+        <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
+          <div className="px-4 py-2 text-xs text-slate-500 border-b border-slate-100">
+            {ctx.params.category} · {ctx.scope.label} · {ctx.storeCount} store{ctx.storeCount === 1 ? "" : "s"} · {ctx.win.cur.start} to {ctx.win.cur.end} against {ctx.win.base.start} to {ctx.win.base.end}
+          </div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="bg-slate-50 border-b border-slate-200 text-left text-slate-500 uppercase tracking-wide">
+                <th className="px-3 py-2 font-semibold">Segment</th>
+                <th className="px-2 py-2 font-semibold text-right">Items</th>
+                <th className="px-2 py-2 font-semibold text-right">Sales</th>
+                <th className="px-2 py-2 font-semibold text-right">% of sales</th>
+                <th className="px-2 py-2 font-semibold text-right">% of space</th>
+                <th className="px-2 py-2 font-semibold text-right" title="Share of sales ÷ share of space × 100. Over 100 earns more than the room it takes.">Space index</th>
+                <th className="px-2 py-2 font-semibold text-right">Sales growth</th>
+                <th className="px-2 py-2 font-semibold">Trend</th>
+                <th className="px-2 py-2 font-semibold">What it means</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              <tr className="bg-slate-50/60 font-semibold text-slate-800">
+                <td className="px-3 py-2">{ctx.params.category} (all)</td>
+                <td className="px-2 py-2 text-right">{tree.total.skus}</td>
+                <td className="px-2 py-2 text-right">{moneyA(tree.total.sales)}</td>
+                <td className="px-2 py-2 text-right">100%</td>
+                <td className="px-2 py-2 text-right">100%</td>
+                <td className="px-2 py-2 text-right">100</td>
+                <td className={`px-2 py-2 text-right ${growthCls(tree.total.growth)}`}>{growthA(tree.total.growth)}</td>
+                <td className="px-2 py-2">{tree.total.growth === null ? "n/a" : tree.total.growth >= 0.02 ? "Growing" : tree.total.growth <= -0.02 ? "Declining" : "Flat"}</td>
+                <td className="px-2 py-2 text-slate-400 font-normal">{tree.total.growth === null ? "Needs earlier-period sales to compare" : ""}</td>
+              </tr>
+              {rows.map((nd) => (
+                <tr key={nd.key} className="hover:bg-slate-50">
+                  <td className="px-3 py-1.5" style={{ paddingLeft: 12 + nd.depth * 18 }}>
+                    <span className="inline-flex items-center gap-1">
+                      {nd.children.length > 0 ? (
+                        <button className="text-slate-400 hover:text-slate-700" onClick={() => toggle(nd.key)}>{open.has(nd.key) ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</button>
+                      ) : <span className="w-[13px]" />}
+                      <span className="font-medium text-slate-800">{nd.label}</span>
+                      <span className="text-[10px] text-slate-400">{labelOf(ctx.levels[nd.depth])}</span>
+                      {nd.largestSpace && <span className="text-[9px] font-bold uppercase tracking-wide bg-slate-100 text-slate-600 border border-slate-200 rounded px-1 py-0.5" title="Holds the most shelf space among its siblings">Most space</span>}
+                    </span>
+                  </td>
+                  <td className="px-2 py-1.5 text-right">{nd.metrics.skus}</td>
+                  <td className="px-2 py-1.5 text-right">{moneyA(nd.metrics.sales)}</td>
+                  <td className="px-2 py-1.5 text-right">{pctA(nd.shareOfCategorySales)}</td>
+                  <td className="px-2 py-1.5 text-right">{pctA(nd.shareOfCategorySpace)}</td>
+                  <td className={`px-2 py-1.5 text-right font-semibold ${nd.spaceIndex === null ? "text-slate-400" : nd.spaceIndex >= 115 ? "text-emerald-600" : nd.spaceIndex <= 85 ? "text-red-600" : "text-slate-600"}`}>{nd.spaceIndex ?? "—"}</td>
+                  <td className={`px-2 py-1.5 text-right ${growthCls(nd.growth)}`}>{growthA(nd.growth)}{nd.vsCategoryPp !== null && <span className="block text-[10px] text-slate-400">{nd.vsCategoryPp >= 0 ? "+" : ""}{nd.vsCategoryPp} pts vs category</span>}</td>
+                  <td className="px-2 py-1.5">{nd.trend}</td>
+                  <td className="px-2 py-1.5 text-slate-500">
+                    {nd.opportunity && <span className={`mr-1 text-[10px] font-bold uppercase tracking-wide rounded px-1 py-0.5 border ${nd.opportunity === "Add space" ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-red-50 text-red-700 border-red-200"}`}>{nd.opportunity}</span>}
+                    {nd.spaceNote}
+                  </td>
+                </tr>
+              ))}
+              {tree.nodes.length === 0 && (
+                <tr><td colSpan={9} className="px-3 py-4 text-center text-slate-400 italic">Choose the first decision above to split this category into segments.</td></tr>
+              )}
+            </tbody>
+          </table>
+          <div className="px-4 py-2 text-[11px] text-slate-400 border-t border-slate-100">Space is each item's shelf width, averaged per store in this view. Space index is measured against the segment's siblings (its parent), so you can read it straight down a level.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- Slow movers ---------------------------------------------------------------------------------------------
+
+function SlowMoversView({ ctx, cfg, setCfg, segLabel }) {
+  const [showAll, setShowAll] = useState(false);
+  const [onlyFlagged, setOnlyFlagged] = useState(false);
+  const result = React.useMemo(() => slowMovers(ctx, { groupBy: cfg.groupBy }), [ctx, cfg.groupBy]);
+  const shown = result.rows.filter((r) => !onlyFlagged || r.slowest || r.declining);
+  const visible = showAll ? shown : shown.slice(0, 40);
+  if (!cfg.category) return <p className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-6 text-center">Choose a category above.</p>;
+  if (ctx.storeCount === 0) return <p className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-6 text-center">No Live or Pending planograms in <span className="font-semibold">{cfg.category}</span> are assigned to {ctx.scope.label.toLowerCase()}.</p>;
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="text-xs text-slate-500">Slowest first by units per store per week. The bottom quarter (at or under {result.slowThreshold}) is flagged.</span>
+        <label className="text-xs text-slate-500 flex items-center gap-1.5 ml-auto">Compare across
+          <AssortSelect value={cfg.groupBy} onChange={(groupBy) => setCfg((c) => ({ ...c, groupBy }))}>
+            <option value="none">Nothing</option><option value="region">Regions</option><option value="cluster">Clusters</option><option value="format">Formats</option><option value="store">Stores</option>
+          </AssortSelect>
+        </label>
+        <label className="text-xs text-slate-500 flex items-center gap-1.5"><input type="checkbox" className="accent-amber-500" checked={onlyFlagged} onChange={(e) => setOnlyFlagged(e.target.checked)} /> Only slow or declining</label>
+      </div>
+      <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="bg-slate-50 border-b border-slate-200 text-left text-slate-500 uppercase tracking-wide">
+              <th className="px-3 py-2 font-semibold">#</th>
+              <th className="px-2 py-2 font-semibold">Item</th>
+              <th className="px-2 py-2 font-semibold">Segment</th>
+              <th className="px-2 py-2 font-semibold text-right">Units / store / wk</th>
+              <th className="px-2 py-2 font-semibold text-right">Sales / store / wk</th>
+              <th className="px-2 py-2 font-semibold text-right">Space (in)</th>
+              <th className="px-2 py-2 font-semibold text-right">Sales / in / wk</th>
+              <th className="px-2 py-2 font-semibold text-right">Growth</th>
+              <th className="px-2 py-2 font-semibold text-right">Stores</th>
+              {result.groups.length > 0 && <th className="px-2 py-2 font-semibold">Slow in</th>}
+              <th className="px-2 py-2 font-semibold"></th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {visible.map((r) => (
+              <tr key={r.productId} className={r.slowest ? "bg-amber-50/50" : ""}>
+                <td className="px-3 py-1.5 text-slate-400">{r.rank}</td>
+                <td className="px-2 py-1.5 font-medium text-slate-800">{r.name}</td>
+                <td className="px-2 py-1.5 text-slate-500">{r.segment.length ? r.segment.join(" › ") : "—"}</td>
+                <td className="px-2 py-1.5 text-right font-semibold">{r.velocity}</td>
+                <td className="px-2 py-1.5 text-right">{money2A(r.salesPerStoreWeek)}</td>
+                <td className="px-2 py-1.5 text-right">{r.spaceIn}</td>
+                <td className="px-2 py-1.5 text-right">{money2A(r.salesPerInchWeek)}</td>
+                <td className={`px-2 py-1.5 text-right ${growthCls(r.growth)}`}>{growthA(r.growth)}</td>
+                <td className="px-2 py-1.5 text-right">{r.stores}</td>
+                {result.groups.length > 0 && (
+                  <td className="px-2 py-1.5 text-slate-600" title={r.groupVelocity.filter((g) => g.velocity !== null).map((g) => `${g.label}: ${g.velocity}${g.slow ? " (slow)" : ""}`).join("\n")}>
+                    {r.groupsCarried > 0 ? `${r.slowIn} of ${r.groupsCarried}` : "—"}
+                  </td>
+                )}
+                <td className="px-2 py-1.5">
+                  {r.slowest && <span className="text-[9px] font-bold uppercase tracking-wide bg-amber-100 text-amber-800 border border-amber-300 rounded px-1 py-0.5 mr-1">Slow</span>}
+                  {r.declining && <span className="text-[9px] font-bold uppercase tracking-wide bg-red-50 text-red-700 border border-red-200 rounded px-1 py-0.5 mr-1">Declining</span>}
+                  {!r.hasData && r.units > 0 && <span className="text-[9px] text-slate-400" title="Fewer weeks of data than the minimum">thin data</span>}
+                </td>
+              </tr>
+            ))}
+            {visible.length === 0 && <tr><td colSpan={11} className="px-3 py-4 text-center text-slate-400 italic">Nothing matches.</td></tr>}
+          </tbody>
+        </table>
+        {shown.length > 40 && (
+          <button className="w-full text-xs text-slate-500 hover:bg-slate-50 py-2 border-t border-slate-100" onClick={() => setShowAll((v) => !v)}>{showAll ? "Show fewer" : `Show all ${shown.length}`}</button>
+        )}
+      </div>
+      <p className="text-[11px] text-slate-400">An item that is slow in most {result.groups.length ? "groups" : "places"} it is carried is a stronger candidate to drop than one that is slow in only one. {segLabel}</p>
+    </div>
+  );
+}
+
+// ---- New items -----------------------------------------------------------------------------------------------
+
+function NewItemEditor({ item, products, productSchema, categories, onSave, onCancel, onDelete }) {
+  const n = item.newItem || {};
+  const upcField = productSchema.find((f) => f.label.trim().toLowerCase() === "upc");
+  const catField = productSchema.find((f) => f.label.trim().toLowerCase() === "category");
+  const [name, setName] = useState(item.name);
+  const [upc, setUpc] = useState((upcField ? item.attributes?.[upcField.id] : "") || item.sku || "");
+  const [category, setCategory] = useState(n.category || (catField ? item.attributes?.[catField.id] : "") || "");
+  const [dims, setDims] = useState({ w: n.dimsMissing ? "" : item.dims?.w ?? "", h: n.dimsMissing ? "" : item.dims?.h ?? "", d: n.dimsMissing ? "" : item.dims?.d ?? "" });
+  const [price, setPrice] = useState(n.retailPrice || "");
+  const [cost, setCost] = useState(n.unitCost || "");
+  const [forecast, setForecast] = useState(n.forecastUnitsPerStoreWeek || "");
+  const [scalePct, setScalePct] = useState(Math.round((n.proxyScale || 1) * 100));
+  const [proxyIds, setProxyIds] = useState(n.proxyProductIds || []);
+  const [launch, setLaunch] = useState(n.launchDate || "");
+  const [attrs, setAttrs] = useState(item.attributes || {});
+  const [proxyQuery, setProxyQuery] = useState("");
+  const attrFields = productSchema.filter((f) => f !== upcField && f !== catField);
+  const candidates = products.filter((p) => !p.newItem && p.id !== item.id && (!proxyQuery.trim() || p.name.toLowerCase().includes(proxyQuery.trim().toLowerCase()))).slice(0, 8);
+  const hasDims = Number(dims.w) > 0 && Number(dims.h) > 0 && Number(dims.d) > 0;
+  const valuesFor = (fid) => [...new Set(products.map((p) => p.attributes?.[fid]).filter((v) => v !== undefined && v !== null && String(v).trim()).map(String))].sort();
+
+  const save = () => {
+    if (!name.trim()) return;
+    const attributes = { ...attrs };
+    if (upcField) attributes[upcField.id] = upc.trim();
+    if (catField && category.trim()) attributes[catField.id] = category.trim();
+    onSave({
+      ...item, name: name.trim(), sku: upc.trim(), attributes,
+      dims: hasDims ? { w: Number(dims.w), h: Number(dims.h), d: Number(dims.d) } : item.dims,
+      newItem: {
+        ...n, category: category.trim(), launchDate: launch, retailPrice: Number(price) || 0, unitCost: Number(cost) || 0,
+        forecastUnitsPerStoreWeek: Number(forecast) || 0, proxyProductIds: proxyIds, proxyScale: Math.max(0.01, (Number(scalePct) || 100) / 100), dimsMissing: !hasDims,
+      },
+    });
+  };
+
+  return (
+    <div className="bg-slate-50 border border-amber-200 rounded-lg p-4 space-y-3">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <Field label="Name"><input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} /></Field>
+        <Field label="UPC"><input className={inputCls} value={upc} onChange={(e) => setUpc(e.target.value)} /></Field>
+        <Field label="Category">
+          <input className={inputCls} value={category} onChange={(e) => setCategory(e.target.value)} list="assort-cats" />
+          <datalist id="assort-cats">{categories.map((c) => <option key={c} value={c} />)}</datalist>
+        </Field>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-6 gap-3">
+        <Field label="Width (in)"><input type="number" step="0.01" className={inputCls} value={dims.w} onChange={(e) => setDims({ ...dims, w: e.target.value })} /></Field>
+        <Field label="Height (in)"><input type="number" step="0.01" className={inputCls} value={dims.h} onChange={(e) => setDims({ ...dims, h: e.target.value })} /></Field>
+        <Field label="Depth (in)"><input type="number" step="0.01" className={inputCls} value={dims.d} onChange={(e) => setDims({ ...dims, d: e.target.value })} /></Field>
+        <Field label="Retail price"><input type="number" step="0.01" className={inputCls} value={price} onChange={(e) => setPrice(e.target.value)} /></Field>
+        <Field label="Unit cost"><input type="number" step="0.01" className={inputCls} value={cost} onChange={(e) => setCost(e.target.value)} /></Field>
+        <Field label="Launch date"><input type="date" className={inputCls} value={launch} onChange={(e) => setLaunch(e.target.value)} /></Field>
+      </div>
+      {attrFields.length > 0 && (
+        <div>
+          <div className={labelCls}>Attributes (what the Segments view groups by)</div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {attrFields.map((f) => (
+              <Field key={f.id} label={f.label}>
+                <input className={inputCls} value={attrs[f.id] ?? ""} onChange={(e) => setAttrs({ ...attrs, [f.id]: e.target.value })} list={`assort-vals-${f.id}`} />
+                <datalist id={`assort-vals-${f.id}`}>{valuesFor(f.id).map((v) => <option key={v} value={v} />)}</datalist>
+              </Field>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="border-t border-slate-200 pt-3">
+        <div className={labelCls}>How much will it sell?</div>
+        <p className="text-xs text-slate-500 mb-2">Either type a forecast, or pick one or more similar items already in the library and its sales are taken from theirs.</p>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-2">
+          <Field label="Forecast (units / store / week)"><input type="number" step="0.1" className={inputCls} value={forecast} onChange={(e) => setForecast(e.target.value)} placeholder="optional" /></Field>
+          <Field label="Sells as much as similar (%)"><input type="number" className={inputCls} value={scalePct} onChange={(e) => setScalePct(e.target.value)} /></Field>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5 mb-1.5">
+          {proxyIds.map((id) => (
+            <span key={id} className="inline-flex items-center gap-1 bg-white border border-slate-300 rounded-full pl-2 pr-1 py-0.5 text-xs">
+              {products.find((p) => p.id === id)?.name || "(removed)"}
+              <button className="text-slate-400 hover:text-red-600" onClick={() => setProxyIds(proxyIds.filter((x) => x !== id))}><X size={11} /></button>
+            </span>
+          ))}
+          {proxyIds.length === 0 && <span className="text-xs text-slate-400 italic">No similar items chosen</span>}
+        </div>
+        <input className={inputCls + " max-w-xs"} placeholder="Find a similar item…" value={proxyQuery} onChange={(e) => setProxyQuery(e.target.value)} />
+        {proxyQuery.trim() && (
+          <div className="mt-1 max-w-xs bg-white border border-slate-200 rounded-md divide-y divide-slate-100">
+            {candidates.map((p) => (
+              <button key={p.id} className="w-full text-left text-xs px-2 py-1.5 hover:bg-slate-50 disabled:text-slate-300" disabled={proxyIds.includes(p.id)} onClick={() => { setProxyIds([...proxyIds, p.id]); setProxyQuery(""); }}>{p.name}</button>
+            ))}
+            {candidates.length === 0 && <div className="text-xs text-slate-400 px-2 py-1.5">No match</div>}
+          </div>
+        )}
+      </div>
+      <div className="flex items-center justify-between pt-2 border-t border-slate-200">
+        <button className="text-xs text-red-600 hover:underline" onClick={onDelete}>Delete from library</button>
+        <div className="flex gap-2"><button className={btnGhost} onClick={onCancel}>Cancel</button><button className={btnPrimary} onClick={save}><Save size={14} /> Save</button></div>
+      </div>
+    </div>
+  );
+}
+
+function NewItemsView({ ctx, products, productSchema, categories, primaryKeyField, cfg, onCreate, onUpdate, onDelete }) {
+  const fileRef = useRef(null);
+  const [editingId, setEditingId] = useState(null);
+  const [status, setStatus] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [showTemplateMenu, setShowTemplateMenu] = useState(false);
+  const [showSheet, setShowSheet] = useState(false);
+  const [sheetLink, setSheetLink] = useState("");
+  const [sheetError, setSheetError] = useState("");
+  const items = products.filter((p) => p.newItem).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+
+  const importFile = async (file) => {
+    if (!file) return;
+    setBusy(true); setStatus(null);
+    try {
+      const r = await parseNewItemWorkbook(file, products, productSchema, primaryKeyField);
+      r.created.forEach(onCreate); r.updated.forEach(onUpdate);
+      const parts = [];
+      if (r.created.length) parts.push(`${r.created.length} added to the product library (pending approval)`);
+      if (r.updated.length) parts.push(`${r.updated.length} updated`);
+      if (r.skipped.length) parts.push(`${r.skipped.length} skipped (${r.skipped.slice(0, 3).map((s) => `row ${s.row}: ${s.reason}`).join("; ")}${r.skipped.length > 3 ? "…" : ""})`);
+      setStatus({ type: r.created.length + r.updated.length ? "ok" : "error", message: (parts.join(", ") || "Nothing to import") + ".", warnings: r.warnings.slice(0, 6) });
+    } catch (e) {
+      setStatus({ type: "error", message: "Couldn't read that file. Use the template: an Excel (.xlsx/.xls) or CSV file with a Product Name column." });
+    } finally { setBusy(false); if (fileRef.current) fileRef.current.value = ""; }
+  };
+  const importSheet = async () => {
+    setSheetError("");
+    if (!sheetLink.trim()) return;
+    setBusy(true);
+    try {
+      const res = await invokeEdgeFunction("fetch-sheet", { url: sheetLink.trim() });
+      const bin = atob(res.base64); const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      setShowSheet(false); setSheetLink("");
+      await importFile(new File([bytes], res.filename || "google-sheet.csv", { type: "text/csv" }));
+    } catch (e) { setSheetError(e?.message || "Couldn't read that sheet."); setBusy(false); }
+  };
+  const addBlank = () => {
+    const p = {
+      id: uid("prod"), name: "New item", sku: "", dims: { w: 1, h: 1, d: 1 }, attributes: {}, images: {}, overhangIn: 0, squeezeFactor: 1, merchStyles: {}, pendingApproval: true, resetProtected: false,
+      newItem: { source: "category_manager", category: cfg.category || "", launchDate: "", retailPrice: 0, unitCost: 0, forecastUnitsPerStoreWeek: 0, proxyProductIds: [], proxyScale: 1, dimsMissing: true, importedAt: new Date().toISOString() },
+    };
+    onCreate(p); setEditingId(p.id);
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <p className="text-xs text-slate-500 flex-1 min-w-[240px]">New items from your category manager. Each one is added to the product library (flagged Pending until you approve it there), and needs either a forecast or a similar item so its sales can be estimated.</p>
+        <div className="relative">
+          <button className={btnGhost} onClick={() => setShowTemplateMenu((v) => !v)}><Download size={14} /> Template <ChevronDown size={12} /></button>
+          {showTemplateMenu && (
+            <div className="absolute right-0 z-30 mt-1 w-52 bg-white border border-slate-200 rounded-lg shadow-lg p-1.5">
+              {[["xlsx", "Excel (.xlsx)"], ["xls", "Excel 97-2003 (.xls)"], ["csv", "CSV (.csv)"]].map(([id, label]) => (
+                <button key={id} className="w-full text-left text-xs font-medium text-slate-700 px-2 py-1.5 rounded hover:bg-slate-50" onClick={() => { downloadNewItemTemplate(productSchema, id); setShowTemplateMenu(false); }}>{label}</button>
+              ))}
+            </div>
+          )}
+        </div>
+        <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={(e) => importFile(e.target.files[0])} />
+        <button className={btnGhost} disabled={busy} onClick={() => fileRef.current && fileRef.current.click()}><Upload size={14} /> {busy ? "Reading…" : "Import file"}</button>
+        <button className={btnGhost} disabled={busy} onClick={() => { setShowSheet((v) => !v); setSheetError(""); }}><Link2 size={14} /> From Google Sheet</button>
+        <button className={btnPrimary} onClick={addBlank}><Plus size={14} /> Add item</button>
+      </div>
+      {showSheet && (
+        <div className="bg-white border border-slate-200 rounded-lg p-3 space-y-2">
+          <div className="text-xs text-slate-500">Paste the link to a Google Sheet laid out like the template, shared as <span className="font-semibold">Anyone with the link → Viewer</span>. The tab in the link is the one that's read.</div>
+          <div className="flex gap-2">
+            <input className={inputCls} value={sheetLink} onChange={(e) => setSheetLink(e.target.value)} placeholder="https://docs.google.com/spreadsheets/d/…" onKeyDown={(e) => { if (e.key === "Enter") importSheet(); }} />
+            <button className={btnPrimary} disabled={busy || !sheetLink.trim()} onClick={importSheet}>Import</button>
+            <button className={btnGhost} onClick={() => setShowSheet(false)}>Cancel</button>
+          </div>
+          {sheetError && <div className="text-xs rounded-md px-2.5 py-1.5 bg-red-50 text-red-700 border border-red-200">{sheetError}</div>}
+        </div>
+      )}
+      {status && (
+        <div className={`text-sm rounded-md px-3 py-2 ${status.type === "ok" ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
+          {status.message}
+          {status.warnings?.length > 0 && <ul className="mt-1 text-xs list-disc pl-4 text-amber-700">{status.warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>}
+        </div>
+      )}
+
+      {items.length === 0 ? (
+        <p className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-8 text-center">No new items yet. Download the template, fill it in (or paste the sheet your category manager sent), and import it.</p>
+      ) : (
+        <div className="space-y-2">
+          {items.map((it) => {
+            const fc = forecastFor(ctx, it);
+            const n = it.newItem;
+            return (
+              <div key={it.id}>
+                {editingId === it.id ? (
+                  <NewItemEditor item={it} products={products} productSchema={productSchema} categories={categories} onCancel={() => setEditingId(null)}
+                    onSave={(p) => { onUpdate(p); setEditingId(null); }} onDelete={() => { onDelete(it.id); setEditingId(null); }} />
+                ) : (
+                  <div className="bg-white border border-slate-200 rounded-lg px-4 py-2.5 flex items-center gap-3 flex-wrap">
+                    <div className="flex-1 min-w-[200px]">
+                      <div className="text-sm font-semibold text-slate-800 flex items-center gap-2">{it.name}{it.pendingApproval && <span className="text-[9px] font-bold uppercase tracking-wide bg-amber-100 text-amber-700 border border-amber-300 rounded px-1 py-0.5">Pending</span>}</div>
+                      <div className="text-xs text-slate-400">{n.category || "No category"}{it.sku ? ` · ${it.sku}` : ""}{n.dimsMissing ? "" : ` · ${it.dims.w}×${it.dims.h}×${it.dims.d} in`}{n.launchDate ? ` · launches ${n.launchDate}` : ""}</div>
+                    </div>
+                    <div className="text-xs text-slate-600 min-w-[200px]">
+                      {fc.unitsPerStoreWeek !== null
+                        ? <>Forecast <span className="font-semibold">{fc.unitsPerStoreWeek}</span> units/store/wk <span className="text-slate-400">({fc.basis}{fc.proxies.length ? `: ${fc.proxies.map((p) => p.name).join(", ")}` : ""})</span></>
+                        : <span className="text-slate-400">{(n.proxyProductIds || []).length ? "Similar items have no sales history in this view" : "No forecast yet"}</span>}
+                    </div>
+                    {fc.ready
+                      ? <span className="text-[10px] font-bold uppercase tracking-wide text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5">Ready</span>
+                      : <span className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5">{fc.missing}</span>}
+                    <button className="text-xs text-amber-700 font-semibold hover:underline" onClick={() => setEditingId(it.id)}>Edit</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- Recommendations -----------------------------------------------------------------------------------------
+
+const CAND_STATUS = {
+  recommended: ["Recommended", "bg-emerald-50 text-emerald-700 border-emerald-200"],
+  not_worth_it: ["Not worth it", "bg-slate-100 text-slate-600 border-slate-200"],
+  no_room: ["No room", "bg-red-50 text-red-700 border-red-200"],
+  already_carried: ["Already carried", "bg-slate-100 text-slate-500 border-slate-200"],
+  not_ready: ["Needs info", "bg-amber-50 text-amber-700 border-amber-200"],
+  excluded: ["Left out", "bg-slate-100 text-slate-400 border-slate-200"],
+};
+
+function RecommendationsView({ ctx, products, cfg, setCfg, onOpenProposal, onDrafted }) {
+  const newItems = products.filter((p) => p.newItem && (!cfg.category || !p.newItem.category || p.newItem.category === cfg.category));
+  const [picked, setPicked] = useState(null); // Set of item ids; null = every ready item
+  const [exclude, setExclude] = useState(() => new Set());
+  const [protect, setProtect] = useState(() => new Set());
+  const [drafting, setDrafting] = useState(false);
+  const [draftResult, setDraftResult] = useState(null);
+  const [error, setError] = useState("");
+  const readyIds = React.useMemo(() => newItems.filter((p) => forecastFor(ctx, p).ready).map((p) => p.id), [ctx, newItems]);
+  const chosen = (picked ? [...picked] : readyIds).filter((id) => newItems.some((p) => p.id === id));
+  const rec = React.useMemo(() => (chosen.length && ctx.storeCount > 0 ? recommend(ctx, chosen, { exclude, protect }) : null), [ctx, chosen.join("|"), exclude, protect]); // eslint-disable-line react-hooks/exhaustive-deps
+  const setA = (patch) => setCfg((c) => ({ ...c, assumptions: { ...c.assumptions, ...patch } }));
+  const a = cfg.assumptions;
+  const toggleSet = (setter, key) => setter((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+  const toggleItem = (id) => setPicked((prev) => { const base = new Set(prev || readyIds); if (base.has(id)) base.delete(id); else base.add(id); return base; });
+
+  const draft = async () => {
+    setDrafting(true); setError(""); setDraftResult(null);
+    try {
+      const res = await invokeEdgeFunction("draft-assortment", {
+        newItemIds: chosen,
+        params: { category: cfg.category, scope: cfg.scope.type === "all" ? { type: "all" } : cfg.scope, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds, assumptions: { metric: a.metric, cannibalization: a.cannibalization, transfer: a.transfer, maxRemovalsPerAdd: a.maxRemovalsPerAdd } },
+        exclude: [...exclude], protect: [...protect],
+      });
+      setDraftResult(res);
+      if (onDrafted) onDrafted();
+    } catch (e) { setError(e?.message || "Couldn't draft the changes."); }
+    finally { setDrafting(false); }
+  };
+
+  if (!cfg.category) return <p className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-6 text-center">Choose a category above.</p>;
+  const metricWord = { sales: "sales", margin: "margin", units: "units" }[a.metric];
+  return (
+    <div className="space-y-4">
+      <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-3">
+        <div>
+          <h3 className="text-sm font-semibold text-slate-800">Which planograms should the new items go on?</h3>
+          <p className="text-xs text-slate-500">For each planogram in {cfg.category}, an item goes in free shelf space if there is any; otherwise the slowest items come out to make room. A swap is only recommended if the new item's expected {metricWord} beats what is given up. The best items are placed first, and each decision updates the planogram for the next item.</p>
+        </div>
+        <div className="flex flex-wrap items-end gap-4">
+          <div><label className={labelCls}>Better means more</label>
+            <AssortSelect value={a.metric} onChange={(metric) => setA({ metric })}><option value="sales">Sales $</option><option value="margin">Margin $</option><option value="units">Units</option></AssortSelect></div>
+          <div><label className={labelCls} title="Share of a new item's sales that is really existing items' sales moving over">Cannibalization %</label>
+            <input type="number" min="0" max="100" className={inputCls + " w-20 text-xs py-1"} value={Math.round(a.cannibalization * 100)} onChange={(e) => setA({ cannibalization: clamp((Number(e.target.value) || 0) / 100, 0, 1) })} /></div>
+          <div><label className={labelCls} title="Share of a removed item's sales that stays in the category (shoppers buy something else)">Sales kept when an item is removed %</label>
+            <input type="number" min="0" max="100" className={inputCls + " w-20 text-xs py-1"} value={Math.round(a.transfer * 100)} onChange={(e) => setA({ transfer: clamp((Number(e.target.value) || 0) / 100, 0, 1) })} /></div>
+          <div><label className={labelCls}>Most to remove per new item</label>
+            <AssortSelect value={String(a.maxRemovalsPerAdd)} onChange={(v) => setA({ maxRemovalsPerAdd: Number(v) })}>{[0, 1, 2, 3, 4].map((n) => <option key={n} value={n}>{n}</option>)}</AssortSelect></div>
+        </div>
+        <div>
+          <div className={labelCls}>New items to place</div>
+          {newItems.length === 0 && <p className="text-xs text-slate-400 italic">No new items for this category yet — add them on the New items tab.</p>}
+          <div className="flex flex-wrap gap-2">
+            {newItems.map((p) => {
+              const fc = forecastFor(ctx, p);
+              const on = chosen.includes(p.id);
+              return (
+                <label key={p.id} className={`text-xs rounded-full border px-2.5 py-1 flex items-center gap-1.5 ${fc.ready ? "cursor-pointer" : "opacity-60"} ${on ? "bg-amber-50 border-amber-300" : "bg-white border-slate-300"}`} title={fc.ready ? "" : fc.missing}>
+                  <input type="checkbox" className="accent-amber-500" disabled={!fc.ready} checked={on} onChange={() => toggleItem(p.id)} /> {p.name}{!fc.ready && <span className="text-amber-700"> · {fc.missing}</span>}
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      {ctx.storeCount === 0 && <p className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-6 text-center">No Live or Pending planograms in {cfg.category} are assigned to {ctx.scope.label.toLowerCase()}.</p>}
+      {rec && (
+        <>
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 flex flex-wrap items-center gap-3">
+            <div className="text-sm text-blue-900 flex-1 min-w-[240px]">
+              <span className="font-semibold">{rec.totals.placements}</span> placement{rec.totals.placements === 1 ? "" : "s"} for <span className="font-semibold">{rec.totals.itemsRecommended}</span> of {rec.items.length} item{rec.items.length === 1 ? "" : "s"}, worth about <span className="font-semibold">{a.metric === "units" ? `${Math.round(rec.totals.netNetworkWeek).toLocaleString()} units` : moneyA(rec.totals.netNetworkWeek)}</span> a week across the stores in view.
+            </div>
+            <button className={btnPrimary} disabled={drafting || rec.totals.placements === 0} onClick={draft}><Sparkles size={14} /> {drafting ? "Drafting…" : "Draft changes for review"}</button>
+          </div>
+          {error && <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{error}</div>}
+          {draftResult && (
+            <div className="bg-white border border-emerald-200 rounded-lg p-3 space-y-1.5">
+              <div className="text-sm font-semibold text-emerald-800">{draftResult.proposals.length} draft{draftResult.proposals.length === 1 ? "" : "s"} ready for review</div>
+              {draftResult.proposals.map((p) => (
+                <div key={p.proposalId} className="flex items-center gap-3 text-sm">
+                  <span className="font-medium text-slate-800">{p.planogramName}</span>
+                  <span className="text-xs text-slate-500">{p.adds} added{p.removes ? `, ${p.removes} removed` : ""}</span>
+                  <button className="text-xs text-amber-700 font-semibold hover:underline ml-auto" onClick={() => onOpenProposal(p.proposalId)}>Review</button>
+                </div>
+              ))}
+              {draftResult.notDrafted.map((p) => <div key={p.planogramId} className="text-xs text-amber-700">{p.planogramName}: {p.reason}</div>)}
+              <div className="text-[11px] text-slate-400">Approving a draft creates a new Work-in-Progress version of that planogram; nothing changes on a live planogram until you do.</div>
+            </div>
+          )}
+          {rec.items.map((item) => (
+            <div key={item.productId} className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+              <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center gap-x-4 gap-y-1">
+                <span className="text-sm font-semibold text-slate-800">{item.name}</span>
+                <span className="text-xs text-slate-500">Forecast {item.forecast.unitsPerStoreWeek} units/store/wk ({item.forecast.basis}) at {money2A(item.forecast.price)}</span>
+                {item.segment.length > 0 && (
+                  <span className="text-xs text-slate-500">
+                    {item.segment.join(" › ")}
+                    {item.segmentTrend && <> — <span className={growthCls(item.segmentTrend.growth)}>{item.segmentTrend.trend.toLowerCase()}</span>{item.segmentTrend.spaceIndex !== null && <>, space index {item.segmentTrend.spaceIndex}</>}{item.segmentTrend.opportunity && <span className="ml-1 font-semibold text-emerald-700">· {item.segmentTrend.opportunity}</span>}</>}
+                  </span>
+                )}
+                <span className="ml-auto text-xs font-semibold text-slate-600">{item.recommendedCount} planogram{item.recommendedCount === 1 ? "" : "s"} recommended</span>
+              </div>
+              <table className="w-full text-xs">
+                <thead><tr className="text-left text-slate-400 uppercase tracking-wide border-b border-slate-100">
+                  <th className="px-3 py-1.5 w-8"></th><th className="px-2 py-1.5 font-semibold">Planogram</th><th className="px-2 py-1.5 font-semibold text-right">Stores</th><th className="px-2 py-1.5 font-semibold">Result</th>
+                  <th className="px-2 py-1.5 font-semibold">Where</th><th className="px-2 py-1.5 font-semibold">Makes room by removing</th><th className="px-2 py-1.5 font-semibold text-right">Net / store / wk</th><th className="px-2 py-1.5 font-semibold text-right">Net / wk</th>
+                </tr></thead>
+                <tbody className="divide-y divide-slate-100">
+                  {item.candidates.map((c) => {
+                    const [label, cls] = CAND_STATUS[c.status] || [c.status, ""];
+                    const key = `${item.productId}|${c.planogramId}`;
+                    const canToggle = !["already_carried", "not_ready"].includes(c.status);
+                    return (
+                      <tr key={c.planogramId} className={c.status === "recommended" ? "" : "text-slate-500"} title={c.reason}>
+                        <td className="px-3 py-1.5"><input type="checkbox" className="accent-amber-500" disabled={!canToggle} checked={c.status !== "excluded"} onChange={() => toggleSet(setExclude, key)} title="Include this planogram" /></td>
+                        <td className="px-2 py-1.5 font-medium text-slate-800">{c.planogramName}</td>
+                        <td className="px-2 py-1.5 text-right">{c.stores}</td>
+                        <td className="px-2 py-1.5"><span className={`text-[10px] font-bold uppercase tracking-wide rounded px-1.5 py-0.5 border ${cls}`}>{label}</span></td>
+                        <td className="px-2 py-1.5">{c.add ? `${c.add.sectionName ? c.add.sectionName + " · " : ""}${c.add.fixtureName}${c.add.spaceFreeIn !== undefined && c.removes.length === 0 ? ` (${c.add.spaceFreeIn}in free)` : ""}` : "—"}</td>
+                        <td className="px-2 py-1.5">
+                          {c.removes.length === 0 ? <span className="text-slate-400">{c.add ? "Nothing — it fits" : "—"}</span> : c.removes.map((rm) => (
+                            <span key={rm.placementId} className="inline-flex items-center gap-1 mr-2">
+                              {rm.name} <span className="text-slate-400">({rm.velocity}/wk)</span>
+                              <button className={`${protect.has(rm.productId) ? "text-amber-600" : "text-slate-300 hover:text-amber-600"}`} title="Keep this item (don't remove it)" onClick={() => toggleSet(setProtect, rm.productId)}><Lock size={11} /></button>
+                            </span>
+                          ))}
+                          {c.variety.length > 0 && <div className="text-[10px] text-blue-700">{c.variety.join(". ")}</div>}
+                        </td>
+                        <td className={`px-2 py-1.5 text-right ${c.netPerStoreWeek === null ? "" : c.netPerStoreWeek > 0 ? "text-emerald-600" : "text-red-600"}`}>{c.netPerStoreWeek === null ? "—" : a.metric === "units" ? c.netPerStoreWeek : money2A(c.netPerStoreWeek)}</td>
+                        <td className={`px-2 py-1.5 text-right font-semibold ${c.netNetworkWeek === null ? "" : c.netNetworkWeek > 0 ? "text-emerald-600" : "text-red-600"}`}>{c.netNetworkWeek === null ? "—" : a.metric === "units" ? Math.round(c.netNetworkWeek) : moneyA(c.netNetworkWeek)}</td>
+                      </tr>
+                    );
+                  })}
+                  {item.candidates.length === 0 && <tr><td colSpan={8} className="px-3 py-3 text-center text-slate-400 italic">No planograms in view.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          ))}
+          <p className="text-[11px] text-slate-400">Untick a planogram to leave an item off it; click the lock to protect an item from being removed. The list updates straight away and the drafts follow what you see. Hover a row for the reasoning.</p>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---- The tab -------------------------------------------------------------------------------------------------
+
+function AssortmentModule({ products, planograms, fixtures, stores, performance, productSchema, primaryKeyField, onCreateProduct, onUpdateProduct, onDeleteProduct, onOpenProposal, onDrafted }) {
+  const [cfg, setCfgState] = useState(ASSORT_DEFAULT_CFG);
+  const [loaded, setLoaded] = useState(false);
+  const [view, setView] = useState("segments"); // segments | slow | newItems | recommend
+  const saveTimer = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    safeGet("settings:assortment").then((raw) => {
+      if (cancelled) return;
+      try {
+        const saved = raw ? JSON.parse(raw) : null;
+        if (saved && typeof saved === "object") setCfgState((c) => ({ ...c, ...saved, scope: { ...c.scope, ...(saved.scope || {}) }, assumptions: { ...c.assumptions, ...(saved.assumptions || {}) } }));
+      } catch (e) { /* keep defaults */ }
+      setLoaded(true);
+    });
+    return () => { cancelled = true; };
+  }, []);
+  const setCfg = useCallback((updater) => {
+    setCfgState((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+      saveTimer.current = setTimeout(() => { safeSet("settings:assortment", JSON.stringify(next)); }, 800);
+      return next;
+    });
+  }, []);
+  useEffect(() => () => { if (saveTimer.current) clearTimeout(saveTimer.current); }, []);
+
+  const categories = React.useMemo(() => Array.from(new Set(planograms.map((p) => p.category).filter(Boolean))).sort((a, b) => a.localeCompare(b)), [planograms]);
+  const scopeReady = cfg.scope.type === "all" || !!cfg.scope.value;
+  const ctx = React.useMemo(
+    () => buildContext({ products, planograms, fixtures, performance, stores, productSchema }, {
+      category: cfg.category, scope: scopeReady ? cfg.scope : { type: "all" }, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds, assumptions: cfg.assumptions,
+    }),
+    [products, planograms, fixtures, performance, stores, productSchema, cfg.category, cfg.scope, scopeReady, cfg.weeks, cfg.compare, cfg.segmentFieldIds, cfg.assumptions],
+  );
+  const tree = React.useMemo(() => segmentTree(ctx), [ctx]);
+
+  const tabs = [["segments", "Segments"], ["slow", "Slow movers"], ["newItems", "New items"], ["recommend", "Recommendations"]];
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1">
+        <h2 className="text-lg font-bold text-slate-800">Assortment</h2>
+      </div>
+      <p className="text-sm text-slate-500 mb-3">See which segments are growing, which items are slow, and where new items earn their space.</p>
+      <AssortmentFilterBar cfg={cfg} setCfg={setCfg} categories={categories} stores={stores} />
+      {!scopeReady && <p className="text-xs text-amber-700 mb-3">Choose a {cfg.scope.type} above; until then all stores are shown.</p>}
+      <div className="flex gap-1 mb-4 border-b border-slate-200">
+        {tabs.map(([id, label]) => (
+          <button key={id} onClick={() => setView(id)} className={`-mb-px px-3 py-1.5 text-xs font-semibold rounded-t-md border border-b-0 ${view === id ? "bg-white border-slate-200 text-slate-800" : "bg-transparent border-transparent text-slate-500 hover:text-slate-700"}`}>{label}</button>
+        ))}
+      </div>
+      {!loaded ? <div className="text-xs text-slate-400 flex items-center gap-2"><RefreshCw size={12} className="animate-spin" /> Loading your settings…</div> : (
+        <>
+          {view === "segments" && <SegmentsView ctx={ctx} tree={tree} cfg={cfg} setCfg={setCfg} productSchema={productSchema} />}
+          {view === "slow" && <SlowMoversView ctx={ctx} cfg={cfg} setCfg={setCfg} segLabel="" />}
+          {view === "newItems" && <NewItemsView ctx={ctx} products={products} productSchema={productSchema} categories={categories} primaryKeyField={primaryKeyField} cfg={cfg} onCreate={onCreateProduct} onUpdate={onUpdateProduct} onDelete={onDeleteProduct} />}
+          {view === "recommend" && <RecommendationsView ctx={ctx} products={products} cfg={cfg} setCfg={setCfg} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
+        </>
+      )}
     </div>
   );
 }
@@ -12440,6 +13300,7 @@ function AppContent({ session }) {
           <TabButton active={tab === "performance"} onClick={() => setTab("performance")} icon={TrendingUp}>Performance</TabButton>
           <TabButton active={tab === "analysis"} onClick={() => setTab("analysis")} icon={BarChart3}>Analysis</TabButton>
           <TabButton active={tab === "storeFeedback"} onClick={() => setTab("storeFeedback")} icon={AlertTriangle}>Store Feedback</TabButton>
+          {isPlanner && <TabButton active={tab === "assortment"} onClick={() => setTab("assortment")} icon={Grid3x3}>Assortment</TabButton>}
           {isPlanner && <TabButton active={tab === "resetImpact"} onClick={() => setTab("resetImpact")} icon={TrendingUp}>Reset Impact</TabButton>}
           {isPlanner && <TabButton active={tab === "execution"} onClick={() => setTab("execution")} icon={Mail} badge={openEscalations}>Execution</TabButton>}
           <TabButton active={tab === "schema"} onClick={() => setTab("schema")} icon={Settings2}>Settings</TabButton>
@@ -12547,6 +13408,13 @@ function AppContent({ session }) {
             stores={stores}
             performance={performance}
             productSchema={productSchema}
+          />
+        ) : tab === "assortment" && isPlanner ? (
+          <AssortmentModule
+            products={products} planograms={planograms} fixtures={fixtures} stores={stores} performance={performance}
+            productSchema={productSchema} primaryKeyField={primaryKeyField}
+            onCreateProduct={createProduct} onUpdateProduct={updateProductEntity} onDeleteProduct={deleteProductEntity}
+            onOpenProposal={setReviewingProposalId} onDrafted={refreshProposals}
           />
         ) : tab === "resetImpact" && isPlanner ? (
           <ResetImpactModule planograms={planograms} />

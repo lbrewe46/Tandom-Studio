@@ -163,7 +163,7 @@ export function createToolRunner(ctx) {
       if (!pg) return { error: "Planogram not found, or not available to you." };
       const all = await ctx.loadPlanograms();
       const prev = getPredecessorPlanogram(pg, all);
-      if (!prev) return { planogram: pg.name, note: "There is no live version to compare against, so everything on this planogram is new." };
+      if (!prev) return { planogram: pg.name, note: "This is the first planogram for this space: there is no previous version, so no comparison details are available." };
       const pById = await productsById();
       const now = facingsByProduct(pg);
       const before = facingsByProduct(prev);
