@@ -151,14 +151,21 @@ export async function deleteIndexed(kind, id) {
 export async function loadPendingProposals() {
   if (!supabase) return { ok: false, rows: [] };
   try {
-    const { data, error } = await supabase
-      .from("proposals")
-      .select("id, agent_id, target_type, target_id, reason, score, status, requested_by, created_at")
-      .eq("status", "pending")
-      .order("created_at", { ascending: false })
-      .limit(1000);
-    if (error || !data) return { ok: false, rows: [] };
-    return { ok: true, rows: data };
+    // Paged, because a chain-wide assortment run can leave thousands of drafts waiting.
+    const PAGE = 1000, MAX = 10000;
+    const rows = [];
+    for (let from = 0; from < MAX; from += PAGE) {
+      const { data, error } = await supabase
+        .from("proposals")
+        .select("id, agent_id, target_type, target_id, reason, score, status, requested_by, created_at")
+        .eq("status", "pending")
+        .order("created_at", { ascending: false })
+        .range(from, from + PAGE - 1);
+      if (error || !data) return { ok: false, rows: [] };
+      rows.push(...data);
+      if (data.length < PAGE) break;
+    }
+    return { ok: true, rows };
   } catch (e) {
     return { ok: false, rows: [] };
   }

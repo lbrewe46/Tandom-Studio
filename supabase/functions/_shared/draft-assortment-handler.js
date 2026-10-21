@@ -19,6 +19,7 @@ import { json, preflightOrWrongMethod, authenticate } from "./http.js";
 import { fingerprint } from "./proposal-core.js";
 import { recordProposals } from "./draft-reset-handler.js";
 import { buildContext, recommend } from "./assortment.js";
+import { getLatestWeekEnding, addDaysISO } from "./app-core.js";
 
 export const AGENT_ID = "assortment-agent";
 export const TARGET_TYPE = "planogram_version";
@@ -53,7 +54,11 @@ export function validateParams(body) {
   const compare = p.compare === undefined ? "prior" : p.compare;
   if (!["prior", "yoy"].includes(compare)) return { error: "compare must be prior or yoy" };
   const scope = p.scope || { type: "all" };
-  if (!["all", "region", "cluster", "format", "store"].includes(scope.type)) return { error: "scope.type is not recognised" };
+  if (!["all", "region", "cluster", "format", "store", "storeAttr"].includes(scope.type)) return { error: "scope.type is not recognised" };
+  if (scope.type === "storeAttr" && (typeof scope.fieldId !== "string" || !scope.fieldId)) return { error: "scope.fieldId is required for a store attribute scope" };
+  const pfIn = p.planogramFilter;
+  if (pfIn !== undefined && pfIn !== null && (typeof pfIn !== "object" || typeof pfIn.fieldId !== "string" || typeof pfIn.value !== "string")) return { error: "planogramFilter needs a fieldId and a value" };
+  const planogramFilter = pfIn && pfIn.fieldId && pfIn.value ? { fieldId: pfIn.fieldId, value: pfIn.value, fieldLabel: typeof pfIn.fieldLabel === "string" ? pfIn.fieldLabel : undefined } : undefined;
   if (scope.type !== "all" && (typeof scope.value !== "string" || !scope.value)) return { error: "scope.value is required for that scope" };
   const segmentFieldIds = p.segmentFieldIds === undefined ? [] : p.segmentFieldIds;
   if (!isStringArray(segmentFieldIds) || segmentFieldIds.length > 6) return { error: "segmentFieldIds must be up to six attribute ids" };
@@ -62,7 +67,7 @@ export function validateParams(body) {
   if (a.metric !== undefined) { if (!["sales", "margin", "units"].includes(a.metric)) return { error: "assumptions.metric must be sales, margin or units" }; assumptions.metric = a.metric; }
   for (const k of ["cannibalization", "transfer"]) if (a[k] !== undefined) { if (typeof a[k] !== "number" || a[k] < 0 || a[k] > 1) return { error: `assumptions.${k} must be a number from 0 to 1` }; assumptions[k] = a[k]; }
   if (a.maxRemovalsPerAdd !== undefined) { if (!Number.isInteger(a.maxRemovalsPerAdd) || a.maxRemovalsPerAdd < 0 || a.maxRemovalsPerAdd > 5) return { error: "assumptions.maxRemovalsPerAdd must be 0 to 5" }; assumptions.maxRemovalsPerAdd = a.maxRemovalsPerAdd; }
-  return { params: { category: p.category.trim(), weeks, compare, scope, segmentFieldIds, assumptions } };
+  return { params: { category: p.category.trim(), weeks, compare, scope, planogramFilter, segmentFieldIds, assumptions } };
 }
 
 export async function handleDraftAssortment(req, db) {
@@ -88,11 +93,11 @@ export async function handleDraftAssortment(req, db) {
   if (body.maxPlanogramsPerItem !== undefined && (!Number.isInteger(body.maxPlanogramsPerItem) || body.maxPlanogramsPerItem < 1)) return json(400, { error: "maxPlanogramsPerItem must be a positive integer" });
 
   try {
-    const [planogramRows, productRows, fixtureRows, perfRows, storeRows, settingRows] = await Promise.all([
+    const [planogramRows, productRows, fixtureRows, , storeRows, settingRows] = await Promise.all([
       fetchAll(db, "planograms", "id, data"),
       fetchAll(db, "products", "data"),
       fetchAll(db, "fixtures", "data"),
-      fetchAll(db, "performance", "id, data"),
+      Promise.resolve(null), // performance is read below, only for the products this run needs
       fetchAll(db, "stores", "data"),
       fetchAll(db, "app_settings", "key, value", (q) => q.in("key", ["schema:product"])),
     ]);
@@ -104,9 +109,26 @@ export async function handleDraftAssortment(req, db) {
     if (notNew.length) return json(400, { error: `Not new items (nothing to place): ${notNew.slice(0, 3).join(", ")}` });
 
     const planograms = planogramRows.map((r) => r.data);
+    // A large chain has millions of sales records, so only the products on this category's planograms (plus the new
+    // items' similar items) are read, and only the weeks the two comparison windows need.
+    const needed = new Set();
+    planograms.filter((p) => p.category === checked.params.category).forEach((p) => (p.sections || []).forEach((sec) => (sec.fixtures || []).forEach((fx) => (fx.placements || []).forEach((pl) => needed.add(pl.productId)))));
+    products.filter((p) => ids.includes(p.id)).forEach((p) => (p.newItem?.proxyProductIds || []).forEach((id) => needed.add(id)));
+    const perfRows = [];
+    const neededIds = [...needed];
+    for (let i = 0; i < neededIds.length; i += 100) {
+      const chunk = neededIds.slice(i, i + 100);
+      perfRows.push(...(await fetchAll(db, "performance", "id, data", (q) => q.in("id", chunk))));
+    }
+    const performance = Object.fromEntries(perfRows.map((r) => [r.id, r.data?.records || []]));
+    const latest = getLatestWeekEnding(performance);
+    if (latest) {
+      const horizon = addDaysISO(latest, -(checked.params.weeks * 2 * 7 + (checked.params.compare === "yoy" ? 364 : 0) + 14));
+      Object.keys(performance).forEach((id) => { performance[id] = performance[id].filter((r) => r.weekEnding >= horizon); });
+    }
     const data = {
       products, planograms, fixtures: fixtureRows.map((r) => r.data),
-      performance: Object.fromEntries(perfRows.map((r) => [r.id, r.data?.records || []])),
+      performance,
       stores: storeRows.map((r) => r.data),
       productSchema: parseSetting(settingRows.find((r) => r.key === "schema:product")?.value, []),
     };

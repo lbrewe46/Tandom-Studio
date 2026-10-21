@@ -154,4 +154,13 @@ assert.equal(computeResetImpact({ planogram: planograms[1], allPlanograms: plano
   const miss = await call("cmTok", { planogramIds: ["nope"] }); assert.equal(miss.json.results[0].ok, false); ok("unknown planogram reported, not thrown");
   const notLive = await call("cmTok", { planogramIds: ["v1"] }); assert.equal(notLive.json.results[0].status, "not_live"); assert.equal(notLive.t.reset_impacts.length, 0); ok("a non-Live version is reported and not saved");
 }
+
+{ // summaries can group by a store or planogram attribute the user defined
+  const row = (sid, pre, post) => ({ status: "measured", storeId: sid, storeName: sid, region: "E", format: "F", pre: { sales: pre, units: 1, margin: 1, weeks: 8 }, post: { sales: post, units: 1, margin: 1, weeks: 8 } });
+  const imp = { status: "ok", planogramId: "g1", planogram: { name: "P", category: "C" }, rows: [row("s1", 10, 20), row("s2", 10, 15)] };
+  const byStore = rollupResetImpact([imp], "sattr:fs", { stores: [{ id: "s1", attributes: { fs: "High" } }, { id: "s2" }], planograms: [], fields: { "sattr:fs": "Foot traffic" } });
+  assert.deepEqual(byStore.groups.map((g) => g.label).sort(), ["(No Foot traffic)", "High"]); ok("groups by a store attribute, blanks labelled");
+  const byPog = rollupResetImpact([imp], "pattr:t", { stores: [], planograms: [{ id: "g1", attributes: { t: "A" } }], fields: {} });
+  assert.deepEqual(byPog.groups.map((g) => g.label), ["A"]); ok("groups by a planogram attribute");
+}
 console.log(`\n${n} passed`);

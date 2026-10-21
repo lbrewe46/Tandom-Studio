@@ -67,20 +67,29 @@ export async function recordProposals(db, results, requestedBy, agentId = AGENT_
     agent_id: agentId, target_type: TARGET_TYPE, target_id: r.planogramId,
     proposed_change: r.result, reason: r.reason || summarize(r), score: r.score, status: "pending", requested_by: requestedBy,
   }));
-  let data, error;
-  try { ({ data, error } = await db.from("proposals").insert(rows).select("id, target_id")); }
-  catch (e) { error = { message: e?.message || String(e) }; }
-  if (error || !data) {
-    console.error("draft-reset: could not record proposals", error);
-    const why = `Couldn't record the proposal${error?.message ? ` (${error.message})` : ""} — has the latest supabase/schema.sql been run?`;
-    drafted.forEach((r) => { r.ok = false; r.error = why; delete r.result; delete r.score; });
-    return;
+  // Written in chunks so a run over thousands of planograms is never one huge request; a chunk that fails marks
+  // only its own drafts as failed.
+  const CHUNK = 100;
+  const idByTarget = {};
+  for (let i = 0; i < drafted.length; i += CHUNK) {
+    const slice = drafted.slice(i, i + CHUNK);
+    let data, error;
+    try { ({ data, error } = await db.from("proposals").insert(rows.slice(i, i + CHUNK)).select("id, target_id")); }
+    catch (e) { error = { message: e?.message || String(e) }; }
+    if (error || !data) {
+      console.error("draft-reset: could not record proposals", error);
+      const why = `Couldn't record the proposal${error?.message ? ` (${error.message})` : ""} — has the latest supabase/schema.sql been run?`;
+      slice.forEach((r) => { r.ok = false; r.error = why; delete r.result; delete r.score; });
+      continue;
+    }
+    data.forEach((d) => { idByTarget[d.target_id] = d.id; });
   }
-  const idByTarget = Object.fromEntries(data.map((d) => [d.target_id, d.id]));
-  drafted.forEach((r) => { r.proposalId = idByTarget[r.planogramId]; });
+  const recorded = drafted.filter((r) => r.ok);
+  if (recorded.length === 0) return;
+  recorded.forEach((r) => { r.proposalId = idByTarget[r.planogramId]; });
   try {
     const { error: logError } = await db.from("activity_log").insert(
-      drafted.map((r) => ({
+      recorded.map((r) => ({
         actor_type: "agent", actor_id: agentId, action: "proposal_created", target_type: TARGET_TYPE, target_id: r.planogramId,
         detail: { proposalId: r.proposalId, score: r.score, changes: r.result.changes.length, skipped: r.result.skipped.length, lookbackWeeks: r.result.lookbackWeeks, requestedBy },
       })),

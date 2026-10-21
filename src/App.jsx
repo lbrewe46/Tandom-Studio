@@ -474,12 +474,12 @@ const storageOk = supabaseConfigured;
 
 const BACKUP_VERSION = 1;
 
-function downloadFullBackup({ productSchema, fixtureSchema, primaryKeyField, products, fixtures, planograms, performance, stores }) {
+function downloadFullBackup({ productSchema, fixtureSchema, planogramSchema, storeSchema, primaryKeyField, products, fixtures, planograms, performance, stores }) {
   const payload = {
     app: "Tandom Studio",
     version: BACKUP_VERSION,
     exportedAt: new Date().toISOString(),
-    productSchema, fixtureSchema, primaryKeyField, products, fixtures, planograms, performance, stores,
+    productSchema, fixtureSchema, planogramSchema, storeSchema, primaryKeyField, products, fixtures, planograms, performance, stores,
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
@@ -497,6 +497,8 @@ function parseBackupObject(data) {
   return {
     productSchema: Array.isArray(data.productSchema) ? data.productSchema : DEFAULT_PRODUCT_SCHEMA,
     fixtureSchema: Array.isArray(data.fixtureSchema) ? data.fixtureSchema : DEFAULT_FIXTURE_SCHEMA,
+    planogramSchema: Array.isArray(data.planogramSchema) ? data.planogramSchema : [],
+    storeSchema: Array.isArray(data.storeSchema) ? data.storeSchema : [],
     primaryKeyField: data.primaryKeyField === "upc" ? "upc" : "sku",
     products: Array.isArray(data.products) ? data.products : [],
     fixtures: Array.isArray(data.fixtures) ? data.fixtures : [],
@@ -752,6 +754,118 @@ function BackupRestorePanel({ dataBundle, onImport }) {
       )}
     </div>
   );
+}
+
+/* ------------------------------------------------------------------ */
+/* User-defined attributes on planograms and stores, and column lists   */
+/* ------------------------------------------------------------------ */
+
+// How an attribute value reads in a list, on a card, or in a report.
+function attrDisplay(field, v) {
+  if (v === undefined || v === null || v === "") return "";
+  if (field?.type === "boolean") return v === true || v === "true" ? "Yes" : "No";
+  return String(v);
+}
+const attrOptions = (field) => String(field?.options || "").split(",").map((o) => o.trim()).filter(Boolean);
+// The value to store for what was typed/picked: numbers as numbers, Yes/No as booleans, blank clears it.
+function attrCoerce(field, raw) {
+  if (raw === "" || raw === undefined || raw === null) return "";
+  if (field?.type === "number") { const n = Number(raw); return Number.isFinite(n) ? n : ""; }
+  if (field?.type === "boolean") return raw === true || raw === "true";
+  return String(raw).trim();
+}
+
+// One attribute input of the right kind. `live` edits on every keystroke (forms with a Save button);
+// otherwise text and numbers are committed after a pause or on leaving the box (inline cells).
+function AttributeInput({ field, value, onChange, live = false, className = "" }) {
+  const cls = className || inputCls;
+  if (field.type === "select") {
+    return (
+      <select className={cls} value={value ?? ""} onChange={(e) => onChange(e.target.value)}>
+        <option value="">—</option>
+        {attrOptions(field).concat(value && !attrOptions(field).includes(String(value)) ? [String(value)] : []).map((o) => <option key={o} value={o}>{o}</option>)}
+      </select>
+    );
+  }
+  if (field.type === "boolean") {
+    return (
+      <select className={cls} value={value === true || value === "true" ? "true" : value === false || value === "false" ? "false" : ""} onChange={(e) => onChange(e.target.value === "" ? "" : e.target.value === "true")}>
+        <option value="">—</option><option value="true">Yes</option><option value="false">No</option>
+      </select>
+    );
+  }
+  const t = field.type === "number" ? "number" : "text";
+  if (live) return <input type={t} className={cls} value={value ?? ""} onChange={(e) => onChange(e.target.value)} />;
+  return <DebouncedTextInput type={t} className={cls} value={value === undefined || value === null ? "" : String(value)} onCommit={(v) => onChange(v)} />;
+}
+
+// A labelled grid of every attribute a schema defines, for the forms and the planogram editor.
+function AttributeFields({ schema, values, onChange, live = true, columns = "grid-cols-2 sm:grid-cols-3" }) {
+  if (!schema || schema.length === 0) return null;
+  return (
+    <div className={`grid ${columns} gap-3`}>
+      {schema.map((f) => (
+        <Field key={f.id} label={f.label}>
+          <AttributeInput field={f} live={live} value={values?.[f.id]} onChange={(v) => onChange({ ...(values || {}), [f.id]: attrCoerce(f, v) })} />
+        </Field>
+      ))}
+    </div>
+  );
+}
+
+// Which columns a list shows. Built-in columns plus one column per attribute the schema defines; the choice is
+// remembered per browser. Attribute columns start switched off.
+function useColumnPrefs(storageKey, builtin, attrSchema) {
+  const columns = React.useMemo(
+    () => [...builtin, ...(attrSchema || []).map((f) => ({ id: `attr:${f.id}`, label: f.label, attr: f, editable: true, type: f.type, defaultOn: false }))],
+    [builtin, attrSchema],
+  );
+  const [saved, setSaved] = useState(() => {
+    try { const v = JSON.parse(window.localStorage.getItem(storageKey) || "null"); if (Array.isArray(v)) return v; } catch (e) { /* storage unavailable: defaults */ }
+    return null;
+  });
+  const ids = saved || builtin.filter((c) => c.defaultOn).map((c) => c.id);
+  const visible = columns.filter((c) => c.locked || ids.includes(c.id));
+  const toggle = (id) => setSaved((prev) => {
+    const base = prev || builtin.filter((c) => c.defaultOn).map((c) => c.id);
+    const next = base.includes(id) ? base.filter((x) => x !== id) : [...base, id];
+    try { window.localStorage.setItem(storageKey, JSON.stringify(next)); } catch (e) { /* ignore */ }
+    return next;
+  });
+  return { columns, visible, toggle };
+}
+
+function ColumnMenu({ columns, visible, onToggle, label = "Columns" }) {
+  const [open, setOpen] = useState(false);
+  const shown = new Set(visible.map((c) => c.id));
+  const builtin = columns.filter((c) => !c.attr), attrs = columns.filter((c) => c.attr);
+  const row = (c) => (
+    <label key={c.id} className={`flex items-center gap-2 text-xs px-1.5 py-1 rounded ${c.locked ? "text-slate-400" : "text-slate-700 hover:bg-slate-50 cursor-pointer"}`}>
+      <input type="checkbox" className="accent-amber-500" disabled={c.locked} checked={c.locked || shown.has(c.id)} onChange={() => onToggle(c.id)} />
+      {c.label}
+    </label>
+  );
+  return (
+    <div className="relative">
+      <button className={btnGhost} onClick={() => setOpen((v) => !v)}><Settings2 size={13} /> {label}</button>
+      {open && (
+        <div className="absolute right-0 z-30 mt-1 w-56 max-h-80 overflow-y-auto bg-white border border-slate-200 rounded-lg shadow-lg p-2" onClick={(e) => e.stopPropagation()}>
+          {builtin.map(row)}
+          {attrs.length > 0 && <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400 mt-2 mb-0.5 px-1.5">Your attributes</div>}
+          {attrs.map(row)}
+          {attrs.length === 0 && <div className="text-[11px] text-slate-400 mt-2 px-1.5">Add your own fields under Settings to show them here.</div>}
+          <button className="text-xs text-slate-500 hover:underline mt-1 px-1.5" onClick={() => setOpen(false)}>Done</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Small "Label: value" chips for the attribute columns a card should show.
+function AttributeChips({ columns, entity }) {
+  const chips = columns.filter((c) => c.attr).map((c) => [c.label, attrDisplay(c.attr, entity.attributes?.[c.attr.id])]).filter(([, v]) => v);
+  if (chips.length === 0) return null;
+  return <div className="flex flex-wrap gap-1 mt-1.5">{chips.map(([l, v]) => <span key={l} className="text-[10px] rounded-full px-2 py-0.5 bg-slate-100 text-slate-600 border border-slate-200">{l}: {v}</span>)}</div>;
 }
 
 function SchemaEditor({ title, schema, onChange, max }) {
@@ -1523,14 +1637,23 @@ const IMPACT_DIMENSIONS = [
 ];
 // impacts: computeResetImpact results (status "ok"). Only stores with a full after-window ("measured") count;
 // maturing stores are tallied separately so nobody reads a half-finished result as final.
-function rollupResetImpact(impacts, dimension) {
+// `lookup` (optional) lets a summary group by a user-defined attribute: { stores, planograms, fields }, where
+// dimensions "sattr:<fieldId>" / "pattr:<fieldId>" read the store's / planogram's attributes.
+function rollupResetImpact(impacts, dimension, lookup) {
+  const attrLabel = (entity, fieldId) => {
+    const v = entity && entity.attributes ? entity.attributes[fieldId] : undefined;
+    return v === undefined || v === null || v === "" ? "" : v === true ? "Yes" : v === false ? "No" : String(v);
+  };
+  const byId = (list) => Object.fromEntries((list || []).map((x) => [x.id, x]));
+  const storesById = lookup ? byId(lookup.stores) : {}, planogramsById = lookup ? byId(lookup.planograms) : {};
   const groups = new Map();
   let maturing = 0;
   (impacts || []).filter((i) => i && i.status === "ok").forEach((imp) => {
     (imp.rows || []).forEach((r) => {
       if (r.status === "maturing") maturing++;
       if (r.status !== "measured") return;
-      const label = ({
+      const attrDim = typeof dimension === "string" && /^[sp]attr:/.test(dimension);
+      const label = attrDim ? (dimension[0] === "s" ? attrLabel(storesById[r.storeId], dimension.slice(6)) : attrLabel(planogramsById[imp.planogramId], dimension.slice(6))) || `(No ${(lookup && lookup.fields && lookup.fields[dimension]) || "value"})` : ({
         region: r.region, store: `${r.storeName}${r.storeNumber ? ` (#${r.storeNumber})` : ""}`, format: r.format,
         category: imp.planogram.category, department: imp.planogram.department, cluster: imp.planogram.cluster, planogram: imp.planogram.name,
       }[dimension]) || `(No ${(IMPACT_DIMENSIONS.find((d) => d.id === dimension) || {}).label || dimension})`;
@@ -2462,7 +2585,8 @@ function storeEffectiveStatus(s) {
   return s.status || "Live";
 }
 
-function StoreForm({ initial, onSave, onCancel }) {
+function StoreForm({ initial, storeSchema, onSave, onCancel }) {
+  const [attributes, setAttributes] = useState(initial?.attributes || {});
   const [name, setName] = useState(initial?.name || "");
   const [storeNumber, setStoreNumber] = useState(initial?.storeNumber || "");
   const [address, setAddress] = useState(initial?.address || "");
@@ -2484,6 +2608,7 @@ function StoreForm({ initial, onSave, onCancel }) {
       format,
       squareFootage: Number(squareFootage) || 0,
       status,
+      attributes,
     });
   };
 
@@ -2506,6 +2631,12 @@ function StoreForm({ initial, onSave, onCancel }) {
         </Field>
         <Field label="Sq Footage"><input type="number" className={inputCls} value={squareFootage} onChange={(e) => setSquareFootage(e.target.value)} /></Field>
       </div>
+      {storeSchema && storeSchema.length > 0 && (
+        <div>
+          <div className={labelCls}>Your attributes</div>
+          <AttributeFields schema={storeSchema} values={attributes} onChange={setAttributes} columns="grid-cols-2" />
+        </div>
+      )}
       <Field label="Status">
         <div className="grid grid-cols-5 gap-1.5">
           {STORE_STATUSES.map((st) => (
@@ -2528,7 +2659,19 @@ function StoreForm({ initial, onSave, onCancel }) {
   );
 }
 
-function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
+const STORE_LIST_COLUMNS = [
+  { id: "name", label: "Name", locked: true, defaultOn: true },
+  { id: "storeNumber", label: "Store #", defaultOn: true },
+  { id: "status", label: "Status", defaultOn: true },
+  { id: "format", label: "Format", defaultOn: true },
+  { id: "address", label: "Address", defaultOn: true },
+  { id: "region", label: "Region", defaultOn: true },
+  { id: "cluster", label: "Cluster", defaultOn: false },
+  { id: "squareFootage", label: "Sq Ft", defaultOn: true },
+];
+
+function StoreLibrary({ stores, storeSchema, onCreate, onUpdate, onDelete }) {
+  const { columns, visible, toggle } = useColumnPrefs("tandom:storeListColumns", STORE_LIST_COLUMNS, storeSchema);
   const [editing, setEditing] = useState(null);
   const [query, setQuery] = useState("");
   const [viewMode, setViewMode] = useState("grid"); // grid | list
@@ -2536,6 +2679,7 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
   if (editing) {
     return (
       <StoreForm
+        storeSchema={storeSchema}
         initial={editing === "new" ? null : editing}
         onCancel={() => setEditing(null)}
         onSave={(s) => { editing === "new" ? onCreate(s) : onUpdate(s); setEditing(null); }}
@@ -2545,7 +2689,7 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
   const q = query.trim().toLowerCase();
   const statusFiltered = statusFilter === "All" ? stores : stores.filter((s) => storeEffectiveStatus(s) === statusFilter);
   const filtered = !q ? statusFiltered : statusFiltered.filter((s) =>
-    [s.name, s.storeNumber, s.address, s.region, s.cluster, s.format].filter(Boolean).join(" ").toLowerCase().includes(q)
+    [s.name, s.storeNumber, s.address, s.region, s.cluster, s.format, ...Object.values(s.attributes || {})].filter((x) => x !== undefined && x !== null && x !== "").join(" ").toLowerCase().includes(q)
   );
   const statusCounts = {};
   stores.forEach((s) => { const st = storeEffectiveStatus(s); statusCounts[st] = (statusCounts[st] || 0) + 1; });
@@ -2571,6 +2715,7 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
               </button>
             </div>
           )}
+          {stores.length > 0 && <ColumnMenu columns={columns} visible={visible} onToggle={toggle} label={viewMode === "list" ? "Columns" : "Card fields"} />}
           <button className={btnPrimary} onClick={() => setEditing("new")}><Plus size={14} /> New Store</button>
         </div>
       </div>
@@ -2620,28 +2765,23 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
           <table className="w-full text-xs">
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50">
-                <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Name</th>
-                <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Store #</th>
-                <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Status</th>
-                <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Format</th>
-                <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Address</th>
-                <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Region</th>
-                <th className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">Sq Ft</th>
+                {visible.map((c) => <th key={c.id} className="text-left font-semibold text-slate-500 uppercase tracking-wide px-3 py-2 whitespace-nowrap">{c.label}</th>)}
                 <th className="px-3 py-2"></th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {filtered.map((s) => (
                 <tr key={s.id} className="hover:bg-slate-50">
-                  <td className="px-3 py-2 font-medium text-slate-800 whitespace-nowrap">{s.name}</td>
-                  <td className="px-3 py-2 text-slate-500 font-mono whitespace-nowrap">#{s.storeNumber || "—"}</td>
-                  <td className="px-3 py-2 whitespace-nowrap">
-                    <span className={`text-[10px] uppercase tracking-wide rounded px-1.5 py-0.5 border ${STORE_STATUS_COLORS[storeEffectiveStatus(s)] || STORE_STATUS_COLORS.Live}`}>{storeEffectiveStatus(s)}</span>
-                  </td>
-                  <td className="px-3 py-2 whitespace-nowrap"><span className="text-[10px] uppercase tracking-wide bg-slate-100 text-slate-500 rounded px-1.5 py-0.5">{s.format || "—"}</span></td>
-                  <td className="px-3 py-2 text-slate-600 whitespace-nowrap max-w-[260px] truncate" title={s.address}>{s.address || "—"}</td>
-                  <td className="px-3 py-2 text-slate-500 whitespace-nowrap">{s.region || "—"}</td>
-                  <td className="px-3 py-2 text-slate-500 whitespace-nowrap">{s.squareFootage ? s.squareFootage.toLocaleString() : "—"}</td>
+                  {visible.map((c) => {
+                    if (c.attr) return <td key={c.id} className="px-3 py-2 text-slate-600 whitespace-nowrap">{attrDisplay(c.attr, s.attributes?.[c.attr.id]) || "—"}</td>;
+                    if (c.id === "name") return <td key={c.id} className="px-3 py-2 font-medium text-slate-800 whitespace-nowrap">{s.name}</td>;
+                    if (c.id === "storeNumber") return <td key={c.id} className="px-3 py-2 text-slate-500 font-mono whitespace-nowrap">#{s.storeNumber || "—"}</td>;
+                    if (c.id === "status") return <td key={c.id} className="px-3 py-2 whitespace-nowrap"><span className={`text-[10px] uppercase tracking-wide rounded px-1.5 py-0.5 border ${STORE_STATUS_COLORS[storeEffectiveStatus(s)] || STORE_STATUS_COLORS.Live}`}>{storeEffectiveStatus(s)}</span></td>;
+                    if (c.id === "format") return <td key={c.id} className="px-3 py-2 whitespace-nowrap"><span className="text-[10px] uppercase tracking-wide bg-slate-100 text-slate-500 rounded px-1.5 py-0.5">{s.format || "—"}</span></td>;
+                    if (c.id === "address") return <td key={c.id} className="px-3 py-2 text-slate-600 whitespace-nowrap max-w-[260px] truncate" title={s.address}>{s.address || "—"}</td>;
+                    if (c.id === "squareFootage") return <td key={c.id} className="px-3 py-2 text-slate-500 whitespace-nowrap">{s.squareFootage ? s.squareFootage.toLocaleString() : "—"}</td>;
+                    return <td key={c.id} className="px-3 py-2 text-slate-500 whitespace-nowrap">{s[c.id] || "—"}</td>;
+                  })}
                   <td className="px-3 py-2 text-right whitespace-nowrap">
                     <button className="text-xs text-amber-600 font-medium hover:underline mr-3" onClick={() => setEditing(s)}>Edit</button>
                     <button className="text-xs text-red-500 font-medium hover:underline" onClick={() => onDelete(s.id)}>Delete</button>
@@ -2665,6 +2805,7 @@ function StoreLibrary({ stores, onCreate, onUpdate, onDelete }) {
               </div>
               <div className="text-xs text-slate-500 mt-1">{s.address}</div>
               <div className="text-xs text-slate-400 mt-1">{s.region}{s.squareFootage ? ` · ${s.squareFootage.toLocaleString()} sq ft` : ""}</div>
+              <AttributeChips columns={visible} entity={s} />
               <div className="flex gap-2 mt-1.5">
                 <button className="text-xs text-amber-600 font-medium hover:underline" onClick={() => setEditing(s)}>Edit</button>
                 <button className="text-xs text-red-500 font-medium hover:underline" onClick={() => onDelete(s.id)}>Delete</button>
@@ -3841,6 +3982,19 @@ const HELP_SECTIONS = [
     ],
   },
   {
+    id: "customAttributes",
+    title: "Planogram and Store Attributes",
+    blocks: [
+      { type: "p", text: "Planograms and stores can carry your own attributes, the same way products do. Define them under **Settings** (Planogram Attribute Fields and Store Attribute Fields) as text, number, Yes/No or dropdown fields, for example a planogram's *Assortment tier* or a store's *Foot traffic*." },
+      { type: "ul", items: [
+        "**Filling them in:** on the New Planogram and store forms, and on a planogram's Attributes tab.",
+        "**Lists and cards:** press **Columns** (list view) or **Card fields** (grid view) on the Planograms and Stores tabs and tick the attributes to show. In the planogram list they can be edited in place and set on many selected planograms at once with **Set**.",
+        "**Assortment:** look at stores by an attribute (or compare slow movers across it), and limit the analysis to planograms with a given attribute value.",
+        "**Reset Impact:** Summarize by any store or planogram attribute.",
+      ] },
+    ],
+  },
+  {
     id: "resetImpact",
     title: "Reset Impact",
     blocks: [
@@ -4981,7 +5135,8 @@ function ProSpaceImportModal({ products, fixtures, productSchema, onClose, onImp
 /* Planogram list                                                       */
 /* ------------------------------------------------------------------ */
 
-function NewPlanogramForm({ existingCategories, onCreate, onCancel }) {
+function NewPlanogramForm({ existingCategories, planogramSchema, onCreate, onCancel }) {
+  const [attributes, setAttributes] = useState({});
   const [name, setName] = useState("");
   const [category, setCategory] = useState("");
   const [eventDate, setEventDate] = useState("");
@@ -5013,6 +5168,12 @@ function NewPlanogramForm({ existingCategories, onCreate, onCancel }) {
         <Field label="Base Height (in)"><input type="number" className={inputCls} value={base} onChange={(e) => setBase(e.target.value)} /></Field>
       </div>
       <p className="text-xs text-slate-400">Base is the distance from the floor to where the first shelf notch begins (kick plate).</p>
+      {planogramSchema && planogramSchema.length > 0 && (
+        <div>
+          <div className={labelCls}>Your attributes</div>
+          <AttributeFields schema={planogramSchema} values={attributes} onChange={setAttributes} columns="grid-cols-2" />
+        </div>
+      )}
       <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
         <button className={btnGhost} onClick={onCancel}>Cancel</button>
         <button
@@ -5026,6 +5187,7 @@ function NewPlanogramForm({ existingCategories, onCreate, onCancel }) {
               eventDate: eventDate || "",
               dims: { w: Number(w) || 48, h: Number(h) || 84, d: Number(d) || 20 },
               base: Number(base) || 0,
+              attributes,
               sections: [],
               storeIds: [],
               status: "wip", // every planogram starts here — see Planogram Lifecycle
@@ -5059,7 +5221,7 @@ const byStoreThenPlanogram = (storeKey, planogramKey) => (a, b) =>
   String(a[storeKey] || "").localeCompare(String(b[storeKey] || ""), undefined, { numeric: true, sensitivity: "base" })
   || String(a[planogramKey] || "").localeCompare(String(b[planogramKey] || ""), undefined, { numeric: true, sensitivity: "base" });
 
-function PlanogramList({ planograms, stores, products, fixtures, productSchema, onCreate, onOpen, onDelete, onUpdate, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace, onDraftResetBulk, draftingReset, proposals, profileNames, onOpenProposal }) {
+function PlanogramList({ planograms, stores, products, fixtures, productSchema, planogramSchema, onCreate, onOpen, onDelete, onUpdate, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace, onDraftResetBulk, draftingReset, proposals, profileNames, currentUserId, onOpenProposal }) {
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
   const [bulkLookbackWeeks, setBulkLookbackWeeks] = useState(13);
@@ -5073,29 +5235,22 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
   const [assigningId, setAssigningId] = useState(null);
   const [selectedIds, setSelectedIds] = useState(() => new Set()); // for bulk actions (e.g. Create Versions)
   const [viewMode, setViewMode] = useState("grid"); // grid | list
-  const [visibleCols, setVisibleCols] = useState(() => {
-    try {
-      const saved = JSON.parse(window.localStorage.getItem("tandom:planogramListColumns") || "null");
-      if (Array.isArray(saved)) return saved.filter((id) => PLANOGRAM_LIST_COLUMNS.some((c) => c.id === id));
-    } catch (e) { /* storage unavailable: use defaults */ }
-    return PLANOGRAM_LIST_COLUMNS.filter((c) => c.defaultOn).map((c) => c.id);
-  });
-  const [showColumnMenu, setShowColumnMenu] = useState(false);
+  const { columns, visible: visibleColumns, toggle: toggleColumn } = useColumnPrefs("tandom:planogramListColumns", PLANOGRAM_LIST_COLUMNS, planogramSchema);
   const [bulkField, setBulkField] = useState("category");
   const [bulkValue, setBulkValue] = useState("");
 
   const categories = Array.from(new Set(planograms.map((p) => p.category).filter(Boolean))).sort();
-  const toggleColumn = (id) => setVisibleCols((prev) => {
-    const next = prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id];
-    try { window.localStorage.setItem("tandom:planogramListColumns", JSON.stringify(next)); } catch (e) { /* ignore */ }
-    return next;
-  });
   const applyBulk = () => {
-    const col = PLANOGRAM_LIST_COLUMNS.find((c) => c.id === bulkField);
+    const col = columns.find((c) => c.id === bulkField);
     if (!col || !col.editable || !onUpdate) return;
-    const value = bulkValue.trim();
     if (col.id === "name") return;
-    planograms.filter((p) => selectedIds.has(p.id)).forEach((p) => onUpdate({ ...p, [col.id]: value }));
+    if (col.attr) {
+      const value = attrCoerce(col.attr, typeof bulkValue === "string" ? bulkValue.trim() : bulkValue);
+      planograms.filter((p) => selectedIds.has(p.id)).forEach((p) => onUpdate({ ...p, attributes: { ...(p.attributes || {}), [col.attr.id]: value } }));
+    } else {
+      const value = bulkValue.trim();
+      planograms.filter((p) => selectedIds.has(p.id)).forEach((p) => onUpdate({ ...p, [col.id]: value }));
+    }
     setBulkValue("");
   };
 
@@ -5185,6 +5340,7 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
               List
             </button>
           </div>
+          {planograms.length > 0 && <ColumnMenu columns={columns} visible={visibleColumns} onToggle={toggleColumn} label={viewMode === "list" ? "Columns" : "Card fields"} />}
           <button className={btnGhost} onClick={() => setImporting(true)}><Upload size={14} /> Import .psa file</button>
           <button className={btnPrimary} onClick={() => setCreating(true)}><Plus size={14} /> New Planogram</button>
         </div>
@@ -5200,7 +5356,7 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
         />
       )}
 
-      <ResetDraftQueue planograms={planograms} proposals={proposals} profileNames={profileNames} onOpenDraft={onOpen} onOpenProposal={onOpenProposal} />
+      <ResetDraftQueue planograms={planograms} proposals={proposals} profileNames={profileNames} currentUserId={currentUserId} onOpenDraft={onOpen} onOpenProposal={onOpenProposal} />
 
       {planograms.length > 0 && (
         <div className="bg-white border border-slate-200 rounded-lg p-3 mb-4 space-y-3">
@@ -5302,17 +5458,27 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
             <div className="flex items-center gap-1.5 border-l border-amber-200 pl-3">
               <span className="text-xs text-amber-800">Set</span>
               <select className="text-xs border border-slate-300 rounded-md px-1.5 py-1 bg-white" value={bulkField} onChange={(e) => { setBulkField(e.target.value); setBulkValue(""); }}>
-                {PLANOGRAM_LIST_COLUMNS.filter((c) => c.editable && c.id !== "name").map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+                {columns.filter((c) => c.editable && c.id !== "name").map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
               </select>
-              <input
-                type={bulkField === "eventDate" ? "date" : "text"}
-                className="text-xs border border-slate-300 rounded-md px-1.5 py-1 bg-white w-32"
-                value={bulkValue}
-                onChange={(e) => setBulkValue(e.target.value)}
-                placeholder="blank clears it"
-                list={bulkField === "category" ? "planogram-category-options" : undefined}
-              />
-              <button className={btnGhost} onClick={applyBulk} title={`Set ${PLANOGRAM_LIST_COLUMNS.find((c) => c.id === bulkField)?.label} on all ${selectedCount} selected`}><Check size={13} /> Apply</button>
+              {(() => {
+                const col = columns.find((c) => c.id === bulkField);
+                const common = "text-xs border border-slate-300 rounded-md px-1.5 py-1 bg-white w-32";
+                if (col?.attr && (col.attr.type === "select" || col.attr.type === "boolean")) {
+                  const opts = col.attr.type === "boolean" ? [["true", "Yes"], ["false", "No"]] : attrOptions(col.attr).map((o) => [o, o]);
+                  return <select className={common} value={String(bulkValue)} onChange={(e) => setBulkValue(e.target.value)}><option value="">blank clears it</option>{opts.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select>;
+                }
+                return (
+                  <input
+                    type={bulkField === "eventDate" ? "date" : col?.attr?.type === "number" ? "number" : "text"}
+                    className={common}
+                    value={bulkValue}
+                    onChange={(e) => setBulkValue(e.target.value)}
+                    placeholder="blank clears it"
+                    list={bulkField === "category" ? "planogram-category-options" : undefined}
+                  />
+                );
+              })()}
+              <button className={btnGhost} onClick={applyBulk} title={`Set ${columns.find((c) => c.id === bulkField)?.label} on all ${selectedCount} selected`}><Check size={13} /> Apply</button>
             </div>
           )}
           <button className="text-xs text-slate-500 hover:underline ml-auto" onClick={() => setSelectedIds(new Set())}>Clear selection</button>
@@ -5339,27 +5505,13 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
           <datalist id="planogram-category-options">{categories.map((c) => <option key={c} value={c} />)}</datalist>
           <div className="flex items-center justify-between mb-2">
             <span className="text-xs text-slate-400">{onUpdate ? "Click a cell to edit it. Changes save as you go." : ""}</span>
-            <div className="relative">
-              <button className={btnGhost} onClick={() => setShowColumnMenu((v) => !v)}><Settings2 size={13} /> Columns</button>
-              {showColumnMenu && (
-                <div className="absolute right-0 z-30 mt-1 w-48 bg-white border border-slate-200 rounded-lg shadow-lg p-2" onClick={(e) => e.stopPropagation()}>
-                  {PLANOGRAM_LIST_COLUMNS.map((c) => (
-                    <label key={c.id} className={`flex items-center gap-2 text-xs px-1.5 py-1 rounded ${c.locked ? "text-slate-400" : "text-slate-700 hover:bg-slate-50 cursor-pointer"}`}>
-                      <input type="checkbox" className="accent-amber-500" disabled={c.locked} checked={c.locked || visibleCols.includes(c.id)} onChange={() => toggleColumn(c.id)} />
-                      {c.label}
-                    </label>
-                  ))}
-                  <button className="text-xs text-slate-500 hover:underline mt-1 px-1.5" onClick={() => setShowColumnMenu(false)}>Done</button>
-                </div>
-              )}
-            </div>
           </div>
           <div className="bg-white border border-slate-200 rounded-lg">
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50 text-left">
                   <th className="w-8 px-3 py-2"></th>
-                  {PLANOGRAM_LIST_COLUMNS.filter((c) => c.locked || visibleCols.includes(c.id)).map((c) => (
+                  {visibleColumns.map((c) => (
                     <th key={c.id} className="px-2 py-2 font-semibold text-slate-500 uppercase tracking-wide whitespace-nowrap">{c.label}</th>
                   ))}
                   <th className="px-2 py-2"></th>
@@ -5408,6 +5560,11 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
                         </div>
                       );
                     }
+                    if (c.attr) {
+                      const val = p.attributes?.[c.attr.id];
+                      if (!onUpdate) return <span className="text-slate-600">{attrDisplay(c.attr, val)}</span>;
+                      return <AttributeInput field={c.attr} className={cellInput + " min-w-[100px]"} value={val} onChange={(v) => { const next = attrCoerce(c.attr, v); if ((val ?? "") !== next) onUpdate({ ...p, attributes: { ...(p.attributes || {}), [c.attr.id]: next } }); }} />;
+                    }
                     if (!onUpdate) return <span className="text-slate-600">{p[c.id] || ""}</span>;
                     if (c.type === "date") {
                       return <input type="date" className={cellInput + " w-32"} value={p[c.id] || ""} onChange={(e) => onUpdate({ ...p, [c.id]: e.target.value })} />;
@@ -5419,7 +5576,7 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
                       <td className="px-3 py-1.5">
                         <input type="checkbox" className="accent-amber-500 w-3.5 h-3.5" checked={selectedIds.has(p.id)} onChange={() => toggleSelected(p.id)} />
                       </td>
-                      {PLANOGRAM_LIST_COLUMNS.filter((c) => c.locked || visibleCols.includes(c.id)).map((c) => (
+                      {visibleColumns.map((c) => (
                         <td key={c.id} className="px-1.5 py-1.5 align-middle">{cell(c)}</td>
                       ))}
                       <td className="px-2 py-1.5 whitespace-nowrap text-right">
@@ -5465,6 +5622,7 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
                 <span>{p.sections.length} section{p.sections.length !== 1 ? "s" : ""}</span>
                 {p.eventDate && <span className="flex items-center gap-1"><CalendarDays size={11} /> {p.eventDate}</span>}
               </div>
+              <AttributeChips columns={visibleColumns} entity={p} />
               <div className="flex items-center justify-between mt-2">
                 <button
                   onClick={(e) => { e.stopPropagation(); setAssigningId(assigningId === p.id ? null : p.id); }}
@@ -8098,16 +8256,36 @@ function buildResetDraftQueue(planograms, proposals) {
   return [...drafts, ...fresh].sort((a, b) => a.score - b.score);
 }
 
-function ResetDraftQueue({ planograms, proposals, profileNames, onOpenDraft, onOpenProposal }) {
-  const pending = buildResetDraftQueue(planograms, proposals);
+function ResetDraftQueue({ planograms, proposals, profileNames, currentUserId, onOpenDraft, onOpenProposal }) {
+  const all = buildResetDraftQueue(planograms, proposals);
+  const [scope, setScope] = useState("mine"); // "mine" | "all"
+  // Collapsed by default so a long queue never pushes the planogram list down; the choice is remembered per browser.
+  const [open, setOpen] = useState(() => { try { return window.localStorage.getItem("tandom:draftQueueOpen") === "1"; } catch (e) { return false; } });
+  const toggleOpen = () => setOpen((v) => { const n = !v; try { window.localStorage.setItem("tandom:draftQueueOpen", n ? "1" : "0"); } catch (e) { /* ignore */ } return n; });
+  // Mine = drafts I asked for. Older in-place drafts carry no requester, so they only show under All.
+  const isMine = (item) => !!currentUserId && item.proposal?.requested_by === currentUserId;
+  const mine = all.filter(isMine);
+  const pending = scope === "mine" ? mine : all;
 
-  if (pending.length === 0) return null;
+  if (all.length === 0) return null;
 
   return (
-    <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
-      <h3 className="text-sm font-semibold text-blue-900 flex items-center gap-1.5 mb-1"><Sparkles size={15} /> AI Draft Review Queue ({pending.length})</h3>
+    <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-2.5 mb-4">
+      <button onClick={toggleOpen} className="w-full flex items-center gap-2 text-left">
+        <Sparkles size={15} className="text-blue-900" />
+        <span className="text-sm font-semibold text-blue-900">AI Draft Review Queue</span>
+        <span className="text-xs text-blue-700">{mine.length} mine · {all.length} total</span>
+        <span className="ml-auto text-blue-700">{open ? <ChevronUp size={16} /> : <ChevronDown size={16} />}</span>
+      </button>
+      {open && <div className="mt-2">
+      <div className="flex gap-1 mb-2">
+        {[["mine", `My drafts (${mine.length})`], ["all", `All drafts (${all.length})`]].map(([id, label]) => (
+          <button key={id} onClick={() => setScope(id)} className={`text-xs font-semibold rounded-full px-3 py-1 border ${scope === id ? "bg-blue-600 text-white border-blue-600" : "bg-white text-blue-700 border-blue-200 hover:bg-blue-100"}`}>{label}</button>
+        ))}
+      </div>
       <p className="text-xs text-blue-700 mb-3">Sorted lowest score first — these are the drafts that most needed a human to finish the job.</p>
-      <div className="divide-y divide-blue-100 bg-white rounded-md border border-blue-100">
+      {pending.length === 0 && <p className="text-xs text-blue-700 italic bg-white rounded-md border border-blue-100 px-3 py-3">{scope === "mine" ? "You haven't drafted anything awaiting review. Switch to All drafts to see your teammates'." : "Nothing is waiting for review."}</p>}
+      <div className="divide-y divide-blue-100 bg-white rounded-md border border-blue-100 max-h-64 overflow-y-auto">
         {pending.map(({ kind, planogram: p, proposal, score }) => {
           const band = resetDraftScoreBand(score);
           const requester = proposal?.requested_by ? profileNames[proposal.requested_by] : null;
@@ -8128,6 +8306,7 @@ function ResetDraftQueue({ planograms, proposals, profileNames, onOpenDraft, onO
           );
         })}
       </div>
+      </div>}
     </div>
   );
 }
@@ -8552,7 +8731,7 @@ function PlanogramVersionsBar({ planogram, allPlanograms, onCreateVersion, onOpe
   );
 }
 
-function PlanogramEditor({ planogram, products, fixtures, performance, productSchema, resetThresholds, dosTargets, stores, capacityWarningsEnabled, onAssignStores, onUpdate, onBack, allPlanograms, onCreateVersion, onOpenVersion, onMakeLive, onResolveIssue, onDraftReset, draftingReset, onApproveResetDraft, onDiscardResetDraft }) {
+function PlanogramEditor({ planogram, products, fixtures, performance, productSchema, planogramSchema, resetThresholds, dosTargets, stores, capacityWarningsEnabled, onAssignStores, onUpdate, onBack, allPlanograms, onCreateVersion, onOpenVersion, onMakeLive, onResolveIssue, onDraftReset, draftingReset, onApproveResetDraft, onDiscardResetDraft }) {
   const [presentMode, setPresentMode] = useState(false);
   const [hideImages, setHideImages] = useState(false); // session-only view toggle, not saved with the planogram
   const [highlightField, setHighlightField] = useState(null); // attribute field id, or null = off
@@ -9211,6 +9390,11 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
             <Field label="Department"><DebouncedTextInput className={inputCls + " w-36"} value={planogram.department || ""} onCommit={(department) => onUpdate({ ...planogram, department })} placeholder="e.g. Grocery" /></Field>
             <Field label="Cluster"><DebouncedTextInput className={inputCls + " w-36"} value={planogram.cluster || ""} onCommit={(cluster) => onUpdate({ ...planogram, cluster })} placeholder="e.g. Urban Large" /></Field>
             <Field label="Event Date"><input type="date" className={inputCls + " w-36"} value={planogram.eventDate || ""} onChange={(e) => onUpdate({ ...planogram, eventDate: e.target.value })} /></Field>
+            {(planogramSchema || []).map((f) => (
+              <Field key={f.id} label={f.label}>
+                <AttributeInput field={f} className={inputCls + " w-36"} value={planogram.attributes?.[f.id]} onChange={(v) => onUpdate({ ...planogram, attributes: { ...(planogram.attributes || {}), [f.id]: attrCoerce(f, v) } })} />
+              </Field>
+            ))}
             <div className="relative">
               <label className={labelCls}>Stores</label>
               <button
@@ -11354,7 +11538,7 @@ function ImpactRowsTable({ impact, metricId }) {
   );
 }
 
-function ResetImpactModule({ planograms }) {
+function ResetImpactModule({ planograms, stores, storeSchema, planogramSchema }) {
   const [state, setState] = useState({ status: "loading", rows: [], error: "" });
   const [measuring, setMeasuring] = useState(false);
   const [message, setMessage] = useState(null); // {type: "ok"|"error", text}
@@ -11365,6 +11549,8 @@ function ResetImpactModule({ planograms }) {
   const [preWeeks, setPreWeeks] = useState(8);
   const [postWeeks, setPostWeeks] = useState(8);
   const [expanded, setExpanded] = useState(null);
+  const impactDims = React.useMemo(() => [...IMPACT_DIMENSIONS, ...(storeSchema || []).map((f) => ({ id: `sattr:${f.id}`, label: `Store: ${f.label}` })), ...(planogramSchema || []).map((f) => ({ id: `pattr:${f.id}`, label: `Planogram: ${f.label}` }))], [storeSchema, planogramSchema]);
+  const impactLookup = React.useMemo(() => ({ stores: stores || [], planograms: planograms || [], fields: Object.fromEntries([...(storeSchema || []).map((f) => [`sattr:${f.id}`, f.label]), ...(planogramSchema || []).map((f) => [`pattr:${f.id}`, f.label])]) }), [stores, planograms, storeSchema, planogramSchema]);
 
   const load = useCallback(async () => {
     const r = await loadResetImpacts();
@@ -11390,7 +11576,7 @@ function ResetImpactModule({ planograms }) {
   const filtered = impacts
     .filter((i) => category === "All" || i.planogram.category === category)
     .map((i) => ({ ...i, rows: region === "All" ? i.rows : i.rows.filter((r) => r.region === region) }));
-  const roll = rollupResetImpact(filtered, groupBy);
+  const roll = rollupResetImpact(filtered, groupBy, impactLookup);
   const opt = IMPACT_METRIC_OPTIONS.find((m) => m.id === metricId) || IMPACT_METRIC_OPTIONS[0];
   const planogramName = (id) => planograms.find((p) => p.id === id)?.name;
 
@@ -11433,7 +11619,7 @@ function ResetImpactModule({ planograms }) {
         <>
           <div className="flex items-center gap-3 flex-wrap mb-3">
             <label className="text-xs text-slate-500 flex items-center gap-1.5">Summarize by
-              <select className={inputCls + " w-40"} value={groupBy} onChange={(e) => setGroupBy(e.target.value)}>{IMPACT_DIMENSIONS.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}</select></label>
+              <select className={inputCls + " w-40"} value={groupBy} onChange={(e) => setGroupBy(e.target.value)}>{impactDims.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}</select></label>
             <label className="text-xs text-slate-500 flex items-center gap-1.5">Measure
               <select className={inputCls + " w-44"} value={metricId} onChange={(e) => setMetricId(e.target.value)}>{IMPACT_METRIC_OPTIONS.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}</select></label>
             <label className="text-xs text-slate-500 flex items-center gap-1.5">Category
@@ -11445,7 +11631,7 @@ function ResetImpactModule({ planograms }) {
             <table className="text-sm w-full">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500 uppercase tracking-wide">
-                  <th className="text-left font-semibold px-3 py-2">{(IMPACT_DIMENSIONS.find((d) => d.id === groupBy) || {}).label}</th>
+                  <th className="text-left font-semibold px-3 py-2">{(impactDims.find((d) => d.id === groupBy) || {}).label}</th>
                   <th className="text-right font-semibold px-3 py-2">Stores</th>
                   <th className="text-right font-semibold px-3 py-2">Before / wk</th>
                   <th className="text-right font-semibold px-3 py-2">After / wk</th>
@@ -11686,7 +11872,7 @@ function RegionalEscalationsView() {
 /* (the calculations live in supabase/functions/_shared/assortment.js)  */
 /* ------------------------------------------------------------------ */
 
-const ASSORT_DEFAULT_CFG = { category: "", segmentFieldIds: [], scope: { type: "all", value: "" }, weeks: 13, compare: "prior", groupBy: "region", assumptions: { ...DEFAULT_ASSUMPTIONS } };
+const ASSORT_DEFAULT_CFG = { category: "", segmentFieldIds: [], planogramFilter: { fieldId: "", value: "" }, scope: { type: "all", value: "" }, weeks: 13, compare: "prior", groupBy: "region", assumptions: { ...DEFAULT_ASSUMPTIONS } };
 const moneyA = (n) => (n === null || n === undefined || !Number.isFinite(n) ? "—" : `${n < 0 ? "-" : ""}$${Math.abs(Math.round(n)).toLocaleString()}`);
 const money2A = (n) => (n === null || n === undefined || !Number.isFinite(n) ? "—" : `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`);
 const growthA = (g) => (g === null || g === undefined ? "—" : `${g >= 0 ? "+" : ""}${(g * 100).toFixed(1)}%`);
@@ -11817,10 +12003,15 @@ function AssortSelect({ value, onChange, children, className = "" }) {
   return <select className={inputCls + " w-auto text-xs py-1 " + className} value={value} onChange={(e) => onChange(e.target.value)}>{children}</select>;
 }
 
-function AssortmentFilterBar({ cfg, setCfg, categories, stores }) {
-  const opts = React.useMemo(() => scopeOptions(stores), [stores]);
+function AssortmentFilterBar({ cfg, setCfg, categories, stores, storeSchema, planogramSchema, planograms }) {
+  const opts = React.useMemo(() => scopeOptions(stores, storeSchema), [stores, storeSchema]);
   const set = (patch) => setCfg((c) => ({ ...c, ...patch }));
-  const scopeValues = cfg.scope.type === "store" ? stores.map((s) => ({ v: s.id, l: s.name })).sort((a, b) => a.l.localeCompare(b.l)) : (opts[cfg.scope.type] || []).map((v) => ({ v, l: v }));
+  const scopeValues = cfg.scope.type === "store" ? stores.map((s) => ({ v: s.id, l: s.name })).sort((a, b) => a.l.localeCompare(b.l))
+    : cfg.scope.type === "storeAttr" ? (opts.attrs[cfg.scope.fieldId] || []).map((v) => ({ v, l: v }))
+    : (opts[cfg.scope.type] || []).map((v) => ({ v, l: v }));
+  const pf = cfg.planogramFilter || { fieldId: "", value: "" };
+  const pfField = (planogramSchema || []).find((f) => f.id === pf.fieldId);
+  const pfValues = pfField ? [...new Set(planograms.filter((p) => p.category === cfg.category).map((p) => attrDisplay(pfField, p.attributes?.[pfField.id])).filter(Boolean))].sort() : [];
   return (
     <div className="bg-white border border-slate-200 rounded-lg p-3 mb-4 flex flex-wrap items-end gap-3">
       <div>
@@ -11833,12 +12024,16 @@ function AssortmentFilterBar({ cfg, setCfg, categories, stores }) {
       <div>
         <label className={labelCls}>Look at</label>
         <div className="flex items-center gap-1.5">
-          <AssortSelect value={cfg.scope.type} onChange={(type) => set({ scope: { type, value: "" } })}>
+          <AssortSelect value={cfg.scope.type === "storeAttr" ? `attr:${cfg.scope.fieldId}` : cfg.scope.type} onChange={(v) => {
+            if (v.startsWith("attr:")) { const f = (storeSchema || []).find((x) => x.id === v.slice(5)); set({ scope: { type: "storeAttr", fieldId: v.slice(5), fieldLabel: f?.label || "", value: "" } }); }
+            else set({ scope: { type: v, value: "" } });
+          }}>
             <option value="all">All stores</option>
             <option value="region">A region</option>
             <option value="cluster">A store cluster</option>
             <option value="format">A store format</option>
             <option value="store">One store</option>
+            {(storeSchema || []).map((f) => <option key={f.id} value={`attr:${f.id}`}>Stores by {f.label}</option>)}
           </AssortSelect>
           {cfg.scope.type !== "all" && (
             <AssortSelect value={cfg.scope.value} onChange={(value) => set({ scope: { ...cfg.scope, value } })} className="min-w-[140px]">
@@ -11848,6 +12043,23 @@ function AssortmentFilterBar({ cfg, setCfg, categories, stores }) {
           )}
         </div>
       </div>
+      {(planogramSchema || []).length > 0 && (
+        <div>
+          <label className={labelCls}>Planograms where</label>
+          <div className="flex items-center gap-1.5">
+            <AssortSelect value={pf.fieldId} onChange={(fieldId) => set({ planogramFilter: { fieldId, value: "" } })}>
+              <option value="">Any planogram</option>
+              {planogramSchema.map((f) => <option key={f.id} value={f.id}>{f.label}</option>)}
+            </AssortSelect>
+            {pfField && (
+              <AssortSelect value={pf.value} onChange={(value) => set({ planogramFilter: { ...pf, value } })} className="min-w-[110px]">
+                <option value="">Choose…</option>
+                {pfValues.map((v) => <option key={v} value={v}>{v}</option>)}
+              </AssortSelect>
+            )}
+          </div>
+        </div>
+      )}
       <div>
         <label className={labelCls}>Period</label>
         <AssortSelect value={String(cfg.weeks)} onChange={(w) => set({ weeks: Number(w) })}>
@@ -11979,7 +12191,7 @@ function SegmentsView({ ctx, tree, cfg, setCfg, productSchema }) {
 
 // ---- Slow movers ---------------------------------------------------------------------------------------------
 
-function SlowMoversView({ ctx, cfg, setCfg, segLabel }) {
+function SlowMoversView({ ctx, cfg, setCfg, segLabel, storeSchema }) {
   const [showAll, setShowAll] = useState(false);
   const [onlyFlagged, setOnlyFlagged] = useState(false);
   const result = React.useMemo(() => slowMovers(ctx, { groupBy: cfg.groupBy }), [ctx, cfg.groupBy]);
@@ -11994,6 +12206,7 @@ function SlowMoversView({ ctx, cfg, setCfg, segLabel }) {
         <label className="text-xs text-slate-500 flex items-center gap-1.5 ml-auto">Compare across
           <AssortSelect value={cfg.groupBy} onChange={(groupBy) => setCfg((c) => ({ ...c, groupBy }))}>
             <option value="none">Nothing</option><option value="region">Regions</option><option value="cluster">Clusters</option><option value="format">Formats</option><option value="store">Stores</option>
+            {(storeSchema || []).map((f) => <option key={f.id} value={`storeAttr:${f.id}`}>By {f.label}</option>)}
           </AssortSelect>
         </label>
         <label className="text-xs text-slate-500 flex items-center gap-1.5"><input type="checkbox" className="accent-amber-500" checked={onlyFlagged} onChange={(e) => setOnlyFlagged(e.target.checked)} /> Only slow or declining</label>
@@ -12286,7 +12499,9 @@ const CAND_STATUS = {
   excluded: ["Left out", "bg-slate-100 text-slate-400 border-slate-200"],
 };
 
-function RecommendationsView({ ctx, products, cfg, setCfg, onOpenProposal, onDrafted }) {
+function RecommendationsView({ ctx, products, cfg, setCfg, planogramFilter, onOpenProposal, onDrafted }) {
+  const [showAllFor, setShowAllFor] = useState(() => new Set()); // item ids whose full planogram list is open
+  const CAND_LIMIT = 25; // a chain can have hundreds of planograms per category; the best are listed first
   const newItems = products.filter((p) => p.newItem && (!cfg.category || !p.newItem.category || p.newItem.category === cfg.category));
   const [picked, setPicked] = useState(null); // Set of item ids; null = every ready item
   const [exclude, setExclude] = useState(() => new Set());
@@ -12307,7 +12522,7 @@ function RecommendationsView({ ctx, products, cfg, setCfg, onOpenProposal, onDra
     try {
       const res = await invokeEdgeFunction("draft-assortment", {
         newItemIds: chosen,
-        params: { category: cfg.category, scope: cfg.scope.type === "all" ? { type: "all" } : cfg.scope, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds, assumptions: { metric: a.metric, cannibalization: a.cannibalization, transfer: a.transfer, maxRemovalsPerAdd: a.maxRemovalsPerAdd } },
+        params: { category: cfg.category, scope: cfg.scope.type === "all" ? { type: "all" } : cfg.scope, planogramFilter, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds, assumptions: { metric: a.metric, cannibalization: a.cannibalization, transfer: a.transfer, maxRemovalsPerAdd: a.maxRemovalsPerAdd } },
         exclude: [...exclude], protect: [...protect],
       });
       setDraftResult(res);
@@ -12395,7 +12610,7 @@ function RecommendationsView({ ctx, products, cfg, setCfg, onOpenProposal, onDra
                   <th className="px-2 py-1.5 font-semibold">Where</th><th className="px-2 py-1.5 font-semibold">Makes room by removing</th><th className="px-2 py-1.5 font-semibold text-right">Net / store / wk</th><th className="px-2 py-1.5 font-semibold text-right">Net / wk</th>
                 </tr></thead>
                 <tbody className="divide-y divide-slate-100">
-                  {item.candidates.map((c) => {
+                  {(showAllFor.has(item.productId) ? item.candidates : item.candidates.slice(0, CAND_LIMIT)).map((c) => {
                     const [label, cls] = CAND_STATUS[c.status] || [c.status, ""];
                     const key = `${item.productId}|${c.planogramId}`;
                     const canToggle = !["already_carried", "not_ready"].includes(c.status);
@@ -12421,6 +12636,9 @@ function RecommendationsView({ ctx, products, cfg, setCfg, onOpenProposal, onDra
                     );
                   })}
                   {item.candidates.length === 0 && <tr><td colSpan={8} className="px-3 py-3 text-center text-slate-400 italic">No planograms in view.</td></tr>}
+                  {item.candidates.length > CAND_LIMIT && (
+                    <tr><td colSpan={8} className="px-3 py-1.5 text-center"><button className="text-xs text-amber-700 font-semibold hover:underline" onClick={() => setShowAllFor((prev) => { const n = new Set(prev); if (n.has(item.productId)) n.delete(item.productId); else n.add(item.productId); return n; })}>{showAllFor.has(item.productId) ? `Show the top ${CAND_LIMIT}` : `Show all ${item.candidates.length} planograms`}</button></td></tr>
+                  )}
                 </tbody>
               </table>
             </div>
@@ -12434,7 +12652,7 @@ function RecommendationsView({ ctx, products, cfg, setCfg, onOpenProposal, onDra
 
 // ---- The tab -------------------------------------------------------------------------------------------------
 
-function AssortmentModule({ products, planograms, fixtures, stores, performance, productSchema, primaryKeyField, onCreateProduct, onUpdateProduct, onDeleteProduct, onOpenProposal, onDrafted }) {
+function AssortmentModule({ products, planograms, fixtures, stores, performance, productSchema, storeSchema, planogramSchema, primaryKeyField, onCreateProduct, onUpdateProduct, onDeleteProduct, onOpenProposal, onDrafted }) {
   const [cfg, setCfgState] = useState(ASSORT_DEFAULT_CFG);
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState("segments"); // segments | slow | newItems | recommend
@@ -12464,11 +12682,12 @@ function AssortmentModule({ products, planograms, fixtures, stores, performance,
 
   const categories = React.useMemo(() => Array.from(new Set(planograms.map((p) => p.category).filter(Boolean))).sort((a, b) => a.localeCompare(b)), [planograms]);
   const scopeReady = cfg.scope.type === "all" || !!cfg.scope.value;
+  const planogramFilter = cfg.planogramFilter?.fieldId && cfg.planogramFilter?.value ? { ...cfg.planogramFilter, fieldLabel: (planogramSchema || []).find((f) => f.id === cfg.planogramFilter.fieldId)?.label } : undefined;
   const ctx = React.useMemo(
     () => buildContext({ products, planograms, fixtures, performance, stores, productSchema }, {
-      category: cfg.category, scope: scopeReady ? cfg.scope : { type: "all" }, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds, assumptions: cfg.assumptions,
+      category: cfg.category, scope: scopeReady ? cfg.scope : { type: "all" }, planogramFilter, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds, assumptions: cfg.assumptions,
     }),
-    [products, planograms, fixtures, performance, stores, productSchema, cfg.category, cfg.scope, scopeReady, cfg.weeks, cfg.compare, cfg.segmentFieldIds, cfg.assumptions],
+    [products, planograms, fixtures, performance, stores, productSchema, cfg.category, cfg.scope, planogramFilter?.fieldId, planogramFilter?.value, scopeReady, cfg.weeks, cfg.compare, cfg.segmentFieldIds, cfg.assumptions],
   );
   const tree = React.useMemo(() => segmentTree(ctx), [ctx]);
 
@@ -12479,7 +12698,7 @@ function AssortmentModule({ products, planograms, fixtures, stores, performance,
         <h2 className="text-lg font-bold text-slate-800">Assortment</h2>
       </div>
       <p className="text-sm text-slate-500 mb-3">See which segments are growing, which items are slow, and where new items earn their space.</p>
-      <AssortmentFilterBar cfg={cfg} setCfg={setCfg} categories={categories} stores={stores} />
+      <AssortmentFilterBar cfg={cfg} setCfg={setCfg} categories={categories} stores={stores} storeSchema={storeSchema} planogramSchema={planogramSchema} planograms={planograms} />
       {!scopeReady && <p className="text-xs text-amber-700 mb-3">Choose a {cfg.scope.type} above; until then all stores are shown.</p>}
       <div className="flex gap-1 mb-4 border-b border-slate-200">
         {tabs.map(([id, label]) => (
@@ -12489,9 +12708,9 @@ function AssortmentModule({ products, planograms, fixtures, stores, performance,
       {!loaded ? <div className="text-xs text-slate-400 flex items-center gap-2"><RefreshCw size={12} className="animate-spin" /> Loading your settings…</div> : (
         <>
           {view === "segments" && <SegmentsView ctx={ctx} tree={tree} cfg={cfg} setCfg={setCfg} productSchema={productSchema} />}
-          {view === "slow" && <SlowMoversView ctx={ctx} cfg={cfg} setCfg={setCfg} segLabel="" />}
+          {view === "slow" && <SlowMoversView ctx={ctx} cfg={cfg} setCfg={setCfg} segLabel="" storeSchema={storeSchema} />}
           {view === "newItems" && <NewItemsView ctx={ctx} products={products} productSchema={productSchema} categories={categories} primaryKeyField={primaryKeyField} cfg={cfg} onCreate={onCreateProduct} onUpdate={onUpdateProduct} onDelete={onDeleteProduct} />}
-          {view === "recommend" && <RecommendationsView ctx={ctx} products={products} cfg={cfg} setCfg={setCfg} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
+          {view === "recommend" && <RecommendationsView ctx={ctx} products={products} cfg={cfg} setCfg={setCfg} planogramFilter={planogramFilter} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
         </>
       )}
     </div>
@@ -12533,6 +12752,8 @@ function AppContent({ session }) {
 
   const [productSchema, setProductSchema] = useState(DEFAULT_PRODUCT_SCHEMA);
   const [fixtureSchema, setFixtureSchema] = useState(DEFAULT_FIXTURE_SCHEMA);
+  const [planogramSchema, setPlanogramSchema] = useState([]); // user-defined planogram attributes
+  const [storeSchema, setStoreSchema] = useState([]); // user-defined store attributes
   const [primaryKeyField, setPrimaryKeyField] = useState("sku"); // "sku" | "upc" — global product matching key
   const [imageRepo, setImageRepo] = useState(DEFAULT_IMAGE_REPO);
   const [upcLookup, setUpcLookup] = useState(DEFAULT_UPC_LOOKUP);
@@ -12588,9 +12809,11 @@ function AppContent({ session }) {
 
     (async () => {
       try {
-        const [pSchema, fSchema, pkField, imgRepo, upcLk, capWarn, prods, fixs, pogs, perf, strs, savedMode, savedStoreId, savedEvents, savedEventTypes, savedTaskTypes, savedResetThresholds, savedDosTargets] = await Promise.all([
+        const [pSchema, fSchema, pogSchema, storeSch, pkField, imgRepo, upcLk, capWarn, prods, fixs, pogs, perf, strs, savedMode, savedStoreId, savedEvents, savedEventTypes, savedTaskTypes, savedResetThresholds, savedDosTargets] = await Promise.all([
           safeGet("schema:product"),
           safeGet("schema:fixture"),
+          safeGet("schema:planogram"),
+          safeGet("schema:store"),
           safeGet("settings:primaryKeyField"),
           safeGet("settings:imageRepo"),
           safeGet("settings:upcLookup"),
@@ -12611,6 +12834,8 @@ function AppContent({ session }) {
         if (settled) return; // the timeout already fired and the app moved on — don't clobber state after the fact
         if (pSchema) setProductSchema(JSON.parse(pSchema));
         if (fSchema) setFixtureSchema(JSON.parse(fSchema));
+        if (pogSchema) setPlanogramSchema(JSON.parse(pogSchema));
+        if (storeSch) setStoreSchema(JSON.parse(storeSch));
         if (pkField) setPrimaryKeyField(pkField);
         if (imgRepo) setImageRepo({ ...DEFAULT_IMAGE_REPO, ...JSON.parse(imgRepo) });
         if (upcLk) setUpcLookup({ ...DEFAULT_UPC_LOOKUP, ...migrateUpcLookup(JSON.parse(upcLk)) });
@@ -12672,6 +12897,8 @@ function AppContent({ session }) {
 
   const updateProductSchema = (next) => { setProductSchema(next); safeSet("schema:product", JSON.stringify(next)); };
   const updateFixtureSchema = (next) => { setFixtureSchema(next); safeSet("schema:fixture", JSON.stringify(next)); };
+  const updatePlanogramSchema = (next) => { setPlanogramSchema(next); safeSet("schema:planogram", JSON.stringify(next)); };
+  const updateStoreSchema = (next) => { setStoreSchema(next); safeSet("schema:store", JSON.stringify(next)); };
   const updatePrimaryKeyField = (next) => { setPrimaryKeyField(next); safeSet("settings:primaryKeyField", next); };
   const updateImageRepo = (patch) => {
     setImageRepo((prev) => {
@@ -13143,6 +13370,8 @@ function AppContent({ session }) {
     for (const [productId, records] of Object.entries(backup.performance)) await saveIndexed("perf", { id: productId, records });
     await safeSet("schema:product", JSON.stringify(backup.productSchema));
     await safeSet("schema:fixture", JSON.stringify(backup.fixtureSchema));
+    await safeSet("schema:planogram", JSON.stringify(backup.planogramSchema));
+    await safeSet("schema:store", JSON.stringify(backup.storeSchema));
     await safeSet("settings:primaryKeyField", backup.primaryKeyField);
 
     setProducts(backup.products);
@@ -13152,6 +13381,8 @@ function AppContent({ session }) {
     setPerformance(backup.performance);
     setProductSchema(backup.productSchema);
     setFixtureSchema(backup.fixtureSchema);
+    setPlanogramSchema(backup.planogramSchema);
+    setStoreSchema(backup.storeSchema);
     setPrimaryKeyField(backup.primaryKeyField);
     setActivePlanogramId(null);
   };
@@ -13320,6 +13551,7 @@ function AppContent({ session }) {
           />
         ) : activePlanogram ? (
           <PlanogramEditor
+            planogramSchema={planogramSchema}
             planogram={activePlanogram}
             products={products}
             fixtures={fixtures}
@@ -13344,6 +13576,7 @@ function AppContent({ session }) {
           />
         ) : tab === "planograms" ? (
           <PlanogramList
+            planogramSchema={planogramSchema}
             planograms={planograms}
             stores={stores}
             products={products}
@@ -13361,6 +13594,7 @@ function AppContent({ session }) {
             draftingReset={draftingReset}
             proposals={proposals}
             profileNames={profileNames}
+            currentUserId={session?.user?.id}
             onOpenProposal={setReviewingProposalId}
           />
         ) : tab === "products" ? (
@@ -13385,6 +13619,7 @@ function AppContent({ session }) {
           />
         ) : tab === "stores" ? (
           <StoreLibrary
+            storeSchema={storeSchema}
             stores={stores}
             onCreate={createStore}
             onUpdate={updateStoreEntity}
@@ -13412,12 +13647,12 @@ function AppContent({ session }) {
         ) : tab === "assortment" && isPlanner ? (
           <AssortmentModule
             products={products} planograms={planograms} fixtures={fixtures} stores={stores} performance={performance}
-            productSchema={productSchema} primaryKeyField={primaryKeyField}
+            productSchema={productSchema} storeSchema={storeSchema} planogramSchema={planogramSchema} primaryKeyField={primaryKeyField}
             onCreateProduct={createProduct} onUpdateProduct={updateProductEntity} onDeleteProduct={deleteProductEntity}
             onOpenProposal={setReviewingProposalId} onDrafted={refreshProposals}
           />
         ) : tab === "resetImpact" && isPlanner ? (
-          <ResetImpactModule planograms={planograms} />
+          <ResetImpactModule planograms={planograms} stores={stores} storeSchema={storeSchema} planogramSchema={planogramSchema} />
         ) : tab === "execution" && isPlanner ? (
           <ExecutionFollowupModule onEscalationsChanged={setOpenEscalations} onStoresChanged={refreshStores} />
         ) : tab === "storeFeedback" ? (
@@ -13427,7 +13662,7 @@ function AppContent({ session }) {
         ) : (
           <div className="space-y-5">
             <BackupRestorePanel
-              dataBundle={{ productSchema, fixtureSchema, primaryKeyField, products, fixtures, planograms, performance, stores }}
+              dataBundle={{ productSchema, fixtureSchema, planogramSchema, storeSchema, primaryKeyField, products, fixtures, planograms, performance, stores }}
               onImport={importFullBackup}
             />
             <div className="bg-white rounded-lg border border-slate-200 p-4">
@@ -13615,6 +13850,8 @@ function AppContent({ session }) {
 
             <SchemaEditor title="Product Attribute Fields" schema={productSchema} onChange={updateProductSchema} max={200} />
             <SchemaEditor title="Fixture Attribute Fields" schema={fixtureSchema} onChange={updateFixtureSchema} max={50} />
+            <SchemaEditor title="Planogram Attribute Fields" schema={planogramSchema} onChange={updatePlanogramSchema} max={100} />
+            <SchemaEditor title="Store Attribute Fields" schema={storeSchema} onChange={updateStoreSchema} max={100} />
 
             <div className="bg-white rounded-lg border border-slate-200 p-4 mt-6">
               <h3 className="text-sm font-semibold text-slate-800 mb-1 flex items-center gap-1.5"><Sparkles size={15} className="text-amber-500" /> Reset Drafting Thresholds</h3>

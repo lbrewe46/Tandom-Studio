@@ -198,14 +198,23 @@ const IMPACT_DIMENSIONS = [
 
 // impacts: computeResetImpact results (status "ok"). Only stores with a full after-window ("measured") count;
 // maturing stores are tallied separately so nobody reads a half-finished result as final.
-function rollupResetImpact(impacts, dimension) {
+// `lookup` (optional) lets a summary group by a user-defined attribute: { stores, planograms, fields }, where
+// dimensions "sattr:<fieldId>" / "pattr:<fieldId>" read the store's / planogram's attributes.
+function rollupResetImpact(impacts, dimension, lookup) {
+  const attrLabel = (entity, fieldId) => {
+    const v = entity && entity.attributes ? entity.attributes[fieldId] : undefined;
+    return v === undefined || v === null || v === "" ? "" : v === true ? "Yes" : v === false ? "No" : String(v);
+  };
+  const byId = (list) => Object.fromEntries((list || []).map((x) => [x.id, x]));
+  const storesById = lookup ? byId(lookup.stores) : {}, planogramsById = lookup ? byId(lookup.planograms) : {};
   const groups = new Map();
   let maturing = 0;
   (impacts || []).filter((i) => i && i.status === "ok").forEach((imp) => {
     (imp.rows || []).forEach((r) => {
       if (r.status === "maturing") maturing++;
       if (r.status !== "measured") return;
-      const label = ({
+      const attrDim = typeof dimension === "string" && /^[sp]attr:/.test(dimension);
+      const label = attrDim ? (dimension[0] === "s" ? attrLabel(storesById[r.storeId], dimension.slice(6)) : attrLabel(planogramsById[imp.planogramId], dimension.slice(6))) || `(No ${(lookup && lookup.fields && lookup.fields[dimension]) || "value"})` : ({
         region: r.region, store: `${r.storeName}${r.storeNumber ? ` (#${r.storeNumber})` : ""}`, format: r.format,
         category: imp.planogram.category, department: imp.planogram.department, cluster: imp.planogram.cluster, planogram: imp.planogram.name,
       }[dimension]) || `(No ${(IMPACT_DIMENSIONS.find((d) => d.id === dimension) || {}).label || dimension})`;
@@ -300,6 +309,19 @@ const HELP_SECTIONS = [
         "**Recommendations:** for each new item, every planogram in the category is checked. It goes into free space if there is any; otherwise the slowest items are removed, but only if the new item is expected to beat what is given up, and never so many that a segment loses all its variety. Untick a planogram to leave an item off it, lock an item to protect it, then press **Draft changes for review**.",
         "Drafts land in the **AI Draft Review Queue** on the Planograms tab like any other draft. Approving one builds a new Work-in-Progress version; live planograms are not touched.",
         "Growth needs sales history for both periods, so load at least twice the period's weeks on the Performance tab. Set each store's **Cluster** on the Stores tab to look at clusters.",
+      ] },
+    ],
+  },
+  {
+    id: "customAttributes",
+    title: "Planogram and Store Attributes",
+    blocks: [
+      { type: "p", text: "Planograms and stores can carry your own attributes, the same way products do. Define them under **Settings** (Planogram Attribute Fields and Store Attribute Fields) as text, number, Yes/No or dropdown fields, for example a planogram's *Assortment tier* or a store's *Foot traffic*." },
+      { type: "ul", items: [
+        "**Filling them in:** on the New Planogram and store forms, and on a planogram's Attributes tab.",
+        "**Lists and cards:** press **Columns** (list view) or **Card fields** (grid view) on the Planograms and Stores tabs and tick the attributes to show. In the planogram list they can be edited in place and set on many selected planograms at once with **Set**.",
+        "**Assortment:** look at stores by an attribute (or compare slow movers across it), and limit the analysis to planograms with a given attribute value.",
+        "**Reset Impact:** Summarize by any store or planogram attribute.",
       ] },
     ],
   },

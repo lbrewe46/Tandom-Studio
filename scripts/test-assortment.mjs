@@ -215,5 +215,25 @@ test("scope narrows which planograms are considered", () => {
   assert.deepEqual(r.items[0].candidates.map((c) => c.planogramId), ["B"]);
 });
 
+console.log("user-defined store and planogram attributes");
+const attrStores = stores.map((st) => ({ ...st, attributes: { fs: st.id === "s1" ? "High" : "Low" } }));
+const attrPogA = { ...pogA, attributes: { tier: "A" } }, attrPogB = { ...pogB, attributes: { tier: "B" } };
+const attrData = (extra = []) => ({ ...data(extra), stores: attrStores, planograms: [attrPogA, attrPogB] });
+test("a store attribute can be the scope", () => {
+  const sc = resolveScope(attrStores, { type: "storeAttr", fieldId: "fs", fieldLabel: "Foot traffic", value: "High" });
+  assert.deepEqual([...sc.storeIds], ["s1"]); assert.equal(sc.label, "Foot traffic: High"); assert.equal(sc.includeChain, false);
+  assert.deepEqual(scopeOptions(attrStores, [{ id: "fs", label: "Foot traffic" }]).attrs.fs, ["High", "Low"]);
+  const r = recommend(buildContext(attrData([N1]), params({ scope: { type: "storeAttr", fieldId: "fs", value: "Low" } })), [N1.id]);
+  assert.deepEqual(r.items[0].candidates.map((c) => c.planogramId), ["B"]);
+});
+test("a planogram attribute filters which planograms are considered", () => {
+  const r = recommend(buildContext(attrData([N1]), params({ planogramFilter: { fieldId: "tier", value: "A" } })), [N1.id]);
+  assert.deepEqual(r.items[0].candidates.map((c) => c.planogramId), ["A"]);
+});
+test("slow movers can be compared across a store attribute", () => {
+  const sm = slowMovers(buildContext(attrData(), params()), { groupBy: "storeAttr:fs" });
+  assert.deepEqual(sm.groups.map((g) => g.label).sort(), ["High", "Low"]);
+});
+
 console.log(`\n${passed} passed${failed ? `, ${failed} FAILED` : ""}`);
 process.exit(failed ? 1 : 0);

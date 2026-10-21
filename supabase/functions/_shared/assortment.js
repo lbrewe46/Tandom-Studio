@@ -34,7 +34,9 @@ const round = (n, d = 2) => (Number.isFinite(n) ? Math.round(n * 10 ** d) / 10 *
 const mean = (xs) => (xs.length ? xs.reduce((s, x) => s + x, 0) / xs.length : 0);
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 
-export const SCOPE_TYPES = ["all", "region", "cluster", "format", "store"];
+// "storeAttr" looks at the stores whose user-defined attribute (scope.fieldId) equals scope.value.
+export const SCOPE_TYPES = ["all", "region", "cluster", "format", "store", "storeAttr"];
+const attrText = (entity, fieldId) => { const v = entity?.attributes?.[fieldId]; return v === undefined || v === null ? "" : String(v).trim(); };
 
 // Stores in the chosen scope. `includeChain` says whether Performance rows with no store (chain-level or
 // blended data) count: only for "all stores".
@@ -46,17 +48,22 @@ export function resolveScope(stores, scope = { type: "all" }) {
     if (type === "region") return (s.region || "") === value;
     if (type === "cluster") return (s.cluster || "") === value;
     if (type === "format") return (s.format || "") === value;
+    if (type === "storeAttr") return !!scope.fieldId && attrText(s, scope.fieldId) === value;
     return s.id === value;
   };
   const list = (stores || []).filter(pick);
-  const label = type === "all" ? "All stores" : type === "store" ? (list[0]?.name || "Store") : `${{ region: "Region", cluster: "Cluster", format: "Format" }[type]}: ${value}`;
-  return { type, value, storeIds: new Set(list.map((s) => s.id)), includeChain: type === "all", label };
+  const label = type === "all" ? "All stores" : type === "store" ? (list[0]?.name || "Store") : type === "storeAttr" ? `${scope.fieldLabel || "Store attribute"}: ${value}` : `${{ region: "Region", cluster: "Cluster", format: "Format" }[type]}: ${value}`;
+  return { type, value, fieldId: scope.fieldId, storeIds: new Set(list.map((s) => s.id)), includeChain: type === "all", label };
 }
 
 // Every value a scope picker can offer, from the stores themselves.
-export function scopeOptions(stores) {
+export function scopeOptions(stores, storeSchema = []) {
   const uniq = (key) => [...new Set((stores || []).map((s) => (s[key] || "").trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
-  return { region: uniq("region"), cluster: uniq("cluster"), format: uniq("format") };
+  const attrs = {};
+  (storeSchema || []).forEach((f) => {
+    attrs[f.id] = [...new Set((stores || []).map((s) => attrText(s, f.id)).filter(Boolean))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+  });
+  return { region: uniq("region"), cluster: uniq("cluster"), format: uniq("format"), attrs };
 }
 
 export function segmentValue(product, fieldId) {
@@ -85,12 +92,15 @@ export function buildContext(data, params) {
   const levels = (params.segmentFieldIds || []).filter(Boolean);
   const assumptions = { ...DEFAULT_ASSUMPTIONS, ...(params.assumptions || {}) };
   const scope = resolveScope(stores, params.scope);
+  // optional: only planograms whose own attribute has this value (e.g. Assortment Tier = A)
+  const pf = params.planogramFilter && params.planogramFilter.fieldId && params.planogramFilter.value ? params.planogramFilter : null;
   const productsById = Object.fromEntries((products || []).map((p) => [p.id, p]));
   const win = windowsFor(performance || {}, weeks, compare);
 
   // planograms of this category that are (or are about to be) on shelves in the scope
   const pogs = (planograms || [])
     .filter((p) => (p.category || "") === category && ["live", "pending"].includes(effectivePlanogramStatus(p)))
+    .filter((p) => !pf || attrText(p, pf.fieldId) === pf.value)
     .map((p) => ({ planogram: p, storeIds: (p.storeIds || []).filter((id) => scope.storeIds.has(id)) }))
     .filter((x) => x.storeIds.length > 0);
   const catStoreIds = new Set(pogs.flatMap((x) => x.storeIds));
@@ -229,24 +239,32 @@ export function slowMovers(ctx, { groupBy = "none" } = {}) {
   const p25 = quantile(velocities, 0.25);
 
   let groups = [];
-  if (["region", "cluster", "format", "store"].includes(groupBy)) {
+  const attrGroup = typeof groupBy === "string" && groupBy.startsWith("storeAttr:") ? groupBy.slice(10) : null;
+  if (attrGroup || ["region", "cluster", "format", "store"].includes(groupBy)) {
     const byKey = new Map();
     (ctx.data.stores || []).filter((s) => ctx.scope.storeIds.has(s.id)).forEach((s) => {
-      const key = groupBy === "store" ? s.id : (s[groupBy] || "").trim() || "(none)";
+      const key = groupBy === "store" ? s.id : attrGroup ? attrText(s, attrGroup) || "(none)" : (s[groupBy] || "").trim() || "(none)";
       if (!byKey.has(key)) byKey.set(key, { key, label: groupBy === "store" ? s.name : key, storeIds: new Set() });
       byKey.get(key).storeIds.add(s.id);
     });
-    groups = [...byKey.values()].map((g) => {
-      const perItem = new Map();
-      rows.forEach((r) => {
-        const carried = [...ctx.carry.get(r.productId)].filter((sid) => g.storeIds.has(sid));
-        if (!carried.length) return;
-        const m = ctx.sum(r.productId, ctx.win?.cur, (sid) => g.storeIds.has(sid));
-        perItem.set(r.productId, m.units / (carried.length * ctx.params.weeks));
+    // One pass over each item's sales and carrying stores, bucketed by group, so the cost grows with the
+    // number of sales records rather than records x groups (a chain with thousands of stores grouped by store).
+    const groupOfStore = new Map();
+    byKey.forEach((g) => g.storeIds.forEach((sid) => groupOfStore.set(sid, g.key)));
+    byKey.forEach((g) => { g.perItem = new Map(); });
+    rows.forEach((r) => {
+      const carriedBy = new Map();
+      ctx.carry.get(r.productId).forEach((sid) => { const k = groupOfStore.get(sid); if (k !== undefined) carriedBy.set(k, (carriedBy.get(k) || 0) + 1); });
+      if (!carriedBy.size) return;
+      const unitsBy = new Map();
+      (ctx.data.performance?.[r.productId] || []).forEach((rec) => {
+        if (!ctx.win?.cur || rec.weekEnding < ctx.win.cur.start || rec.weekEnding > ctx.win.cur.end || !rec.storeId) return;
+        const k = groupOfStore.get(rec.storeId);
+        if (k !== undefined) unitsBy.set(k, (unitsBy.get(k) || 0) + (rec.units || 0));
       });
-      const sorted = [...perItem.values()].sort((a, b) => a - b);
-      return { ...g, perItem, p25: quantile(sorted, 0.25) };
+      carriedBy.forEach((n, k) => byKey.get(k).perItem.set(r.productId, (unitsBy.get(k) || 0) / (n * ctx.params.weeks)));
     });
+    groups = [...byKey.values()].map((g) => ({ ...g, p25: quantile([...g.perItem.values()].sort((a, b) => a - b), 0.25) }));
   }
 
   const out = rows.map((r) => {
@@ -465,6 +483,8 @@ export function recommend(ctx, newItemIds, options = {}) {
       ensure(c.planogramId).changes.push(...changes);
     });
     result.candidates.forEach((c) => { delete c._best; delete c._net; });
+    const rank = { recommended: 0, not_worth_it: 1, no_room: 2, excluded: 3, not_ready: 4, already_carried: 5 };
+    result.candidates.sort((x, y) => (rank[x.status] ?? 9) - (rank[y.status] ?? 9) || (y.netNetworkWeek ?? -Infinity) - (x.netNetworkWeek ?? -Infinity) || x.planogramName.localeCompare(y.planogramName));
     result.recommendedCount = result.candidates.filter((c) => c.status === "recommended").length;
     result.totalNetNetworkWeek = round(result.candidates.filter((c) => c.status === "recommended").reduce((s, c) => s + c.netNetworkWeek, 0));
   });

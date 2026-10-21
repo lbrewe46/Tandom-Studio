@@ -261,3 +261,7 @@ The **Assortment** tab (Admins and Category Managers) has four views: Segments (
 - Stores have a new optional **Cluster** field (Stores tab) used for the cluster scope.
 - Products need Category plus the attributes you want to segment by. Growth needs sales history for at least twice the chosen period.
 - Tests: `node scripts/test-assortment.mjs`, `node scripts/test-draft-assortment.mjs` (both are part of `npm run test:edge`).
+
+## Planogram and store attributes
+
+Define your own fields for planograms and stores under **Settings** (stored in `app_settings` as `schema:planogram` and `schema:store`; values live in each record's `attributes`, keyed by field id, like products). They appear on the forms, as extra columns / card fields on the Planograms and Stores tabs, as scopes and groupings in Assortment, and as "Summarize by" options in Reset Impact. They are included in Export / Restore Full Backup. No `schema.sql` change is needed.
