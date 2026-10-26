@@ -224,7 +224,7 @@ export async function invokeEdgeFunction(name, body) {
   const { data, error } = await supabase.functions.invoke(name, { body });
   if (error) {
     let message = error.message || `The ${name} function couldn't be reached.`;
-    try { const detail = await error.context.json(); if (detail?.error) message = detail.error; } catch (e) { /* keep the generic message */ }
+    try { const detail = await error.context.json(); if (detail?.error) message = detail.detail ? `${detail.error} (${detail.detail})` : detail.error; } catch (e) { /* keep the generic message */ }
     throw new Error(message);
   }
   return data;
@@ -295,4 +295,16 @@ export async function resolveEscalation(id, note) {
     .update({ status: "resolved", resolved_at: new Date().toISOString(), resolved_by: auth?.user?.id || null, resolution: note || "Resolved by a person" })
     .eq("id", id);
   if (error) throw new Error(error.message);
+}
+
+// Admin-only usage numbers (DAU/WAU/MAU, stickiness, session length and counts), computed in the database.
+export async function loadUsageMetrics(days, timeZone) {
+  if (!supabase) return { ok: false, error: "Supabase isn't configured." };
+  try {
+    const { data, error } = await supabase.rpc("usage_metrics", { p_days: days, p_tz: timeZone || "UTC" });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, error: e?.message || "Couldn't load usage." };
+  }
 }

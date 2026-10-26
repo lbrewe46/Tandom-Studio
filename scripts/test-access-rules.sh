@@ -22,3 +22,4 @@ alter default privileges in schema public grant all on functions to authenticate
 SQL
 for pass in 1 2; do psql -q -d "$DB" -v ON_ERROR_STOP=1 -f supabase/schema.sql 2>&1 | grep -v "NOTICE" || true; done
 psql -q -t -A -d "$DB" -f scripts/access-rules.test.sql
+psql -q -t -A -d "$DB" -f scripts/usage.test.sql

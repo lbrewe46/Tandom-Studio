@@ -133,4 +133,21 @@ await test("if the proposal can't be saved the caller is told, with a schema hin
   assert.equal(body.proposals.length, 0);
   assert.ok(body.notDrafted.every((x) => /schema\.sql/.test(x.reason)));
 });
+await test("core mode: only core items with gaps are drafted, with a core-item reason", async () => {
+  const db = fresh();
+  const probe = await call(db, { body: { mode: "core", newItemIds: ["ks1"], params, coreOverrides: { ks1: "notcore" } } });
+  assert.equal(probe.status, 400); assert.match((await probe.json()).error, /Not a core item with gaps/);
+  const { buildContext, coreProfile } = await import("../supabase/functions/_shared/assortment.js");
+  const data = { products: db.t.products.map((r) => r.data), planograms: [pogA, pogB], fixtures: [shelfDef], stores: db.t.stores.map((r) => r.data), productSchema: schema, performance: Object.fromEntries(db.t.performance.map((r) => [r.id, r.data.records])) };
+  const gaps = coreProfile(buildContext(data, { ...params, assumptions: { coreMinCoverage: 1 } })).rows.filter((r) => r.isGap).map((r) => r.productId);
+  assert.ok(gaps.length > 0, "fixture has a core gap at 100% coverage");
+  const ok = await call(db, { body: { mode: "core", newItemIds: [gaps[0]], params: { ...params, assumptions: { coreMinCoverage: 1 } } } });
+  const body = await ok.json();
+  assert.equal(ok.status, 200);
+  assert.ok(body.proposals.length >= 1, JSON.stringify(body)); assert.match(JSON.stringify(db.t.proposals[0]), /Core item/);
+  assert.equal((await call(fresh(), { body: { mode: "core", newItemIds: ["n1"], params } })).status, 400, "a new item is not a core item");
+  assert.equal((await call(fresh(), { body: { mode: "core", newItemIds: ["ks1"], params, coreOverrides: { ks1: "maybe" } } })).status, 400);
+  assert.equal((await call(fresh(), { body: { mode: "weird", newItemIds: ["ks1"], params } })).status, 400);
+  assert.equal((await call(fresh(), { body: { newItemIds: ["n1"], params: { ...params, assumptions: { coreMaxCv: -1 } } } })).status, 400);
+});
 console.log(`\n${passed} passed`);

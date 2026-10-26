@@ -254,10 +254,11 @@ Performance Data accepts an Excel file (.xlsx/.xls), a CSV, or a **Google Sheet 
 
 ## Assortment (new items and SKU rationalization)
 
-The **Assortment Planner** module (top-bar switcher, between Event Planner and Space Planner; Admins and Category Managers) has four views: Segments (growth and space by shopper-decision attribute), Slow movers, New items (template import from Excel/CSV/Google Sheet or manual entry; items go into the product library as Pending) and Recommendations (which planograms each new item should go on, and what to remove).
+The **Assortment Planner** module (top-bar switcher, between Event Planner and Space Planner; Admins and Category Managers) has five views: Segments (growth and space by shopper-decision attribute), Slow movers, Core items (classifies fundamental items by frequency, steadiness and share of sales, shows coverage by store format, flags core items missing from planograms and drafts their expansion), New items (template import from Excel/CSV/Google Sheet or manual entry; items go into the product library as Pending) and Recommendations (which planograms each new item should go on, and what to remove).
 
 - The analysis runs in the browser from data already loaded. **Draft changes for review** calls the new `draft-assortment` Edge Function, which re-runs the same engine (`supabase/functions/_shared/assortment.js`) on the server and files proposals under the `assortment-agent`, so they appear in the existing AI Draft Review Queue.
 - Admin steps: re-run `supabase/schema.sql` (adds the `assortment-agent` row), then let the GitHub Action deploy `draft-assortment` (and `fetch-sheet` if not yet deployed).
+- Core items: thresholds live in the assortment settings (`coreMinWeeksSelling`, `coreMaxCv`, `coreSalesShare`, `coreMinCoverage`); manual Mark core / Not core calls are saved with them. `draft-assortment` accepts `mode:"core"`, re-classifies on the server and refuses ids that are not core items with gaps. Staple status and competitor pricing are not in the data; price steadiness is only a hint.
 - Stores have a new optional **Cluster** field (Stores tab) used for the cluster scope.
 - Products need Category plus the attributes you want to segment by. Growth needs sales history for at least twice the chosen period.
 - Tests: `node scripts/test-assortment.mjs`, `node scripts/test-draft-assortment.mjs` (both are part of `npm run test:edge`).
@@ -265,3 +266,12 @@ The **Assortment Planner** module (top-bar switcher, between Event Planner and S
 ## Planogram and store attributes
 
 Define your own fields for planograms and stores under **Settings** (stored in `app_settings` as `schema:planogram` and `schema:store`; values live in each record's `attributes`, keyed by field id, like products). They appear on the forms, as extra columns / card fields on the Planograms and Stores tabs, as scopes and groupings in Assortment, and as "Summarize by" options in Reset Impact. They are included in Export / Restore Full Backup. No `schema.sql` change is needed.
+
+## Usage analytics (Admins)
+
+The **Usage** tab shows DAU / WAU / MAU, stickiness (average DAU ÷ MAU over 30 days), average session length, time per active day and sessions per user, split by role, module and person.
+
+- The browser (`src/lib/usage.js`) records one `usage_sessions` row per working session: person, role, start, last seen, active seconds, and seconds per module. Time counts only while the person interacts with the app in view (2 minutes of no interaction stops the clock; 30 minutes ends the session). Nothing about what they edit is recorded.
+- The database sets the times and role itself and caps active time at the time the session has been open. Only an Admin can read the numbers, through `usage_metrics()`.
+- Admin step: re-run `supabase/schema.sql` (creates `usage_sessions` and `usage_metrics`). Until then the tracker switches itself off quietly. Numbers start from the moment it is deployed.
+- Tests: `node scripts/test-usage.mjs` (tracker) and `scripts/test-access-rules.sh` (which also runs `scripts/usage.test.sql`: the rules and the numbers, on a real Postgres).

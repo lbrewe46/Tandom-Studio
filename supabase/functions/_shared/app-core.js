@@ -305,6 +305,7 @@ const HELP_SECTIONS = [
       { type: "ul", items: [
         "**Segments:** list the product attributes in the order a shopper decides at the shelf (for cereal: Age group, then Sugar level, then Brand). The table splits the category that way and shows each segment's sales, share of sales, share of shelf space, space index (over 100 earns more than the room it takes), growth, and which segment holds the most space.",
         "**Slow movers:** every item ranked slowest first by units per store per week, with the bottom quarter flagged. Compare across regions, clusters, formats or stores to see where an item is slow in most places versus just one.",
+        "**Core items:** finds the fundamental, everyday items of the category. An item is core when it sells in most weeks (frequent), with little week-to-week swing (steady) and sits in the top share of category sales (the backbone). Thresholds are editable. Each item shows its stores and coverage by store format, so you can see a core item carried only in large stores; a core item carried by too few stores and missing from planograms is flagged as a gap. Tick gap items to see where they would earn their space (forecast from how they sell where carried, adjusted for store strength) and draft the changes for review. Staple-versus-impulse and competitive pricing can't be read from sales: use Mark core / Not core, and the Price steady column as a hint.",
         "**New items:** import what the category manager sent (Excel, CSV or a Google Sheet link; download the template first) or add items by hand. Each is added to the product library as Pending. Give it a forecast, or pick similar items and say how much it sells compared with them. It also needs its size, and a price (or a similar item's price).",
         "**Recommendations:** for each new item, every planogram in the category is checked. It goes into free space if there is any; otherwise the slowest items are removed, but only if the new item is expected to beat what is given up, and never so many that a segment loses all its variety. Untick a planogram to leave an item off it, lock an item to protect it, then press **Draft changes for review**.",
         "Drafts land in the **AI Draft Review Queue** on the Space Planner's Planograms tab like any other draft (the Review link takes you there). Approving one builds a new Work-in-Progress version; live planograms are not touched.",
@@ -322,6 +323,20 @@ const HELP_SECTIONS = [
         "**Lists and cards:** press **Columns** (list view) or **Card fields** (grid view) on the Planograms and Stores tabs and tick the attributes to show. In the planogram list they can be edited in place and set on many selected planograms at once with **Set**.",
         "**Assortment:** look at stores by an attribute (or compare slow movers across it), and limit the analysis to planograms with a given attribute value.",
         "**Reset Impact:** Summarize by any store or planogram attribute.",
+      ] },
+    ],
+  },
+  {
+    id: "usage",
+    title: "Usage",
+    blocks: [
+      { type: "p", text: "The **Usage** tab (Admins only) shows how the app is being used, from the Space Planner's tab bar. Pick a period (7 to 365 days)." },
+      { type: "ul", items: [
+        "**DAU / WAU / MAU:** the number of different people active today, in the last 7 days and in the last 30 days. The chart shows all three day by day.",
+        "**Stickiness:** average daily users divided by monthly users over the last 30 days. Higher means people come back more days of the month.",
+        "**Avg session, Time per active day, Total active time:** how long people actively use the app. Time counts only while someone is clicking, typing or scrolling with the app in view; idle time and a hidden tab don't count.",
+        "**Sessions per user:** how many separate visits each person makes. A new session starts after 30 minutes without activity.",
+        "**By role, Where time is spent, People:** the same numbers split by role, by module and by person. Only who, their role, when and which module are recorded, never what was edited. Days follow your own time zone.",
       ] },
     ],
   },

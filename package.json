@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test:edge": "node scripts/test-draft-reset.mjs && node scripts/test-apply-proposal.mjs && node scripts/test-stacking.mjs && node scripts/test-supply.mjs && node scripts/test-ask-tandom.mjs && node scripts/test-reset-impact.mjs && node scripts/test-execution-followup.mjs && node scripts/test-manage-users.mjs && node scripts/test-fetch-sheet.mjs && node scripts/test-assortment.mjs && node scripts/test-draft-assortment.mjs",
+    "test:edge": "node scripts/test-draft-reset.mjs && node scripts/test-apply-proposal.mjs && node scripts/test-stacking.mjs && node scripts/test-supply.mjs && node scripts/test-ask-tandom.mjs && node scripts/test-reset-impact.mjs && node scripts/test-execution-followup.mjs && node scripts/test-manage-users.mjs && node scripts/test-fetch-sheet.mjs && node scripts/test-assortment.mjs && node scripts/test-draft-assortment.mjs && node scripts/test-usage.mjs",
     "sync:edge": "node scripts/sync-edge-core.mjs",
     "check:edge": "node scripts/sync-edge-core.mjs --check && npm run test:edge"
   },

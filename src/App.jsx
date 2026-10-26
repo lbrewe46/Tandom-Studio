@@ -11,9 +11,10 @@ import {
   supabase, supabaseConfigured, pendingWriteListeners,
   safeGet, safeSet, safeDelete, loadIndexed, saveIndexed, deleteIndexed, waitForPendingWrites,
   loadPendingProposals, reviewProposal, loadProfileNames, loadActivity, loadProposal, applyProposal, invokeEdgeFunction,
-  loadResetImpacts, loadEscalations, resolveEscalation,
+  loadResetImpacts, loadEscalations, resolveEscalation, loadUsageMetrics,
 } from "./lib/db.js";
-import { buildContext, segmentTree, slowMovers, forecastFor, recommend, scopeOptions, DEFAULT_ASSUMPTIONS } from "../supabase/functions/_shared/assortment.js";
+import { startUsageTracking } from "./lib/usage.js";
+import { coreProfile, coreForecasts, coreValueScale, buildContext, segmentTree, slowMovers, forecastFor, recommend, scopeOptions, DEFAULT_ASSUMPTIONS } from "../supabase/functions/_shared/assortment.js";
 
 /* ------------------------------------------------------------------ */
 /* Constants & helpers                                                 */
@@ -2642,6 +2643,10 @@ function storeEffectiveStatus(s) {
   return s.status || "Live";
 }
 
+const sortStoresByName = (list) => [...(list || [])].sort((a, b) =>
+  String(a.name || "").localeCompare(String(b.name || ""), undefined, { numeric: true, sensitivity: "base" })
+  || String(a.storeNumber || "").localeCompare(String(b.storeNumber || ""), undefined, { numeric: true, sensitivity: "base" }));
+
 function StoreForm({ initial, storeSchema, onSave, onCancel }) {
   const [attributes, setAttributes] = useState(initial?.attributes || {});
   const [name, setName] = useState(initial?.name || "");
@@ -4031,6 +4036,7 @@ const HELP_SECTIONS = [
       { type: "ul", items: [
         "**Segments:** list the product attributes in the order a shopper decides at the shelf (for cereal: Age group, then Sugar level, then Brand). The table splits the category that way and shows each segment's sales, share of sales, share of shelf space, space index (over 100 earns more than the room it takes), growth, and which segment holds the most space.",
         "**Slow movers:** every item ranked slowest first by units per store per week, with the bottom quarter flagged. Compare across regions, clusters, formats or stores to see where an item is slow in most places versus just one.",
+        "**Core items:** finds the fundamental, everyday items of the category. An item is core when it sells in most weeks (frequent), with little week-to-week swing (steady) and sits in the top share of category sales (the backbone). Thresholds are editable. Each item shows its stores and coverage by store format, so you can see a core item carried only in large stores; a core item carried by too few stores and missing from planograms is flagged as a gap. Tick gap items to see where they would earn their space (forecast from how they sell where carried, adjusted for store strength) and draft the changes for review. Staple-versus-impulse and competitive pricing can't be read from sales: use Mark core / Not core, and the Price steady column as a hint.",
         "**New items:** import what the category manager sent (Excel, CSV or a Google Sheet link; download the template first) or add items by hand. Each is added to the product library as Pending. Give it a forecast, or pick similar items and say how much it sells compared with them. It also needs its size, and a price (or a similar item's price).",
         "**Recommendations:** for each new item, every planogram in the category is checked. It goes into free space if there is any; otherwise the slowest items are removed, but only if the new item is expected to beat what is given up, and never so many that a segment loses all its variety. Untick a planogram to leave an item off it, lock an item to protect it, then press **Draft changes for review**.",
         "Drafts land in the **AI Draft Review Queue** on the Space Planner's Planograms tab like any other draft (the Review link takes you there). Approving one builds a new Work-in-Progress version; live planograms are not touched.",
@@ -4048,6 +4054,20 @@ const HELP_SECTIONS = [
         "**Lists and cards:** press **Columns** (list view) or **Card fields** (grid view) on the Planograms and Stores tabs and tick the attributes to show. In the planogram list they can be edited in place and set on many selected planograms at once with **Set**.",
         "**Assortment:** look at stores by an attribute (or compare slow movers across it), and limit the analysis to planograms with a given attribute value.",
         "**Reset Impact:** Summarize by any store or planogram attribute.",
+      ] },
+    ],
+  },
+  {
+    id: "usage",
+    title: "Usage",
+    blocks: [
+      { type: "p", text: "The **Usage** tab (Admins only) shows how the app is being used, from the Space Planner's tab bar. Pick a period (7 to 365 days)." },
+      { type: "ul", items: [
+        "**DAU / WAU / MAU:** the number of different people active today, in the last 7 days and in the last 30 days. The chart shows all three day by day.",
+        "**Stickiness:** average daily users divided by monthly users over the last 30 days. Higher means people come back more days of the month.",
+        "**Avg session, Time per active day, Total active time:** how long people actively use the app. Time counts only while someone is clicking, typing or scrolling with the app in view; idle time and a hidden tab don't count.",
+        "**Sessions per user:** how many separate visits each person makes. A new session starts after 30 minutes without activity.",
+        "**By role, Where time is spent, People:** the same numbers split by role, by module and by person. Only who, their role, when and which module are recorded, never what was edited. Days follow your own time zone.",
       ] },
     ],
   },
@@ -5278,12 +5298,55 @@ const byStoreThenPlanogram = (storeKey, planogramKey) => (a, b) =>
   String(a[storeKey] || "").localeCompare(String(b[storeKey] || ""), undefined, { numeric: true, sensitivity: "base" })
   || String(a[planogramKey] || "").localeCompare(String(b[planogramKey] || ""), undefined, { numeric: true, sensitivity: "base" });
 
+const UNCATEGORIZED = "Uncategorized";
+
+// Pick any number of categories (with how many planograms each has), searchable, for a long category list.
+function CategoryFilter({ planograms, selected, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const counts = React.useMemo(() => {
+    const m = new Map();
+    planograms.forEach((p) => { const c = (p.category || "").trim() || UNCATEGORIZED; m.set(c, (m.get(c) || 0) + 1); });
+    return [...m.entries()].sort((a, b) => (a[0] === UNCATEGORIZED) - (b[0] === UNCATEGORIZED) || a[0].localeCompare(b[0], undefined, { numeric: true, sensitivity: "base" }));
+  }, [planograms]);
+  const shown = counts.filter(([c]) => c.toLowerCase().includes(q.trim().toLowerCase()));
+  const toggle = (c) => { const n = new Set(selected); if (n.has(c)) n.delete(c); else n.add(c); onChange(n); };
+  return (
+    <div className="relative">
+      <button className={btnGhost} onClick={() => setOpen((v) => !v)}>
+        {selected.size === 0 ? "All categories" : selected.size === 1 ? [...selected][0] : `${selected.size} categories`} <ChevronDown size={12} />
+      </button>
+      {open && (
+        <div className="absolute left-0 z-30 mt-1 w-64 bg-white border border-slate-200 rounded-lg shadow-lg p-2" onClick={(e) => e.stopPropagation()}>
+          {counts.length > 8 && <input className={inputCls + " mb-1.5 text-xs py-1"} placeholder="Find a category…" value={q} onChange={(e) => setQ(e.target.value)} autoFocus />}
+          <div className="max-h-64 overflow-y-auto">
+            {shown.map(([c, n]) => (
+              <label key={c} className="flex items-center gap-2 text-xs px-1.5 py-1 rounded text-slate-700 hover:bg-slate-50 cursor-pointer">
+                <input type="checkbox" className="accent-amber-500" checked={selected.has(c)} onChange={() => toggle(c)} />
+                <span className="flex-1 truncate">{c}</span>
+                <span className="text-slate-400">{n}</span>
+              </label>
+            ))}
+            {shown.length === 0 && <div className="text-xs text-slate-400 italic px-1.5 py-1">No categories match.</div>}
+          </div>
+          <div className="flex items-center justify-between mt-1.5 px-1.5">
+            <button className="text-xs text-slate-500 hover:underline" onClick={() => onChange(new Set())}>Show all</button>
+            <button className="text-xs text-amber-700 font-semibold hover:underline" onClick={() => setOpen(false)}>Done</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PlanogramList({ planograms, stores, products, fixtures, productSchema, planogramSchema, onCreate, onOpen, onDelete, onUpdate, onAssignStores, onCreateVersion, onCreateVersions, onImportProSpace, onDraftResetBulk, draftingReset, proposals, profileNames, currentUserId, onOpenProposal }) {
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
   const [bulkLookbackWeeks, setBulkLookbackWeeks] = useState(13);
   const [query, setQuery] = useState("");
-  const [categoryFilter, setCategoryFilter] = useState("All");
+  // Category filter: any number of categories (empty = all). Remembered per browser.
+  const [categoryFilter, setCategoryFilter] = useState(() => { const v = readLocalJSON("tandom:planogramCategoryFilter", []); return new Set(Array.isArray(v) ? v : []); });
+  useEffect(() => { writeLocalJSON("tandom:planogramCategoryFilter", [...categoryFilter]); }, [categoryFilter]);
   const [storeFilter, setStoreFilter] = useState("All");
   const [statusFilter, setStatusFilter] = useState(() => new Set()); // empty set = show all statuses
   const [dateFrom, setDateFrom] = useState("");
@@ -5326,7 +5389,7 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
 
   const filtered = planograms
     .filter((p) => p.name.toLowerCase().includes(query.toLowerCase()))
-    .filter((p) => categoryFilter === "All" || (p.category || "Uncategorized") === categoryFilter)
+    .filter((p) => categoryFilter.size === 0 || categoryFilter.has((p.category || "").trim() || UNCATEGORIZED))
     .filter((p) => storeFilter === "All" || (p.storeIds || []).includes(storeFilter))
     .filter((p) => statusFilter.size === 0 || statusFilter.has(effectivePlanogramStatus(p)))
     .filter((p) => !dateFrom || (p.eventDate && p.eventDate >= dateFrom))
@@ -5448,22 +5511,16 @@ function PlanogramList({ planograms, stores, products, fixtures, productSchema, 
             </div>
           </div>
 
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <button
-              onClick={() => setCategoryFilter("All")}
-              className={`text-xs rounded-full px-3 py-1 border font-medium ${categoryFilter === "All" ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-300 text-slate-600 hover:bg-slate-50"}`}
-            >
-              All
-            </button>
-            {categories.map((c) => (
-              <button
-                key={c}
-                onClick={() => setCategoryFilter(c)}
-                className={`text-xs rounded-full px-3 py-1 border font-medium ${categoryFilter === c ? "bg-amber-500 border-amber-500 text-slate-900" : "border-slate-300 text-slate-600 hover:bg-slate-50"}`}
-              >
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wide mr-0.5">Category</span>
+            <CategoryFilter planograms={planograms} selected={categoryFilter} onChange={setCategoryFilter} />
+            {[...categoryFilter].map((c) => (
+              <span key={c} className="inline-flex items-center gap-1 bg-amber-50 border border-amber-300 rounded-full pl-2.5 pr-1 py-0.5 text-xs font-medium text-slate-800">
                 {c}
-              </button>
+                <button className="text-slate-400 hover:text-red-600 px-0.5" title={`Remove ${c}`} onClick={() => setCategoryFilter((prev) => { const n = new Set(prev); n.delete(c); return n; })}><X size={12} /></button>
+              </span>
             ))}
+            {categoryFilter.size > 0 && <button className="text-xs text-slate-500 hover:underline" onClick={() => setCategoryFilter(new Set())}>Clear</button>}
           </div>
 
           <div className="flex items-center gap-1.5 flex-wrap border-t border-slate-100 pt-2.5">
@@ -11957,7 +12014,7 @@ function RegionalEscalationsView() {
 /* (the calculations live in supabase/functions/_shared/assortment.js)  */
 /* ------------------------------------------------------------------ */
 
-const ASSORT_DEFAULT_CFG = { category: "", segmentFieldIds: [], planogramFilter: { fieldId: "", value: "" }, scope: { type: "all", value: "" }, weeks: 13, compare: "prior", groupBy: "region", assumptions: { ...DEFAULT_ASSUMPTIONS } };
+const ASSORT_DEFAULT_CFG = { category: "", segmentFieldIds: [], planogramFilter: { fieldId: "", value: "" }, scope: { type: "all", value: "" }, weeks: 13, compare: "prior", groupBy: "region", coreOverrides: {}, assumptions: { ...DEFAULT_ASSUMPTIONS } };
 const moneyA = (n) => (n === null || n === undefined || !Number.isFinite(n) ? "—" : `${n < 0 ? "-" : ""}$${Math.abs(Math.round(n)).toLocaleString()}`);
 const money2A = (n) => (n === null || n === undefined || !Number.isFinite(n) ? "—" : `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`);
 const growthA = (g) => (g === null || g === undefined ? "—" : `${g >= 0 ? "+" : ""}${(g * 100).toFixed(1)}%`);
@@ -12584,6 +12641,62 @@ const CAND_STATUS = {
   excluded: ["Left out", "bg-slate-100 text-slate-400 border-slate-200"],
 };
 
+function CandidateCard({ item, a, showAll, onToggleShowAll, onToggleExclude, onToggleProtect, protect, limit = 25 }) {
+  const CAND_LIMIT = limit;
+  return (
+      <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+        <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center gap-x-4 gap-y-1">
+          <span className="text-sm font-semibold text-slate-800">{item.name}</span>
+          <span className="text-xs text-slate-500">Forecast {item.forecast.unitsPerStoreWeek} units/store/wk ({item.forecast.basis}) at {money2A(item.forecast.price)}</span>
+          {item.segment.length > 0 && (
+            <span className="text-xs text-slate-500">
+              {item.segment.join(" › ")}
+              {item.segmentTrend && <> — <span className={growthCls(item.segmentTrend.growth)}>{item.segmentTrend.trend.toLowerCase()}</span>{item.segmentTrend.spaceIndex !== null && <>, space index {item.segmentTrend.spaceIndex}</>}{item.segmentTrend.opportunity && <span className="ml-1 font-semibold text-emerald-700">· {item.segmentTrend.opportunity}</span>}</>}
+            </span>
+          )}
+          <span className="ml-auto text-xs font-semibold text-slate-600">{item.recommendedCount} planogram{item.recommendedCount === 1 ? "" : "s"} recommended</span>
+        </div>
+        <table className="w-full text-xs">
+          <thead><tr className="text-left text-slate-400 uppercase tracking-wide border-b border-slate-100">
+            <th className="px-3 py-1.5 w-8"></th><th className="px-2 py-1.5 font-semibold">Planogram</th><th className="px-2 py-1.5 font-semibold text-right">Stores</th><th className="px-2 py-1.5 font-semibold">Result</th>
+            <th className="px-2 py-1.5 font-semibold">Where</th><th className="px-2 py-1.5 font-semibold">Makes room by removing</th><th className="px-2 py-1.5 font-semibold text-right">Net / store / wk</th><th className="px-2 py-1.5 font-semibold text-right">Net / wk</th>
+          </tr></thead>
+          <tbody className="divide-y divide-slate-100">
+            {(showAll ? item.candidates : item.candidates.slice(0, CAND_LIMIT)).map((c) => {
+              const [label, cls] = CAND_STATUS[c.status] || [c.status, ""];
+              const key = `${item.productId}|${c.planogramId}`;
+              const canToggle = !["already_carried", "not_ready"].includes(c.status);
+              return (
+                <tr key={c.planogramId} className={c.status === "recommended" ? "" : "text-slate-500"} title={c.reason}>
+                  <td className="px-3 py-1.5"><input type="checkbox" className="accent-amber-500" disabled={!canToggle} checked={c.status !== "excluded"} onChange={() => onToggleExclude(key)} title="Include this planogram" /></td>
+                  <td className="px-2 py-1.5 font-medium text-slate-800">{c.planogramName}</td>
+                  <td className="px-2 py-1.5 text-right">{c.stores}</td>
+                  <td className="px-2 py-1.5"><span className={`text-[10px] font-bold uppercase tracking-wide rounded px-1.5 py-0.5 border ${cls}`}>{label}</span></td>
+                  <td className="px-2 py-1.5">{c.add ? `${c.add.sectionName ? c.add.sectionName + " · " : ""}${c.add.fixtureName}${c.add.spaceFreeIn !== undefined && c.removes.length === 0 ? ` (${c.add.spaceFreeIn}in free)` : ""}` : "—"}</td>
+                  <td className="px-2 py-1.5">
+                    {c.removes.length === 0 ? <span className="text-slate-400">{c.add ? "Nothing — it fits" : "—"}</span> : c.removes.map((rm) => (
+                      <span key={rm.placementId} className="inline-flex items-center gap-1 mr-2">
+                        {rm.name} <span className="text-slate-400">({rm.velocity}/wk)</span>
+                        <button className={`${protect.has(rm.productId) ? "text-amber-600" : "text-slate-300 hover:text-amber-600"}`} title="Keep this item (don't remove it)" onClick={() => onToggleProtect(rm.productId)}><Lock size={11} /></button>
+                      </span>
+                    ))}
+                    {c.variety.length > 0 && <div className="text-[10px] text-blue-700">{c.variety.join(". ")}</div>}
+                  </td>
+                  <td className={`px-2 py-1.5 text-right ${c.netPerStoreWeek === null ? "" : c.netPerStoreWeek > 0 ? "text-emerald-600" : "text-red-600"}`}>{c.netPerStoreWeek === null ? "—" : a.metric === "units" ? c.netPerStoreWeek : money2A(c.netPerStoreWeek)}</td>
+                  <td className={`px-2 py-1.5 text-right font-semibold ${c.netNetworkWeek === null ? "" : c.netNetworkWeek > 0 ? "text-emerald-600" : "text-red-600"}`}>{c.netNetworkWeek === null ? "—" : a.metric === "units" ? Math.round(c.netNetworkWeek) : moneyA(c.netNetworkWeek)}</td>
+                </tr>
+              );
+            })}
+            {item.candidates.length === 0 && <tr><td colSpan={8} className="px-3 py-3 text-center text-slate-400 italic">No planograms in view.</td></tr>}
+            {item.candidates.length > CAND_LIMIT && (
+              <tr><td colSpan={8} className="px-3 py-1.5 text-center"><button className="text-xs text-amber-700 font-semibold hover:underline" onClick={onToggleShowAll}>{showAll ? `Show the top ${CAND_LIMIT}` : `Show all ${item.candidates.length} planograms`}</button></td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+  );
+}
+
 function RecommendationsView({ ctx, products, cfg, setCfg, planogramFilter, onOpenProposal, onDrafted }) {
   const [showAllFor, setShowAllFor] = useState(() => new Set()); // item ids whose full planogram list is open
   const CAND_LIMIT = 25; // a chain can have hundreds of planograms per category; the best are listed first
@@ -12677,59 +12790,181 @@ function RecommendationsView({ ctx, products, cfg, setCfg, planogramFilter, onOp
             </div>
           )}
           {rec.items.map((item) => (
-            <div key={item.productId} className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-              <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center gap-x-4 gap-y-1">
-                <span className="text-sm font-semibold text-slate-800">{item.name}</span>
-                <span className="text-xs text-slate-500">Forecast {item.forecast.unitsPerStoreWeek} units/store/wk ({item.forecast.basis}) at {money2A(item.forecast.price)}</span>
-                {item.segment.length > 0 && (
-                  <span className="text-xs text-slate-500">
-                    {item.segment.join(" › ")}
-                    {item.segmentTrend && <> — <span className={growthCls(item.segmentTrend.growth)}>{item.segmentTrend.trend.toLowerCase()}</span>{item.segmentTrend.spaceIndex !== null && <>, space index {item.segmentTrend.spaceIndex}</>}{item.segmentTrend.opportunity && <span className="ml-1 font-semibold text-emerald-700">· {item.segmentTrend.opportunity}</span>}</>}
-                  </span>
-                )}
-                <span className="ml-auto text-xs font-semibold text-slate-600">{item.recommendedCount} planogram{item.recommendedCount === 1 ? "" : "s"} recommended</span>
-              </div>
-              <table className="w-full text-xs">
-                <thead><tr className="text-left text-slate-400 uppercase tracking-wide border-b border-slate-100">
-                  <th className="px-3 py-1.5 w-8"></th><th className="px-2 py-1.5 font-semibold">Planogram</th><th className="px-2 py-1.5 font-semibold text-right">Stores</th><th className="px-2 py-1.5 font-semibold">Result</th>
-                  <th className="px-2 py-1.5 font-semibold">Where</th><th className="px-2 py-1.5 font-semibold">Makes room by removing</th><th className="px-2 py-1.5 font-semibold text-right">Net / store / wk</th><th className="px-2 py-1.5 font-semibold text-right">Net / wk</th>
-                </tr></thead>
-                <tbody className="divide-y divide-slate-100">
-                  {(showAllFor.has(item.productId) ? item.candidates : item.candidates.slice(0, CAND_LIMIT)).map((c) => {
-                    const [label, cls] = CAND_STATUS[c.status] || [c.status, ""];
-                    const key = `${item.productId}|${c.planogramId}`;
-                    const canToggle = !["already_carried", "not_ready"].includes(c.status);
-                    return (
-                      <tr key={c.planogramId} className={c.status === "recommended" ? "" : "text-slate-500"} title={c.reason}>
-                        <td className="px-3 py-1.5"><input type="checkbox" className="accent-amber-500" disabled={!canToggle} checked={c.status !== "excluded"} onChange={() => toggleSet(setExclude, key)} title="Include this planogram" /></td>
-                        <td className="px-2 py-1.5 font-medium text-slate-800">{c.planogramName}</td>
-                        <td className="px-2 py-1.5 text-right">{c.stores}</td>
-                        <td className="px-2 py-1.5"><span className={`text-[10px] font-bold uppercase tracking-wide rounded px-1.5 py-0.5 border ${cls}`}>{label}</span></td>
-                        <td className="px-2 py-1.5">{c.add ? `${c.add.sectionName ? c.add.sectionName + " · " : ""}${c.add.fixtureName}${c.add.spaceFreeIn !== undefined && c.removes.length === 0 ? ` (${c.add.spaceFreeIn}in free)` : ""}` : "—"}</td>
-                        <td className="px-2 py-1.5">
-                          {c.removes.length === 0 ? <span className="text-slate-400">{c.add ? "Nothing — it fits" : "—"}</span> : c.removes.map((rm) => (
-                            <span key={rm.placementId} className="inline-flex items-center gap-1 mr-2">
-                              {rm.name} <span className="text-slate-400">({rm.velocity}/wk)</span>
-                              <button className={`${protect.has(rm.productId) ? "text-amber-600" : "text-slate-300 hover:text-amber-600"}`} title="Keep this item (don't remove it)" onClick={() => toggleSet(setProtect, rm.productId)}><Lock size={11} /></button>
-                            </span>
-                          ))}
-                          {c.variety.length > 0 && <div className="text-[10px] text-blue-700">{c.variety.join(". ")}</div>}
-                        </td>
-                        <td className={`px-2 py-1.5 text-right ${c.netPerStoreWeek === null ? "" : c.netPerStoreWeek > 0 ? "text-emerald-600" : "text-red-600"}`}>{c.netPerStoreWeek === null ? "—" : a.metric === "units" ? c.netPerStoreWeek : money2A(c.netPerStoreWeek)}</td>
-                        <td className={`px-2 py-1.5 text-right font-semibold ${c.netNetworkWeek === null ? "" : c.netNetworkWeek > 0 ? "text-emerald-600" : "text-red-600"}`}>{c.netNetworkWeek === null ? "—" : a.metric === "units" ? Math.round(c.netNetworkWeek) : moneyA(c.netNetworkWeek)}</td>
-                      </tr>
-                    );
-                  })}
-                  {item.candidates.length === 0 && <tr><td colSpan={8} className="px-3 py-3 text-center text-slate-400 italic">No planograms in view.</td></tr>}
-                  {item.candidates.length > CAND_LIMIT && (
-                    <tr><td colSpan={8} className="px-3 py-1.5 text-center"><button className="text-xs text-amber-700 font-semibold hover:underline" onClick={() => setShowAllFor((prev) => { const n = new Set(prev); if (n.has(item.productId)) n.delete(item.productId); else n.add(item.productId); return n; })}>{showAllFor.has(item.productId) ? `Show the top ${CAND_LIMIT}` : `Show all ${item.candidates.length} planograms`}</button></td></tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
+            <CandidateCard key={item.productId} item={item} a={a} protect={protect} showAll={showAllFor.has(item.productId)}
+              onToggleShowAll={() => toggleSet(setShowAllFor, item.productId)} onToggleExclude={(key) => toggleSet(setExclude, key)} onToggleProtect={(id) => toggleSet(setProtect, id)} />
           ))}
           <p className="text-[11px] text-slate-400">Untick a planogram to leave an item off it; click the lock to protect an item from being removed. The list updates straight away and the drafts follow what you see. Hover a row for the reasoning.</p>
         </>
+      )}
+    </div>
+  );
+}
+
+const CORE_CLS = {
+  core: ["Core", "bg-emerald-50 text-emerald-700 border-emerald-200"],
+  near: ["Nearly core", "bg-amber-50 text-amber-700 border-amber-200"],
+  not: ["Not core", "bg-slate-100 text-slate-500 border-slate-200"],
+  unknown: ["Not enough data", "bg-slate-50 text-slate-400 border-slate-200"],
+};
+
+function CoreChecks({ row, th }) {
+  const items = [
+    ["Frequent", row.checks.frequency.ok, `Sold in ${Math.round(row.checks.frequency.value * 100)}% of weeks (needs ${Math.round(th.weeksSelling * 100)}%)`],
+    ["Steady", row.checks.steady.ok, row.checks.steady.value === null ? "No sales" : `Weekly swing ${row.checks.steady.value} (needs ${th.maxCv} or less)`],
+    ["Backbone", row.checks.baseline.ok, `${(row.checks.baseline.value * 100).toFixed(1)}% of category sales; must be in the top ${Math.round(th.salesShare * 100)}%`],
+  ];
+  return (
+    <span className="inline-flex gap-1">
+      {items.map(([label, ok, tip]) => <span key={label} title={tip} className={`text-[10px] rounded px-1 py-0.5 border ${ok ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-white text-slate-400 border-slate-200"}`}>{ok ? "✓" : "✗"} {label}</span>)}
+    </span>
+  );
+}
+
+function CoreItemsView({ ctx, cfg, setCfg, planogramFilter, onOpenProposal, onDrafted }) {
+  const a = cfg.assumptions;
+  const overrides = cfg.coreOverrides || {};
+  const [gapsOnly, setGapsOnly] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+  const [picked, setPicked] = useState(null); // Set of gap item ids; null = every gap
+  const [exclude, setExclude] = useState(() => new Set());
+  const [protect, setProtect] = useState(() => new Set());
+  const [showAllFor, setShowAllFor] = useState(() => new Set());
+  const [drafting, setDrafting] = useState(false);
+  const [draftResult, setDraftResult] = useState(null);
+  const [error, setError] = useState("");
+  const profile = React.useMemo(() => coreProfile(ctx, { overrides }), [ctx, cfg.coreOverrides]); // eslint-disable-line react-hooks/exhaustive-deps
+  const gapIds = React.useMemo(() => profile.rows.filter((r) => r.isGap).map((r) => r.productId), [profile]);
+  const chosen = (picked ? [...picked] : gapIds).filter((id) => gapIds.includes(id));
+  const rec = React.useMemo(() => {
+    if (!chosen.length || ctx.storeCount === 0) return null;
+    return recommend(ctx, chosen, { exclude, protect, forecastOverrides: coreForecasts(ctx, chosen), valueScale: coreValueScale(ctx), kind: "core" });
+  }, [ctx, chosen.join("|"), exclude, protect]); // eslint-disable-line react-hooks/exhaustive-deps
+  const setA = (patch) => setCfg((c) => ({ ...c, assumptions: { ...c.assumptions, ...patch } }));
+  const setOverride = (id, value) => setCfg((c) => { const o = { ...(c.coreOverrides || {}) }; if (value) o[id] = value; else delete o[id]; return { ...c, coreOverrides: o }; });
+  const toggleSet = (setter, key) => setter((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+  const toggleItem = (id) => setPicked((prev) => { const base = new Set(prev || gapIds); if (base.has(id)) base.delete(id); else base.add(id); return base; });
+  const th = profile.thresholds;
+  const sm = profile.summary;
+
+  const draft = async () => {
+    setDrafting(true); setError(""); setDraftResult(null);
+    try {
+      const res = await invokeEdgeFunction("draft-assortment", {
+        mode: "core", newItemIds: chosen, coreOverrides: overrides,
+        params: { category: cfg.category, scope: cfg.scope.type === "all" ? { type: "all" } : cfg.scope, planogramFilter, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds,
+          assumptions: { metric: a.metric, cannibalization: a.cannibalization, transfer: a.transfer, maxRemovalsPerAdd: a.maxRemovalsPerAdd, coreMinWeeksSelling: a.coreMinWeeksSelling, coreMaxCv: a.coreMaxCv, coreSalesShare: a.coreSalesShare, coreMinCoverage: a.coreMinCoverage } },
+        exclude: [...exclude], protect: [...protect],
+      });
+      setDraftResult(res);
+      if (onDrafted) onDrafted();
+    } catch (e) { setError(e?.message || "Couldn't draft the changes."); }
+    finally { setDrafting(false); }
+  };
+
+  if (!cfg.category) return <p className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-6 text-center">Choose a category above.</p>;
+  if (ctx.storeCount === 0) return <p className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-6 text-center">No Live or Pending planograms in {cfg.category} are assigned to {ctx.scope.label.toLowerCase()}.</p>;
+  const rows = profile.rows.filter((r) => !gapsOnly || r.isGap);
+  const visible = showAll ? rows : rows.slice(0, 60);
+  const numIn = (label, title, value, key, scale = 100, step = 1, min = 1, max = 100) => (
+    <div><label className={labelCls} title={title}>{label}</label>
+      <input type="number" min={min} max={max} step={step} className={inputCls + " w-20 text-xs py-1"} value={Math.round(value * scale * 100) / 100} onChange={(e) => { const v = Number(e.target.value); if (Number.isFinite(v) && v > 0) setA({ [key]: clamp(v / scale, min / scale, max / scale) }); }} /></div>
+  );
+  return (
+    <div className="space-y-4">
+      <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-3">
+        <div>
+          <h3 className="text-sm font-semibold text-slate-800">What counts as a core item?</h3>
+          <p className="text-xs text-slate-500">A fundamental, high-demand item that sells steadily and forms the everyday foundation of {cfg.category}. An item is core when it passes all three sales checks below (or you mark it core yourself). "Staple versus impulse" and competitive pricing can't be read from sales alone, so use Mark core / Not core for those calls; price steadiness is shown as a hint only, since Tandom holds no competitor prices.</p>
+        </div>
+        <div className="flex flex-wrap items-end gap-4">
+          {numIn("Sells in at least % of weeks", "Frequency: share of weeks in the period with any sales", a.coreMinWeeksSelling, "coreMinWeeksSelling", 100, 5, 10, 100)}
+          {numIn("Weekly swing at most", "Steadiness: standard deviation of weekly units per store divided by the average. Lower is steadier", a.coreMaxCv, "coreMaxCv", 1, 0.05, 0.05, 5)}
+          {numIn("In the top % of category sales", "Backbone: items are ranked by sales and counted until this share of the category is reached", a.coreSalesShare, "coreSalesShare", 100, 5, 10, 100)}
+          {numIn("Gap if carried by under % of stores", "A core item carried by fewer stores than this, and missing from at least one planogram, is flagged as a gap", a.coreMinCoverage, "coreMinCoverage", 100, 5, 10, 100)}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        {[["Core items", sm.core, `${sm.near} nearly core`], ["Core share of sales", pctA(sm.coreShareOfSales), "of this category"], ["Average core coverage", sm.coreAvgCoverage === null ? "—" : `${Math.round(sm.coreAvgCoverage * 100)}%`, "of stores carry a core item"], ["Gaps", sm.gaps, "core items missing from planograms"]].map(([label, value, sub]) => (
+          <div key={label} className="bg-white border border-slate-200 rounded-lg p-3"><div className="text-[11px] uppercase tracking-wide text-slate-400 font-semibold">{label}</div><div className="text-xl font-bold text-slate-800">{value}</div><div className="text-[11px] text-slate-500">{sub}</div></div>
+        ))}
+      </div>
+
+      <div className="flex items-center gap-3">
+        <label className="text-xs text-slate-600 flex items-center gap-1.5"><input type="checkbox" className="accent-amber-500" checked={gapsOnly} onChange={(e) => setGapsOnly(e.target.checked)} /> Gaps only</label>
+        <span className="text-xs text-slate-400">Gaps first, then core, then the rest by sales.</span>
+      </div>
+      <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead><tr className="text-left text-slate-400 uppercase tracking-wide border-b border-slate-100">
+            <th className="px-2 py-1.5 w-8"></th><th className="px-2 py-1.5 font-semibold">Item</th><th className="px-2 py-1.5 font-semibold">Class</th><th className="px-2 py-1.5 font-semibold">Checks</th>
+            <th className="px-2 py-1.5 font-semibold text-right">Stores</th><th className="px-2 py-1.5 font-semibold">By format</th><th className="px-2 py-1.5 font-semibold text-right">Units/store/wk</th>
+            <th className="px-2 py-1.5 font-semibold text-right">Share</th><th className="px-2 py-1.5 font-semibold text-right" title="Share of sales at the usual price (within the price band)">Price steady</th><th className="px-2 py-1.5 font-semibold">Missing from</th><th className="px-2 py-1.5 font-semibold">Your call</th>
+          </tr></thead>
+          <tbody className="divide-y divide-slate-100">
+            {visible.map((r) => {
+              const [label, cls] = CORE_CLS[r.cls];
+              return (
+                <tr key={r.productId} className={r.isGap ? "bg-amber-50/40" : ""}>
+                  <td className="px-2 py-1.5">{r.isGap && <input type="checkbox" className="accent-amber-500" checked={chosen.includes(r.productId)} onChange={() => toggleItem(r.productId)} title="Include in the expansion below" />}</td>
+                  <td className="px-2 py-1.5"><div className="font-medium text-slate-800">{r.name}</div>{r.segment.length > 0 && <div className="text-[10px] text-slate-400">{r.segment.join(" › ")}</div>}</td>
+                  <td className="px-2 py-1.5"><span className={`text-[10px] font-bold uppercase tracking-wide rounded px-1.5 py-0.5 border ${cls}`}>{label}</span>{r.override && <span className="ml-1 text-[10px] text-slate-400">(your call)</span>}{r.isGap && <span className="ml-1 text-[10px] font-bold text-amber-700">GAP</span>}</td>
+                  <td className="px-2 py-1.5">{r.hasData ? <CoreChecks row={r} th={th} /> : <span className="text-slate-400">—</span>}</td>
+                  <td className="px-2 py-1.5 text-right">{r.stores}/{r.storesInView} <span className="text-slate-400">({Math.round(r.coverage * 100)}%)</span></td>
+                  <td className="px-2 py-1.5">{r.byFormat.map((f) => <span key={f.format} className={`inline-block mr-1 text-[10px] rounded px-1 py-0.5 border ${f.pct >= 0.95 ? "bg-emerald-50 text-emerald-700 border-emerald-200" : f.pct === 0 ? "bg-red-50 text-red-700 border-red-200" : "bg-amber-50 text-amber-700 border-amber-200"}`} title={`${f.carried} of ${f.of} ${f.format} stores`}>{f.format} {Math.round(f.pct * 100)}%</span>)}</td>
+                  <td className="px-2 py-1.5 text-right">{r.velocity}</td>
+                  <td className="px-2 py-1.5 text-right">{pctA(r.salesShare)}</td>
+                  <td className="px-2 py-1.5 text-right text-slate-500">{r.priceSteady === null ? "—" : `${Math.round(r.priceSteady * 100)}%`}</td>
+                  <td className="px-2 py-1.5 text-slate-600">{r.missingPlanograms.length === 0 ? <span className="text-slate-300">—</span> : <span title={r.missingPlanograms.map((m) => `${m.planogramName} (${m.stores} stores)`).join(", ")}>{r.missingPlanograms.length} planogram{r.missingPlanograms.length === 1 ? "" : "s"}, {r.missingStores} stores</span>}</td>
+                  <td className="px-2 py-1.5 whitespace-nowrap">
+                    <AssortSelect value={r.override || ""} onChange={(v) => setOverride(r.productId, v)}><option value="">Automatic</option><option value="core">Mark core</option><option value="notcore">Not core</option></AssortSelect>
+                  </td>
+                </tr>
+              );
+            })}
+            {rows.length === 0 && <tr><td colSpan={11} className="px-3 py-4 text-center text-slate-400 italic">{gapsOnly ? "No core item has a coverage gap." : "No items in view."}</td></tr>}
+          </tbody>
+        </table>
+        {rows.length > 60 && <button className="w-full text-xs text-slate-500 hover:bg-slate-50 py-2 border-t border-slate-100" onClick={() => setShowAll((v) => !v)}>{showAll ? "Show fewer" : `Show all ${rows.length}`}</button>}
+      </div>
+
+      {gapIds.length > 0 && (
+        <div className="space-y-3">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-800">Extend core items to the planograms that lack them</h3>
+            <p className="text-xs text-slate-500">Forecasts use what each item sells per store where it is carried, adjusted up or down for how strong the other planograms' stores are in this category. Each item is placed in free space if there is any; otherwise the slowest items make room, and only if the core item is expected to beat what is given up.</p>
+          </div>
+          {rec && (
+            <>
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 flex flex-wrap items-center gap-3">
+                <div className="text-sm text-blue-900 flex-1 min-w-[240px]">
+                  <span className="font-semibold">{rec.totals.placements}</span> placement{rec.totals.placements === 1 ? "" : "s"} for <span className="font-semibold">{rec.totals.itemsRecommended}</span> of {rec.items.length} core item{rec.items.length === 1 ? "" : "s"}, worth about <span className="font-semibold">{a.metric === "units" ? `${Math.round(rec.totals.netNetworkWeek)} units` : moneyA(rec.totals.netNetworkWeek)}</span> a week.
+                </div>
+                <button className={btnPrimary} disabled={drafting || rec.totals.placements === 0} onClick={draft}><Sparkles size={14} /> {drafting ? "Drafting…" : "Draft changes for review"}</button>
+              </div>
+              {error && <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{error}</div>}
+              {draftResult && (
+                <div className="bg-white border border-emerald-200 rounded-lg p-3 space-y-1.5">
+                  <div className="text-sm font-semibold text-emerald-800">{draftResult.proposals.length} draft{draftResult.proposals.length === 1 ? "" : "s"} ready for review</div>
+                  {draftResult.proposals.map((p) => (
+                    <div key={p.proposalId} className="flex items-center gap-3 text-sm">
+                      <span className="font-medium text-slate-800">{p.planogramName}</span>
+                      <span className="text-xs text-slate-500">{p.adds} added{p.removes ? `, ${p.removes} removed` : ""}</span>
+                      <button className="text-xs text-amber-700 font-semibold hover:underline ml-auto" onClick={() => onOpenProposal(p.proposalId)}>Review</button>
+                    </div>
+                  ))}
+                  {draftResult.notDrafted.map((p) => <div key={p.planogramId} className="text-xs text-amber-700">{p.planogramName}: {p.reason}</div>)}
+                  <div className="text-[11px] text-slate-400">Approving a draft creates a new Work-in-Progress version of that planogram; nothing changes on a live planogram until you do.</div>
+                </div>
+              )}
+              {rec.items.map((item) => (
+                <CandidateCard key={item.productId} item={item} a={a} protect={protect} showAll={showAllFor.has(item.productId)}
+                  onToggleShowAll={() => toggleSet(setShowAllFor, item.productId)} onToggleExclude={(key) => toggleSet(setExclude, key)} onToggleProtect={(id) => toggleSet(setProtect, id)} />
+              ))}
+            </>
+          )}
+          {!rec && <p className="text-xs text-slate-400 italic">Tick at least one gap item above.</p>}
+        </div>
       )}
     </div>
   );
@@ -12740,7 +12975,7 @@ function RecommendationsView({ ctx, products, cfg, setCfg, planogramFilter, onOp
 function AssortmentModule({ products, planograms, fixtures, stores, performance, productSchema, storeSchema, planogramSchema, primaryKeyField, onCreateProduct, onUpdateProduct, onDeleteProduct, onOpenProposal, onDrafted }) {
   const [cfg, setCfgState] = useState(ASSORT_DEFAULT_CFG);
   const [loaded, setLoaded] = useState(false);
-  const [view, setView] = useState("segments"); // segments | slow | newItems | recommend
+  const [view, setView] = useState("segments"); // segments | slow | core | newItems | recommend
   const saveTimer = useRef(null);
 
   useEffect(() => {
@@ -12776,7 +13011,7 @@ function AssortmentModule({ products, planograms, fixtures, stores, performance,
   );
   const tree = React.useMemo(() => segmentTree(ctx), [ctx]);
 
-  const tabs = [["segments", "Segments"], ["slow", "Slow movers"], ["newItems", "New items"], ["recommend", "Recommendations"]];
+  const tabs = [["segments", "Segments"], ["slow", "Slow movers"], ["core", "Core items"], ["newItems", "New items"], ["recommend", "Recommendations"]];
   return (
     <div>
       <div className="flex items-center justify-between mb-1">
@@ -12794,9 +13029,141 @@ function AssortmentModule({ products, planograms, fixtures, stores, performance,
         <>
           {view === "segments" && <SegmentsView ctx={ctx} tree={tree} cfg={cfg} setCfg={setCfg} productSchema={productSchema} />}
           {view === "slow" && <SlowMoversView ctx={ctx} cfg={cfg} setCfg={setCfg} segLabel="" storeSchema={storeSchema} />}
+          {view === "core" && <CoreItemsView ctx={ctx} cfg={cfg} setCfg={setCfg} planogramFilter={planogramFilter} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
           {view === "newItems" && <NewItemsView ctx={ctx} products={products} productSchema={productSchema} categories={categories} primaryKeyField={primaryKeyField} cfg={cfg} onCreate={onCreateProduct} onUpdate={onUpdateProduct} onDelete={onDeleteProduct} />}
           {view === "recommend" && <RecommendationsView ctx={ctx} products={products} cfg={cfg} setCfg={setCfg} planogramFilter={planogramFilter} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
         </>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Usage (Admins): who uses the app, how often and for how long        */
+/* ------------------------------------------------------------------ */
+
+const fmtDuration = (sec) => {
+  const s = Math.round(sec || 0);
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min`;
+  return `${Math.floor(m / 60)} h ${m % 60} min`;
+};
+const USAGE_ROLE_LABELS = { admin: "Admin", category_manager: "Category Manager", event_planner: "Event Planner", regional_manager: "Regional Manager", store_associate: "Store Associate", unknown: "Unknown" };
+const USAGE_MODULE_LABELS = { eventPlanner: "Event Planner", assortment: "Assortment Planner", storeAssistant: "Store Assistant", planner: "Space Planner" };
+const usageModuleLabel = (key) => { const [mode, tab] = String(key).split(":"); const base = USAGE_MODULE_LABELS[mode] || mode; return tab ? `${base} › ${tab}` : base; };
+
+// A small line chart of DAU, WAU and MAU over the period (no chart library needed).
+function UsageTrendChart({ daily }) {
+  const W = 760, H = 220, L = 36, R = 64, T = 12, B = 26;
+  if (!daily || daily.length === 0) return null;
+  const series = [["mau", "MAU", "#475569"], ["wau", "WAU", "#2563eb"], ["dau", "DAU", "#d97706"]];
+  const max = Math.max(1, ...daily.flatMap((d) => [d.dau, d.wau, d.mau]));
+  const nice = max <= 5 ? max : Math.ceil(max / 5) * 5;
+  const x = (i) => L + (daily.length === 1 ? 0 : (i / (daily.length - 1)) * (W - L - R));
+  const y = (v) => T + (1 - v / nice) * (H - T - B);
+  const ticks = [0, 0.5, 1].map((f) => Math.round(nice * f));
+  const labelIdx = [0, Math.floor((daily.length - 1) / 2), daily.length - 1].filter((v, i, a) => a.indexOf(v) === i);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" role="img" aria-label="Daily, weekly and monthly active users over time">
+      {ticks.map((tv) => (
+        <g key={tv}>
+          <line x1={L} x2={W - R} y1={y(tv)} y2={y(tv)} stroke="#e2e8f0" strokeWidth="1" />
+          <text x={L - 6} y={y(tv) + 3} textAnchor="end" fontSize="10" fill="#94a3b8">{tv}</text>
+        </g>
+      ))}
+      {labelIdx.map((i) => <text key={i} x={x(i)} y={H - 8} textAnchor={i === 0 ? "start" : i === daily.length - 1 ? "end" : "middle"} fontSize="10" fill="#94a3b8">{String(daily[i].day).slice(5)}</text>)}
+      {series.map(([key, label, color]) => (
+        <g key={key}>
+          <polyline fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" points={daily.map((d, i) => `${x(i)},${y(d[key])}`).join(" ")} />
+          <text x={W - R + 6} y={y(daily[daily.length - 1][key]) + 3} fontSize="11" fontWeight="600" fill={color}>{label} {daily[daily.length - 1][key]}</text>
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+function UsageView() {
+  const [days, setDays] = useState(30);
+  const [state, setState] = useState({ status: "loading", data: null, error: "" });
+  const tz = React.useMemo(() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch (e) { return "UTC"; } }, []);
+  const load = useCallback(async () => {
+    setState((s) => ({ ...s, status: "loading" }));
+    const r = await loadUsageMetrics(days, tz);
+    setState(r.ok ? { status: "ready", data: r.data, error: "" } : { status: "error", data: null, error: r.error || "" });
+  }, [days, tz]);
+  useEffect(() => { load(); }, [load]);
+  const d = state.data, t = d?.totals;
+  const tile = (label, value, hint) => (
+    <div className="bg-white border border-slate-200 rounded-lg px-4 py-3" title={hint}>
+      <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{label}</div>
+      <div className="text-2xl font-bold text-slate-800 mt-0.5">{value}</div>
+      {hint && <div className="text-[11px] text-slate-400 mt-0.5">{hint}</div>}
+    </div>
+  );
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <h2 className="text-lg font-bold text-slate-800">Usage</h2>
+        <div className="flex items-center gap-2">
+          <select className={inputCls + " w-auto text-xs py-1"} value={days} onChange={(e) => setDays(Number(e.target.value))}>
+            {[7, 30, 90, 180, 365].map((n) => <option key={n} value={n}>Last {n} days</option>)}
+          </select>
+          <button className={btnGhost} onClick={load}><RefreshCw size={13} className={state.status === "loading" ? "animate-spin" : ""} /> Refresh</button>
+        </div>
+      </div>
+      <p className="text-sm text-slate-500 mb-4">Who is using Tandom Studio, how often, and for how long. Time counts only while someone is actively using the app with it in view; only the person, their role and which module they were in are recorded, never what they edited.</p>
+      {state.status === "error" && (
+        <div className="text-sm rounded-md px-3 py-2 mb-3 bg-amber-50 text-amber-700 border border-amber-200">Usage couldn't be loaded{state.error ? ` (${state.error})` : ""}. If this is the first time, run the latest <span className="font-mono">supabase/schema.sql</span>.</div>
+      )}
+      {state.status === "loading" && !d && <p className="text-sm text-slate-400">Loading…</p>}
+      {d && t && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            {tile("DAU", t.dau ?? 0, "Active today")}
+            {tile("WAU", t.wau ?? 0, "Active in the last 7 days")}
+            {tile("MAU", t.mau ?? 0, "Active in the last 30 days")}
+            {tile("Stickiness", t.stickiness === null || t.stickiness === undefined ? "—" : `${(t.stickiness * 100).toFixed(1)}%`, "Average daily users ÷ monthly users (30 days)")}
+            {tile("Avg session", fmtDuration(t.avgSessionSeconds), "Active time per session")}
+            {tile("Sessions per user", t.avgSessionsPerUser ?? 0, `${t.sessions} sessions, ${t.activeUsers} people`)}
+            {tile("Time per active day", fmtDuration(t.avgSecondsPerActiveDay), "Per person, on days they used it")}
+            {tile("Total active time", fmtDuration(t.activeSeconds), `Last ${d.days} days`)}
+          </div>
+
+          <div className="bg-white border border-slate-200 rounded-lg p-4">
+            <div className="text-sm font-semibold text-slate-700 mb-1">Active users over time</div>
+            <UsageTrendChart daily={d.daily} />
+            <div className="text-[11px] text-slate-400">Days are in your time zone ({d.timezone}). Rolling: WAU and MAU count the people active in the 7 and 30 days up to each day.</div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+              <div className="px-4 py-2 text-sm font-semibold text-slate-700 border-b border-slate-100">By role</div>
+              <table className="w-full text-xs"><thead><tr className="text-left text-slate-400 uppercase tracking-wide"><th className="px-4 py-1.5 font-semibold">Role</th><th className="px-2 py-1.5 font-semibold text-right">People</th><th className="px-2 py-1.5 font-semibold text-right">Sessions</th><th className="px-4 py-1.5 font-semibold text-right">Active time</th></tr></thead>
+                <tbody className="divide-y divide-slate-100">
+                  {(d.byRole || []).map((r) => <tr key={r.role}><td className="px-4 py-1.5 text-slate-700">{USAGE_ROLE_LABELS[r.role] || r.role}</td><td className="px-2 py-1.5 text-right">{r.users}</td><td className="px-2 py-1.5 text-right">{r.sessions}</td><td className="px-4 py-1.5 text-right">{fmtDuration(r.seconds)}</td></tr>)}
+                  {(d.byRole || []).length === 0 && <tr><td colSpan={4} className="px-4 py-3 text-center text-slate-400 italic">No sessions yet.</td></tr>}
+                </tbody></table>
+            </div>
+            <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+              <div className="px-4 py-2 text-sm font-semibold text-slate-700 border-b border-slate-100">Where time is spent</div>
+              <table className="w-full text-xs"><thead><tr className="text-left text-slate-400 uppercase tracking-wide"><th className="px-4 py-1.5 font-semibold">Module</th><th className="px-2 py-1.5 font-semibold text-right">People</th><th className="px-4 py-1.5 font-semibold text-right">Active time</th></tr></thead>
+                <tbody className="divide-y divide-slate-100">
+                  {(d.byModule || []).map((m) => <tr key={m.module}><td className="px-4 py-1.5 text-slate-700">{usageModuleLabel(m.module)}</td><td className="px-2 py-1.5 text-right">{m.users}</td><td className="px-4 py-1.5 text-right">{fmtDuration(m.seconds)}</td></tr>)}
+                  {(d.byModule || []).length === 0 && <tr><td colSpan={3} className="px-4 py-3 text-center text-slate-400 italic">No activity yet.</td></tr>}
+                </tbody></table>
+            </div>
+          </div>
+
+          <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
+            <div className="px-4 py-2 text-sm font-semibold text-slate-700 border-b border-slate-100">People <span className="text-xs font-normal text-slate-400">(most active time first, top 200)</span></div>
+            <table className="w-full text-xs"><thead><tr className="text-left text-slate-400 uppercase tracking-wide"><th className="px-4 py-1.5 font-semibold">Person</th><th className="px-2 py-1.5 font-semibold">Role</th><th className="px-2 py-1.5 font-semibold text-right">Days active</th><th className="px-2 py-1.5 font-semibold text-right">Sessions</th><th className="px-2 py-1.5 font-semibold text-right">Active time</th><th className="px-4 py-1.5 font-semibold text-right">Last seen</th></tr></thead>
+              <tbody className="divide-y divide-slate-100">
+                {(d.users || []).map((u) => <tr key={u.user_id}><td className="px-4 py-1.5 text-slate-800">{u.display_name || u.email || u.user_id}</td><td className="px-2 py-1.5 text-slate-500">{USAGE_ROLE_LABELS[u.role] || u.role}</td><td className="px-2 py-1.5 text-right">{u.days_active}</td><td className="px-2 py-1.5 text-right">{u.sessions}</td><td className="px-2 py-1.5 text-right">{fmtDuration(u.seconds)}</td><td className="px-4 py-1.5 text-right text-slate-500">{u.last_day}</td></tr>)}
+                {(d.users || []).length === 0 && <tr><td colSpan={6} className="px-4 py-3 text-center text-slate-400 italic">No sessions in this period.</td></tr>}
+              </tbody></table>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -12847,9 +13214,17 @@ function AppContent({ session }) {
   const [fixtures, setFixtures] = useState([]);
   const [planograms, setPlanograms] = useState([]);
   const [performance, setPerformance] = useState({}); // productId -> [{weekEnding, unitCost, price, units}]
-  const [stores, setStores] = useState([]);
+  // Stores are always kept A to Z (numbers in numeric order), so every list, picker and report shows them that way.
+  const [stores, setStoresRaw] = useState([]);
+  const setStores = useCallback((update) => setStoresRaw((prev) => sortStoresByName(typeof update === "function" ? update(prev) : update)), []);
   const [activePlanogramId, setActivePlanogramId] = useState(null);
   const [pendingSaveCount, setPendingSaveCount] = useState(0);
+  const usageModuleRef = useRef("app"); // which module the person is in right now, for usage tracking
+  const signedInUserId = session?.user?.id;
+  useEffect(() => {
+    if (!supabase || !signedInUserId) return undefined;
+    return startUsageTracking({ db: supabase, userId: signedInUserId, getModule: () => usageModuleRef.current });
+  }, [signedInUserId]);
   const [appMode, setAppModeState] = useState("planner"); // "planner" | "storeAssistant" | "eventPlanner"
   const [selectedStoreId, setSelectedStoreIdState] = useState(null); // which store is "logged in" to Store Assistant
   // restricted roles never write these shared settings (they have no access to them, and their screen is fixed by role)
@@ -13499,6 +13874,7 @@ function AppContent({ session }) {
   // each role lands on its own screen; restricted roles can't reach the others
   const effectiveMode = isStoreScoped ? "storeAssistant" : isEventPlanner ? "eventPlanner" : appMode === "assortment" && !isPlanner ? "planner" : appMode;
   const effectiveStoreId = userRole === "store_associate" ? profile.store_id : selectedStoreId;
+  usageModuleRef.current = effectiveMode === "planner" ? `planner:${tab}` : effectiveMode;
 
   if (effectiveMode === "storeAssistant") {
     return (
@@ -13642,6 +14018,7 @@ function AppContent({ session }) {
           {isPlanner && <TabButton active={tab === "resetImpact"} onClick={() => setTab("resetImpact")} icon={TrendingUp}>Reset Impact</TabButton>}
           <TabButton active={tab === "storeFeedback"} onClick={() => setTab("storeFeedback")} icon={AlertTriangle}>Store Feedback</TabButton>
           {isPlanner && <TabButton active={tab === "execution"} onClick={() => setTab("execution")} icon={Mail} badge={openEscalations}>Execution Monitoring</TabButton>}
+          {isAdmin && <TabButton active={tab === "usage"} onClick={() => setTab("usage")} icon={Users}>Usage</TabButton>}
           <TabButton active={tab === "schema"} onClick={() => setTab("schema")} icon={Settings2}>Settings</TabButton>
           <TabButton active={tab === "help"} onClick={() => setTab("help")} icon={HelpCircle}>Help</TabButton>
         </div>
@@ -13752,6 +14129,8 @@ function AppContent({ session }) {
             performance={performance}
             productSchema={productSchema}
           />
+        ) : tab === "usage" && isAdmin ? (
+          <UsageView />
         ) : tab === "resetImpact" && isPlanner ? (
           <ResetImpactModule planograms={planograms} stores={stores} storeSchema={storeSchema} planogramSchema={planogramSchema} />
         ) : tab === "execution" && isPlanner ? (

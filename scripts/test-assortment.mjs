@@ -2,7 +2,7 @@
 // Assortment engine: segments, slow movers, forecast and SKU rationalization on a hand-built Cereal category
 // whose right answers are known in advance. Run: node scripts/test-assortment.mjs
 import assert from "node:assert/strict";
-import { buildContext, segmentTree, slowMovers, forecastFor, recommend, resolveScope, scopeOptions, windowsFor } from "../supabase/functions/_shared/assortment.js";
+import { buildContext, segmentTree, slowMovers, forecastFor, recommend, resolveScope, scopeOptions, windowsFor, coreProfile, coreForecasts, coreValueScale, storeProductivity } from "../supabase/functions/_shared/assortment.js";
 import { applyResetDraftChanges, addDaysISO } from "../supabase/functions/_shared/app-core.js";
 
 let passed = 0, failed = 0;
@@ -214,6 +214,62 @@ test("scope narrows which planograms are considered", () => {
   const r = recommend(west, [N1.id]);
   assert.deepEqual(r.items[0].candidates.map((c) => c.planogramId), ["B"]);
 });
+
+console.log("core assortment");
+{
+  // Large store s1 carries KS1, AN1... on pog A; Small store s2 carries fewer on pog B. KS2 is on A only.
+  const cctx = buildContext(data(), params());
+  const prof = coreProfile(cctx);
+  const row = (id) => prof.rows.find((r) => r.productId === id);
+  test("steady, frequent, high-selling items are core; slow ones are not", () => {
+    assert.equal(row("ks2").cls, "core"); assert.equal(row("an1").cls, "core");
+    assert.notEqual(row("ks3").cls, "core"); assert.notEqual(row("an4").cls, "core"); // 1-2 units a week
+  });
+  test("coverage and format breakdown show an item carried only in the large stores", () => {
+    const r = row("ks2");
+    assert.equal(r.stores, 1); assert.equal(r.storesInView, 2); assert.equal(r.coverage, 0.5);
+    assert.deepEqual(r.byFormat.map((f) => [f.format, f.carried, f.of]), [["Large", 1, 1], ["Small", 0, 1]]);
+    assert.deepEqual(r.missingPlanograms.map((m) => m.planogramId), ["B"]);
+    assert.equal(row("an1").coverage, 1);
+  });
+  test("a core item below the coverage threshold is a gap; one in every store is not", () => {
+    assert.equal(row("ks2").isGap, true); assert.equal(row("an1").isGap, false);
+    assert.ok(prof.summary.gaps >= 1); assert.ok(prof.summary.coreShareOfSales > 0.5);
+    assert.equal(coreProfile(buildContext(data(), params({ assumptions: { coreMinCoverage: 0.4 } }))).rows.find((r) => r.productId === "ks2").isGap, false);
+  });
+  test("a person can mark an item core or not core", () => {
+    const p2 = coreProfile(cctx, { overrides: { ks3: "core", ks2: "notcore" } });
+    assert.equal(p2.rows.find((r) => r.productId === "ks3").cls, "core"); assert.equal(p2.rows.find((r) => r.productId === "ks3").override, "core");
+    assert.equal(p2.rows.find((r) => r.productId === "ks2").cls, "not");
+  });
+  test("an erratic seller fails the steadiness check even when it sells every week", () => {
+    const wobbly = {}; Object.keys(perf).forEach((k) => { wobbly[k] = perf[k]; });
+    wobbly.ks2 = perf.ks2.map((r, i) => ({ ...r, units: i % 2 ? 40 : 2 }));
+    const c = buildContext({ ...data(), performance: wobbly }, params());
+    const r = coreProfile(c).rows.find((x) => x.productId === "ks2");
+    assert.equal(r.checks.frequency.ok, true); assert.equal(r.checks.steady.ok, false); assert.notEqual(r.cls, "core");
+  });
+  test("store productivity compares how strong two sets of stores are for the category", () => {
+    const big = storeProductivity(cctx, ["s1"]), small = storeProductivity(cctx, ["s2"]);
+    assert.ok(big > 0 && small > 0);
+  });
+  test("a core gap can be expanded: measured forecast, scaled to the stores, placed like a new item", () => {
+    const fcs = coreForecasts(cctx, ["ks2"]);
+    assert.equal(fcs.ks2.ready, true); assert.equal(fcs.ks2.basis, "measured where carried");
+    const r = recommend(cctx, ["ks2"], { forecastOverrides: fcs, valueScale: coreValueScale(cctx), kind: "core" });
+    const cand = r.items[0].candidates.find((c) => c.planogramId === "B");
+    assert.ok(["recommended", "not_worth_it", "no_room"].includes(cand.status));
+    assert.equal(r.items[0].candidates.find((c) => c.planogramId === "A").status, "already_carried");
+    assert.ok(cand.scale > 0 && cand.scale <= 1.5);
+    if (cand.status === "recommended") { const ch = r.byPlanogram.B.changes.find((c) => c.type === "addProduct"); assert.match(ch.reason, /^Core item expansion/); }
+  });
+  test("expansion value is lower where the stores sell less of the category", () => {
+    const fcs = coreForecasts(cctx, ["ks2"]);
+    const sc = coreValueScale(cctx)(cctx.productsById.ks2, pogB, ["s2"]);
+    const expected = storeProductivity(cctx, ["s2"]) / storeProductivity(cctx, ["s1"]);
+    assert.equal(sc, Math.min(1.5, Math.max(0.25, expected)));
+  });
+}
 
 console.log("user-defined store and planogram attributes");
 const attrStores = stores.map((st) => ({ ...st, attributes: { fs: st.id === "s1" ? "High" : "Low" } }));

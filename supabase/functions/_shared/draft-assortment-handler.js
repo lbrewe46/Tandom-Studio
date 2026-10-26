@@ -10,6 +10,9 @@
 //          exclude?: string[]  ("itemId|planogramId" pairs the planner unticked),
 //          protect?: string[]  (product ids that must not be removed),
 //          maxPlanogramsPerItem?: int }
+//   Core mode: mode:"core" with newItemIds = existing core items whose coverage has gaps; coreOverrides?: {productId: "core"|"notcore"}.
+//     Each id must be a core item with gaps (the server re-classifies), and forecasts come from how it sells where it is carried,
+//     scaled for how strong the target planograms' stores are.
 //   200 { proposals: [{ planogramId, planogramName, proposalId, adds, removes }], notDrafted: [{ planogramId, planogramName, reason }] }
 //   400 bad input · 401 · 403 role not allowed or agent disabled · 500
 //
@@ -18,7 +21,7 @@
 import { json, preflightOrWrongMethod, authenticate } from "./http.js";
 import { fingerprint } from "./proposal-core.js";
 import { recordProposals } from "./draft-reset-handler.js";
-import { buildContext, recommend } from "./assortment.js";
+import { buildContext, recommend, coreProfile, coreForecasts, coreValueScale } from "./assortment.js";
 import { getLatestWeekEnding, addDaysISO } from "./app-core.js";
 
 export const AGENT_ID = "assortment-agent";
@@ -66,6 +69,9 @@ export function validateParams(body) {
   const assumptions = {};
   if (a.metric !== undefined) { if (!["sales", "margin", "units"].includes(a.metric)) return { error: "assumptions.metric must be sales, margin or units" }; assumptions.metric = a.metric; }
   for (const k of ["cannibalization", "transfer"]) if (a[k] !== undefined) { if (typeof a[k] !== "number" || a[k] < 0 || a[k] > 1) return { error: `assumptions.${k} must be a number from 0 to 1` }; assumptions[k] = a[k]; }
+  for (const [k, lo, hi] of [["coreMinWeeksSelling", 0.1, 1], ["coreMaxCv", 0.05, 5], ["coreSalesShare", 0.1, 1], ["coreMinCoverage", 0.1, 1]]) {
+    if (a[k] !== undefined) { if (typeof a[k] !== "number" || a[k] < lo || a[k] > hi) return { error: `assumptions.${k} must be a number from ${lo} to ${hi}` }; assumptions[k] = a[k]; }
+  }
   if (a.maxRemovalsPerAdd !== undefined) { if (!Number.isInteger(a.maxRemovalsPerAdd) || a.maxRemovalsPerAdd < 0 || a.maxRemovalsPerAdd > 5) return { error: "assumptions.maxRemovalsPerAdd must be 0 to 5" }; assumptions.maxRemovalsPerAdd = a.maxRemovalsPerAdd; }
   return { params: { category: p.category.trim(), weeks, compare, scope, planogramFilter, segmentFieldIds, assumptions } };
 }
@@ -86,6 +92,13 @@ export async function handleDraftAssortment(req, db) {
   const ids = [...new Set(body.newItemIds)];
   if (!isStringArray(ids) || ids.length === 0) return json(400, { error: "newItemIds must be a non-empty array of product ids" });
   if (ids.length > MAX_ITEMS) return json(400, { error: `At most ${MAX_ITEMS} new items per call` });
+  const core = body.mode === "core";
+  if (body.mode !== undefined && !["core", "new"].includes(body.mode)) return json(400, { error: "mode must be new or core" });
+  const coreOverrides = {};
+  if (body.coreOverrides !== undefined) {
+    if (!body.coreOverrides || typeof body.coreOverrides !== "object" || Array.isArray(body.coreOverrides)) return json(400, { error: "coreOverrides must be an object of product id to core or notcore" });
+    for (const [k, v] of Object.entries(body.coreOverrides)) { if (v !== "core" && v !== "notcore") return json(400, { error: "coreOverrides values must be core or notcore" }); coreOverrides[k] = v; }
+  }
   const checked = validateParams(body);
   if (checked.error) return json(400, { error: checked.error });
   if (body.exclude !== undefined && !isStringArray(body.exclude)) return json(400, { error: "exclude must be an array of itemId|planogramId strings" });
@@ -105,7 +118,9 @@ export async function handleDraftAssortment(req, db) {
     const known = new Set(products.map((p) => p.id));
     const missing = ids.filter((id) => !known.has(id));
     if (missing.length) return json(400, { error: `Unknown product ids: ${missing.slice(0, 3).join(", ")}` });
-    const notNew = products.filter((p) => ids.includes(p.id) && !p.newItem).map((p) => p.name);
+    const notNew = core ? [] : products.filter((p) => ids.includes(p.id) && !p.newItem).map((p) => p.name);
+    const newItemsInCore = core ? products.filter((p) => ids.includes(p.id) && p.newItem).map((p) => p.name) : [];
+    if (newItemsInCore.length) return json(400, { error: `New items are not core items: ${newItemsInCore.slice(0, 3).join(", ")}` });
     if (notNew.length) return json(400, { error: `Not new items (nothing to place): ${notNew.slice(0, 3).join(", ")}` });
 
     const planograms = planogramRows.map((r) => r.data);
@@ -133,7 +148,18 @@ export async function handleDraftAssortment(req, db) {
       productSchema: parseSetting(settingRows.find((r) => r.key === "schema:product")?.value, []),
     };
     const ctx = buildContext(data, checked.params);
-    const rec = recommend(ctx, ids, { exclude: new Set(body.exclude || []), protect: new Set(body.protect || []), maxPlanogramsPerItem: body.maxPlanogramsPerItem || null });
+    const opts = { exclude: new Set(body.exclude || []), protect: new Set(body.protect || []), maxPlanogramsPerItem: body.maxPlanogramsPerItem || null };
+    if (core) {
+      const profile = coreProfile(ctx, { overrides: coreOverrides });
+      const gapIds = new Set(profile.rows.filter((r) => r.isGap).map((r) => r.productId));
+      const bad = ids.filter((id) => !gapIds.has(id));
+      if (bad.length) {
+        const names = bad.slice(0, 3).map((id) => products.find((p) => p.id === id)?.name || id);
+        return json(400, { error: `Not a core item with gaps: ${names.join(", ")}` });
+      }
+      Object.assign(opts, { forecastOverrides: coreForecasts(ctx, ids), valueScale: coreValueScale(ctx), kind: "core" });
+    }
+    const rec = recommend(ctx, ids, opts);
 
     const planogramById = Object.fromEntries(planograms.map((p) => [p.id, p]));
     const results = [];
@@ -152,7 +178,7 @@ export async function handleDraftAssortment(req, db) {
       const score = Math.round((adds / (adds + g.skipped.length)) * 100);
       results.push({
         planogramId, ok: true, score, result, planogramName: planogram.name, adds, removes,
-        reason: `New item assortment for ${checked.params.category} (${ctx.scope.label}): ${adds} item${adds === 1 ? "" : "s"} added${removes ? `, ${removes} removed to make room` : ""}${g.skipped.length ? `, ${g.skipped.length} could not be placed` : ""}.`,
+        reason: `${core ? "Core item assortment" : "New item assortment"} for ${checked.params.category} (${ctx.scope.label}): ${adds} item${adds === 1 ? "" : "s"} added${removes ? `, ${removes} removed to make room` : ""}${g.skipped.length ? `, ${g.skipped.length} could not be placed` : ""}.`,
       });
     }
     await recordProposals(db, results, auth.user.id, AGENT_ID);

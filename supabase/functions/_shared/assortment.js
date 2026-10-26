@@ -28,6 +28,12 @@ export const DEFAULT_ASSUMPTIONS = {
   transfer: 0.3, // share of a removed item's sales that stays in the category (shoppers buy something else)
   minWeeksOfData: 4,
   maxRemovalsPerAdd: 3,
+  // what makes an item "core": it sells in nearly every week, steadily, and is part of the base of the category's sales
+  coreMinWeeksSelling: 0.85, // sells in at least this share of the weeks
+  coreMaxCv: 0.6, // weekly sales vary no more than this (standard deviation / average)
+  coreSalesShare: 0.8, // belongs to the items that together make this share of the category's sales
+  coreMinCoverage: 0.8, // a core item is expected in at least this share of the stores
+  corePriceBand: 0.05, // a price within this of the usual price counts as "steady" (information only)
 };
 
 const round = (n, d = 2) => (Number.isFinite(n) ? Math.round(n * 10 ** d) / 10 ** d : n);
@@ -154,7 +160,7 @@ export function buildContext(data, params) {
     };
   });
 
-  return { data, params: { category, weeks, compare, levels, scope: params.scope || { type: "all" } }, assumptions, scope, win, pogs, storeCount, items, productsById, carry, sum, inScope, denominator, metricOf, levels, productSchema, fixtures };
+  return { data, params: { category, weeks, compare, levels, scope: params.scope || { type: "all" } }, assumptions, scope, win, pogs, storeCount, items, productsById, carry, onPlanograms, sum, inScope, denominator, metricOf, levels, productSchema, fixtures };
 }
 
 // ---- 1. segments -------------------------------------------------------------------------------------------
@@ -347,6 +353,132 @@ function tryAdd(planogram, section, fixtureInst, def, placements, product, layou
   return { placement, remainder: widthIn - totalWidth, widthIn };
 }
 
+
+// ---- 4. core assortment -------------------------------------------------------------------------------------
+// A core item is a staple: bought regularly and repeatedly, steady week to week, and part of the base of the
+// category's sales. Tandom can measure those three from sales history (how many weeks it sells, how much weekly
+// sales swing, and whether it is among the items that make up most of the category's sales). Whether an item is a
+// necessity rather than an impulse or luxury buy cannot be read from sales, so a person can mark items core or not
+// core. Price steadiness is shown as a sign of an everyday-priced item but does not decide anything, because
+// competitors' prices are not in the data.
+
+const median = (xs) => { if (!xs.length) return 0; const v = [...xs].sort((p, q) => p - q); const m = v.length >> 1; return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2; };
+
+// Average units of this category sold per store per week in a set of stores: how strong those stores are for it.
+export function storeProductivity(ctx, storeIds) {
+  if (!ctx._storeUnits) {
+    const m = new Map();
+    ctx.items.forEach((r) => (ctx.data.performance?.[r.productId] || []).forEach((rec) => {
+      if (!ctx.win?.cur || rec.weekEnding < ctx.win.cur.start || rec.weekEnding > ctx.win.cur.end || !rec.storeId) return;
+      m.set(rec.storeId, (m.get(rec.storeId) || 0) + (rec.units || 0));
+    }));
+    ctx._storeUnits = m;
+  }
+  const ids = [...storeIds];
+  if (!ids.length) return 0;
+  return ids.reduce((sum, id) => sum + (ctx._storeUnits.get(id) || 0), 0) / (ids.length * ctx.params.weeks);
+}
+
+export function coreProfile(ctx, { overrides = {} } = {}) {
+  const a = ctx.assumptions;
+  const weeks = ctx.params.weeks;
+  const rows = ctx.items.filter((r) => r.product && !r.product.newItem);
+  const storeById = Object.fromEntries((ctx.data.stores || []).map((st) => [st.id, st]));
+  const catStores = new Set(ctx.pogs.flatMap((x) => x.storeIds));
+  const formatOf = (sid) => (storeById[sid]?.format || "").trim() || "(none)";
+  const formatTotals = new Map();
+  catStores.forEach((sid) => { const f = formatOf(sid); formatTotals.set(f, (formatTotals.get(f) || 0) + 1); });
+  const totalSales = rows.reduce((sum, r) => sum + r.cur.sales, 0);
+  const cumBefore = new Map();
+  let run = 0;
+  [...rows].sort((x, y) => y.cur.sales - x.cur.sales).forEach((r) => { cumBefore.set(r.productId, totalSales > 0 ? run / totalSales : 1); run += r.cur.sales; });
+
+  const out = rows.map((r) => {
+    const carried = ctx.carry.get(r.productId) || new Set();
+    const byWeek = new Map();
+    const prices = [];
+    if (ctx.win?.cur) {
+      (ctx.data.performance?.[r.productId] || []).forEach((rec) => {
+        if (rec.weekEnding < ctx.win.cur.start || rec.weekEnding > ctx.win.cur.end) return;
+        const ok = rec.storeId ? ctx.scope.storeIds.has(rec.storeId) : ctx.scope.includeChain;
+        if (!ok) return;
+        byWeek.set(rec.weekEnding, (byWeek.get(rec.weekEnding) || 0) + (rec.units || 0));
+        if ((rec.units || 0) > 0 && rec.price > 0) prices.push(rec.price);
+      });
+    }
+    const perStore = Math.max(1, carried.size);
+    const slots = [...byWeek.values()].map((u) => u / perStore);
+    while (slots.length < weeks) slots.push(0);
+    const mean = slots.reduce((sum, x) => sum + x, 0) / Math.max(1, slots.length);
+    const sd = Math.sqrt(slots.reduce((sum, x) => sum + (x - mean) ** 2, 0) / Math.max(1, slots.length));
+    const weeksSelling = Math.min(1, [...byWeek.values()].filter((u) => u > 0).length / weeks);
+    const cv = mean > 0 ? sd / mean : null;
+    const med = median(prices);
+    const priceSteady = med > 0 ? prices.filter((x) => Math.abs(x - med) / med <= a.corePriceBand).length / prices.length : null;
+    const share = totalSales > 0 ? r.cur.sales / totalSales : 0;
+    const checks = {
+      frequency: { ok: weeksSelling >= a.coreMinWeeksSelling, value: round(weeksSelling, 3) },
+      steady: { ok: cv !== null && cv <= a.coreMaxCv, value: cv === null ? null : round(cv, 3) },
+      baseline: { ok: r.cur.sales > 0 && (cumBefore.get(r.productId) ?? 1) < a.coreSalesShare, value: round(share, 4) },
+    };
+    const passes = Object.values(checks).filter((c) => c.ok).length;
+    const auto = !r.hasData ? "unknown" : passes === 3 ? "core" : passes === 2 ? "near" : "not";
+    const ov = overrides[r.productId];
+    const cls = ov === "core" ? "core" : ov === "notcore" ? "not" : auto;
+    const missingPogs = ctx.pogs.filter((x) => !(ctx.onPlanograms.get(r.productId) || new Set()).has(x.planogram.id));
+    const coverage = catStores.size > 0 ? carried.size / catStores.size : 0;
+    const carriedByFormat = new Map();
+    carried.forEach((sid) => { const f = formatOf(sid); carriedByFormat.set(f, (carriedByFormat.get(f) || 0) + 1); });
+    return {
+      productId: r.productId, name: r.product.name, segment: r.path, cls, auto, override: ov === "core" || ov === "notcore" ? ov : null, hasData: r.hasData, checks,
+      priceSteady: priceSteady === null ? null : round(priceSteady, 3),
+      velocity: round(r.velocity, 2), sales: round(r.cur.sales), salesShare: round(share, 4),
+      stores: carried.size, storesInView: catStores.size, coverage: round(coverage, 3),
+      planograms: (ctx.onPlanograms.get(r.productId) || new Set()).size, planogramsInView: ctx.pogs.length,
+      byFormat: [...formatTotals.entries()].map(([format, total]) => ({ format, carried: carriedByFormat.get(format) || 0, of: total, pct: round((carriedByFormat.get(format) || 0) / total, 3) })).sort((x, y) => x.format.localeCompare(y.format, undefined, { numeric: true, sensitivity: "base" })),
+      missingPlanograms: missingPogs.map((x) => ({ planogramId: x.planogram.id, planogramName: x.planogram.name || "Untitled", stores: x.storeIds.length })),
+      missingStores: catStores.size - carried.size,
+      isGap: cls === "core" && coverage < a.coreMinCoverage && missingPogs.length > 0,
+    };
+  });
+  const clsRank = { core: 0, near: 1, not: 2, unknown: 3 };
+  out.sort((x, y) => (y.isGap - x.isGap) || (clsRank[x.cls] - clsRank[y.cls]) || y.sales - x.sales || x.name.localeCompare(y.name));
+  const core = out.filter((r) => r.cls === "core");
+  const summary = {
+    items: out.length, core: core.length, near: out.filter((r) => r.cls === "near").length, notCore: out.filter((r) => r.cls === "not").length, unknown: out.filter((r) => r.cls === "unknown").length,
+    coreShareOfSales: round(core.reduce((sum, r) => sum + r.salesShare, 0), 4),
+    coreAvgCoverage: core.length ? round(core.reduce((sum, r) => sum + r.coverage, 0) / core.length, 3) : null,
+    gaps: out.filter((r) => r.isGap).length,
+  };
+  return { rows: out, summary, thresholds: { weeksSelling: a.coreMinWeeksSelling, maxCv: a.coreMaxCv, salesShare: a.coreSalesShare, coverage: a.coreMinCoverage }, formats: [...formatTotals.entries()].map(([format, stores]) => ({ format, stores })) };
+}
+
+// What a core item is expected to sell where it is not carried yet: what it sells per store in the stores that carry it,
+// scaled planogram by planogram by how strong the new stores are for this category compared with its current ones.
+export function coreForecasts(ctx, ids) {
+  const out = {};
+  ids.forEach((id) => {
+    const v = velocityOfProduct(ctx, id);
+    const price = v.price, cost = v.cost;
+    const value = { sales: v.velocity * price, margin: v.velocity * (price - cost), units: v.velocity }[ctx.assumptions.metric];
+    out[id] = {
+      productId: id, unitsPerStoreWeek: round(v.velocity, 2), basis: "measured where carried", proxies: [], proxyScale: 1,
+      price: round(price), cost: round(cost), valuePerStoreWeek: value,
+      ready: v.hasData && v.velocity > 0 && price > 0,
+      missing: !v.hasData ? "Not enough weeks of sales to rely on" : v.velocity <= 0 ? "It has no sales in this period" : "It has no price in the sales data",
+    };
+  });
+  return out;
+}
+export function coreValueScale(ctx) {
+  return (product, planogram, storeIds) => {
+    const here = storeProductivity(ctx, storeIds);
+    const there = storeProductivity(ctx, ctx.carry.get(product.id) || []);
+    if (!(here > 0) || !(there > 0)) return 1;
+    return clamp(here / there, 0.25, 1.5);
+  };
+}
+
 // Recommendations for the given new items. Options: exclude (Set of "itemId|planogramId"), protect (Set of product
 // ids that may never be removed), maxPlanogramsPerItem (null = every planogram that comes out ahead).
 export function recommend(ctx, newItemIds, options = {}) {
@@ -367,7 +499,8 @@ export function recommend(ctx, newItemIds, options = {}) {
   const ensure = (pid) => (byPlanogram[pid] ||= { changes: [], skipped: [], notes: [] });
 
   const newProducts = newItemIds.map((id) => ctx.productsById[id]).filter(Boolean);
-  const forecasts = new Map(newProducts.map((p) => [p.id, forecastFor(ctx, p)]));
+  const forecasts = new Map(newProducts.map((p) => [p.id, (options.forecastOverrides && options.forecastOverrides[p.id]) || forecastFor(ctx, p)]));
+  const noun = options.kind === "core" ? "core item" : "new item";
   const order = [...newProducts].sort((x, y) => (forecasts.get(y.id).valuePerStoreWeek || 0) - (forecasts.get(x.id).valuePerStoreWeek || 0) || x.name.localeCompare(y.name));
   const results = [];
 
@@ -388,7 +521,9 @@ export function recommend(ctx, newItemIds, options = {}) {
       if (alreadyThere) { cand.status = "already_carried"; cand.reason = "Already on this planogram."; return; }
       if (!fc.ready) { cand.status = "not_ready"; cand.reason = fc.missing; return; }
 
-      const gain = fc.valuePerStoreWeek * (1 - a.cannibalization);
+      const scale = options.valueScale ? options.valueScale(product, orig, storeIds) : 1; // e.g. these stores sell less of the category per store
+      cand.scale = round(scale, 2);
+      const gain = fc.valuePerStoreWeek * scale * (1 - a.cannibalization);
       const placedIds = new Set();
       (pg.sections || []).forEach((s) => (s.fixtures || []).forEach((fx) => (fx.placements || []).forEach((pl) => placedIds.add(pl.productId))));
       const layoutProducts = (ctx.data.products || []).filter((p) => placedIds.has(p.id) || p.id === product.id);
@@ -458,7 +593,7 @@ export function recommend(ctx, newItemIds, options = {}) {
       cand._best = best; cand._net = net;
       cand.status = net > 0 ? "recommended" : "not_worth_it";
       cand.reason = net > 0
-        ? `Forecast ${fc.unitsPerStoreWeek} units/store/week (${fc.basis}) is worth ${round(gain)} per store per week after ${Math.round(a.cannibalization * 100)}% cannibalization${best.removes.length ? `, against ${round(best.loss)} given up by removing ${best.removes.map((t) => t.p.name).join(", ")}` : ", and it fits in existing free space"}.`
+        ? `Forecast ${round(fc.unitsPerStoreWeek * scale, 2)} units/store/week (${fc.basis}${scale !== 1 ? `, adjusted x${round(scale, 2)} for how the stores on this planogram sell this category` : ""}) is worth ${round(gain)} per store per week after ${Math.round(a.cannibalization * 100)}% cannibalization${best.removes.length ? `, against ${round(best.loss)} given up by removing ${best.removes.map((t) => t.p.name).join(", ")}` : ", and it fits in existing free space"}.`
         : `Giving up ${round(best.loss)} per store per week to gain ${round(gain)} would lose ${round(-net)} per store per week.`;
     });
 
@@ -470,12 +605,12 @@ export function recommend(ctx, newItemIds, options = {}) {
       const changes = [
         ...best.removes.map((t) => ({
           type: "delete", productId: t.p.id, productName: t.p.name, sectionId: best.section.id, fixtureInstId: best.fixtureInst.id, placementId: t.pl.id,
-          reason: `Removed to make room for new item ${product.name}: one of the slowest on this shelf (${round(t.velocity, 2)} units/store/week${t.r ? `, ${round(t.r.salesPerStoreWeek)} sales/store/week` : ""}).`,
+          reason: `Removed to make room for ${noun} ${product.name}: one of the slowest on this shelf (${round(t.velocity, 2)} units/store/week${t.r ? `, ${round(t.r.salesPerStoreWeek)} sales/store/week` : ""}).`,
         })),
         {
           type: "addProduct", productId: product.id, productName: product.name, sectionId: best.section.id, fixtureInstId: best.fixtureInst.id, placementId: best.add.placement.id,
           newFacings: 1, newHigh: best.add.placement.high || 1, autoStack: true,
-          reason: `New item — ${c.reason}${c.variety.length ? ` ${c.variety.join(". ")}.` : ""}`,
+          reason: `${noun === "core item" ? "Core item expansion" : "New item"} — ${c.reason}${c.variety.length ? ` ${c.variety.join(". ")}.` : ""}`,
         },
       ];
       work[c.planogramId] = { ...work[c.planogramId], sections: applyResetDraftChanges(work[c.planogramId].sections, changes) };

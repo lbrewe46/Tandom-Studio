@@ -2,7 +2,7 @@
 // Exercises the real ask-tandom handler + tool runner against an in-memory Supabase stand-in and a
 // scripted model. Run: node scripts/test-ask-tandom.mjs
 import assert from "node:assert/strict";
-import { handleAskTandom } from "../supabase/functions/_shared/ask-tandom-handler.js";
+import { handleAskTandom, explainFailure } from "../supabase/functions/_shared/ask-tandom-handler.js";
 
 function makeDb({ tables, tokens }) {
   class Query {
@@ -180,5 +180,19 @@ const q = (text) => ({ messages: [{ role: "user", content: text }] });
   const m = scripted([reply("hi")]);
   const history = Array.from({ length: 30 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `m${i}` })).concat([{ role: "user", content: "last" }]);
   await ask("adminTok", { messages: history }, m); assert.ok(m.seen[0].messages.length <= 20 && m.seen[0].messages[0].role === "user"); ok("history trimmed and starts with a user turn");
+}
+{
+  const e401 = explainFailure(new Error("model API 401: invalid x-api-key"), "store_associate");
+  assert.equal(e401.code, "model_auth"); assert.match(e401.error, /ANTHROPIC_API_KEY/); assert.equal(e401.detail, undefined); ok("a rejected API key is named, without technical detail for a store user");
+  assert.equal(explainFailure(new Error("model API 404: model: x"), "admin").code, "model_not_found");
+  assert.equal(explainFailure(new Error("model API 400: Your credit balance is too low"), "admin").code, "model_billing");
+  assert.equal(explainFailure(new Error("model API 529: overloaded"), "admin").code, "model_busy");
+  const adm = explainFailure(new Error("model API 401: bad key"), "admin"); assert.match(adm.detail, /bad key/); ok("model errors are classified; admins also get the detail");
+  assert.match(explainFailure(new Error("boom"), "admin").error, /Try again in a moment/); ok("anything else keeps the generic message");
+}
+{
+  const db = makeDb({ tables: mkTables(), tokens });
+  const res = await handleAskTandom(req("adminTok", q("hi")), db, { callModel: async () => { throw new Error("model API 401: invalid x-api-key"); } });
+  assert.equal(res.status, 502); const j = await res.json(); assert.equal(j.code, "model_auth"); ok("the response carries the specific cause");
 }
 console.log(`\n${n} passed`);

@@ -89,6 +89,23 @@ async function confirmTaskUpdate(db, auth, body) {
   return json(200, { ok: true, task: updated });
 }
 
+// The model call's failure says why (see callModel in index.ts: "model API <status>: <body>"). People are told the
+// actionable cause; anything else stays the generic message. Only an admin also gets the technical detail.
+export function explainFailure(e, role) {
+  const msg = String(e?.message || e || "");
+  const m = /model API (\d{3})/.exec(msg);
+  const status = m ? Number(m[1]) : null;
+  let error = "Ask Tandom couldn't get an answer just now. Try again in a moment.";
+  let code = "unknown";
+  if (status === 401 || status === 403) { code = "model_auth"; error = "Ask Tandom can't reach its AI service: the API key was rejected. An administrator needs to check the ANTHROPIC_API_KEY secret."; }
+  else if (status === 404) { code = "model_not_found"; error = "Ask Tandom's AI model isn't available. An administrator needs to check the model name (ASK_TANDOM_MODEL)."; }
+  else if (status === 400 && /credit|billing/i.test(msg)) { code = "model_billing"; error = "Ask Tandom's AI account is out of credit. An administrator needs to check billing on the Anthropic account."; }
+  else if (status === 429 || status === 529 || (status && status >= 500)) { code = "model_busy"; error = "The AI service is busy right now. Try again in a moment."; }
+  else if (status) { code = "model_error"; }
+  else if (/fetch failed|network|timed? ?out/i.test(msg)) { code = "network"; }
+  return { error, code, ...(role === "admin" ? { detail: msg.slice(0, 400) } : {}) };
+}
+
 export async function handleAskTandom(req, db, { callModel, configured = true, now = () => new Date() } = {}) {
   const early = preflightOrWrongMethod(req);
   if (early) return early;
@@ -139,6 +156,6 @@ export async function handleAskTandom(req, db, { callModel, configured = true, n
     return json(200, { reply, actions: runner.pending });
   } catch (e) {
     console.error("ask-tandom failed", e);
-    return json(502, { error: "Ask Tandom couldn't get an answer just now. Try again in a moment." });
+    return json(502, explainFailure(e, auth.role));
   }
 }

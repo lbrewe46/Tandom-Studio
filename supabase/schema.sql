@@ -726,3 +726,136 @@ drop policy if exists "Regional managers resolve their escalations" on escalatio
 create policy "Regional managers resolve their escalations" on escalations for update to authenticated
   using (current_user_role() = 'regional_manager' and store_id = any(coalesce(current_user_store_ids(), '{}')))
   with check (current_user_role() = 'regional_manager' and store_id = any(coalesce(current_user_store_ids(), '{}')));
+
+-- ---- usage analytics (Admin → Usage) -----------------------------------------------------------
+-- One row per working session of a signed-in person. The app records when it began, when it was last
+-- seen, and how many seconds the person was actually active (touching the screen with it in view),
+-- by module. Nothing about what was edited is recorded. Only an Admin can read the numbers.
+create table if not exists usage_sessions (
+  id uuid primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  role text,
+  started_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  active_seconds integer not null default 0 check (active_seconds >= 0),
+  modules jsonb not null default '{}'::jsonb
+);
+create index if not exists usage_sessions_started_idx on usage_sessions (started_at);
+create index if not exists usage_sessions_user_started_idx on usage_sessions (user_id, started_at);
+alter table usage_sessions enable row level security;
+
+drop policy if exists "Users record their own sessions" on usage_sessions;
+create policy "Users record their own sessions" on usage_sessions for insert to authenticated
+  with check (user_id = auth.uid());
+drop policy if exists "Users update their own sessions" on usage_sessions;
+create policy "Users update their own sessions" on usage_sessions for update to authenticated
+  using (user_id = auth.uid()) with check (user_id = auth.uid());
+-- (a person must be able to see their own row for their own update to find it)
+drop policy if exists "Users read their own sessions" on usage_sessions;
+create policy "Users read their own sessions" on usage_sessions for select to authenticated
+  using (user_id = auth.uid());
+drop policy if exists "Admins read usage" on usage_sessions;
+create policy "Admins read usage" on usage_sessions for select to authenticated
+  using (current_user_role() = 'admin');
+
+-- The database, not the browser, decides the times and the role, and active time can never exceed the
+-- time the session has been open.
+create or replace function guard_usage_session()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'INSERT' then
+    new.started_at := now();
+    new.last_seen_at := now();
+    new.active_seconds := 0;
+    new.role := current_user_role();
+    if new.modules is null or jsonb_typeof(new.modules) <> 'object' then new.modules := '{}'::jsonb; end if;
+  else
+    new.user_id := old.user_id;
+    new.started_at := old.started_at;
+    new.role := old.role;
+    new.last_seen_at := now();
+    new.active_seconds := least(greatest(coalesce(new.active_seconds, 0), old.active_seconds), ceil(extract(epoch from (now() - old.started_at)))::int);
+    if new.modules is null or jsonb_typeof(new.modules) <> 'object' then new.modules := old.modules; end if;
+  end if;
+  return new;
+end $$;
+drop trigger if exists guard_usage_session on usage_sessions;
+create trigger guard_usage_session before insert or update on usage_sessions
+  for each row execute procedure guard_usage_session();
+
+-- Admin-only summary. Days are in the caller's time zone (p_tz). A person counts as active on every day a session
+-- touched. WAU / MAU are the people active in the 7 / 30 days up to and including that day; stickiness is the
+-- average daily active users over the last 30 days divided by the people active in those 30 days.
+create or replace function usage_metrics(p_days int default 30, p_tz text default 'UTC')
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  v_days int := least(greatest(coalesce(p_days, 30), 7), 365);
+  v_today date := (now() at time zone p_tz)::date;
+  v_from date := v_today - (least(greatest(coalesce(p_days, 30), 7), 365) - 1);
+  v_result jsonb;
+begin
+  if current_user_role() is distinct from 'admin' then
+    raise exception 'Only an Admin can read usage';
+  end if;
+  with s as (
+    select id, user_id, role, modules, active_seconds,
+           (started_at at time zone p_tz)::date as d_start, (last_seen_at at time zone p_tz)::date as d_end
+    from usage_sessions
+    where last_seen_at >= (v_from - 29)::timestamp at time zone p_tz
+  ),
+  ud as (select distinct s.user_id, g::date as day from s, generate_series(s.d_start, s.d_end, interval '1 day') g),
+  days as (select g::date as day from generate_series(v_from, v_today, interval '1 day') g),
+  daily as (
+    select d.day,
+      (select count(*) from ud where ud.day = d.day) as dau,
+      (select count(distinct user_id) from ud where ud.day between d.day - 6 and d.day) as wau,
+      (select count(distinct user_id) from ud where ud.day between d.day - 29 and d.day) as mau,
+      (select count(*) from s where s.d_start = d.day) as sessions,
+      (select coalesce(sum(active_seconds), 0) from s where s.d_start = d.day) as seconds
+    from days d
+  ),
+  inrange as (select * from s where d_start >= v_from),
+  last30 as (select user_id, day from ud where day > v_today - 30),
+  totals as (
+    select
+      (select count(distinct user_id) from ud where day >= v_from) as active_users,
+      (select count(*) from inrange) as sessions,
+      (select coalesce(sum(active_seconds), 0) from inrange) as seconds,
+      (select count(*) from ud where day >= v_from) as user_days,
+      (select count(distinct user_id) from last30) as mau30,
+      (select count(*) from last30) as user_days30
+  ),
+  by_role as (
+    select coalesce(role, 'unknown') as role, count(distinct user_id) as users, count(*) as sessions, coalesce(sum(active_seconds), 0) as seconds
+    from inrange group by 1 order by 4 desc
+  ),
+  by_module as (
+    select m.key as module, sum((m.value)::numeric)::bigint as seconds, count(distinct i.user_id) as users
+    from inrange i, jsonb_each_text(i.modules) m group by 1 order by 2 desc
+  ),
+  by_user as (
+    select i.user_id, p.display_name, p.email, coalesce(max(i.role), 'unknown') as role, count(*) as sessions,
+           coalesce(sum(i.active_seconds), 0) as seconds, max(i.d_end) as last_day,
+           (select count(*) from ud where ud.user_id = i.user_id and ud.day >= v_from) as days_active
+    from inrange i left join profiles p on p.id = i.user_id group by i.user_id, p.display_name, p.email order by 6 desc limit 200
+  )
+  select jsonb_build_object(
+    'days', v_days, 'from', v_from, 'to', v_today, 'timezone', p_tz,
+    'daily', (select coalesce(jsonb_agg(jsonb_build_object('day', day, 'dau', dau, 'wau', wau, 'mau', mau, 'sessions', sessions, 'seconds', seconds) order by day), '[]'::jsonb) from daily),
+    'totals', (select jsonb_build_object(
+        'activeUsers', active_users, 'sessions', sessions, 'activeSeconds', seconds,
+        'avgSessionSeconds', case when sessions > 0 then round(seconds::numeric / sessions) else 0 end,
+        'avgSessionsPerUser', case when active_users > 0 then round(sessions::numeric / active_users, 2) else 0 end,
+        'avgSecondsPerActiveDay', case when user_days > 0 then round(seconds::numeric / user_days) else 0 end,
+        'dau', (select dau from daily where day = v_today), 'wau', (select wau from daily where day = v_today), 'mau', (select mau from daily where day = v_today),
+        'avgDau30', case when user_days30 > 0 then round(user_days30::numeric / 30, 2) else 0 end,
+        'stickiness', case when mau30 > 0 then round((user_days30::numeric / 30) / mau30, 4) else null end
+      ) from totals),
+    'byRole', (select coalesce(jsonb_agg(to_jsonb(by_role)), '[]'::jsonb) from by_role),
+    'byModule', (select coalesce(jsonb_agg(to_jsonb(by_module)), '[]'::jsonb) from by_module),
+    'users', (select coalesce(jsonb_agg(to_jsonb(by_user)), '[]'::jsonb) from by_user)
+  ) into v_result;
+  return v_result;
+end $$;
+revoke all on function usage_metrics(int, text) from public;
+grant execute on function usage_metrics(int, text) to authenticated;

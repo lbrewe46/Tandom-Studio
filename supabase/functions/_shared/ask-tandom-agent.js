@@ -179,7 +179,7 @@ export function createToolRunner(ctx) {
       if (!ctx.store) return { error: "No store is selected, so there are no store tasks to show." };
       const want = status && status !== "all" ? status : null;
       const tasks = (ctx.store.tasks || []).filter((t) => !want || t.status === want)
-        .sort((a, b) => (a.dueDate || "9999").localeCompare(b.dueDate || "9999")).slice(0, MAX_LIST)
+        .sort((a, b) => String(a.dueDate || "9999").localeCompare(String(b.dueDate || "9999"))).slice(0, MAX_LIST)
         .map((t) => ({ id: t.id, type: t.type, description: clip(t.description, 300), dueDate: t.dueDate || null, status: t.status }));
       return { store: ctx.store.name, tasks };
     },
