@@ -1458,12 +1458,17 @@ function parsePerformanceWorkbook(file, products, stores, productSchema, primary
         const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { defval: "" });
 
         const keyLabel = primaryKeyField === "upc" ? "UPC" : "SKU";
+        // A row can identify its product by SKU or UPC (whichever column it has), whatever the primary key setting says.
+        // Codes are compared as digits without leading zeros (spreadsheets drop them from UPCs), names ignore case and extra spaces.
+        const normCode = (v) => { const t = String(v ?? "").trim().toLowerCase(); return /^[0-9\s-]+$/.test(t) ? t.replace(/[\s-]/g, "").replace(/^0+(?=.)/, "") : t; };
+        const normName = (v) => String(v ?? "").trim().toLowerCase().replace(/\s+/g, " ");
         const byKey = {};
         const byName = {};
         products.forEach((p) => {
-          const key = getPrimaryKeyValue(p, productSchema, primaryKeyField);
-          if (key) byKey[key] = p.id;
-          byName[p.name.trim().toLowerCase()] = p.id;
+          const primary = getPrimaryKeyValue(p, productSchema, primaryKeyField);
+          const codes = [primary, (p.sku || ""), getAttrByLabel(p, productSchema, ["upc"]) || ""];
+          codes.forEach((c) => { const k = normCode(c); if (k && !byKey[k]) byKey[k] = p.id; });
+          byName[normName(p.name)] = p.id;
         });
 
         const storeByNumber = {};
@@ -1479,9 +1484,9 @@ function parsePerformanceWorkbook(file, products, stores, productSchema, primary
         let unmatchedStoreRows = 0;
 
         rows.forEach((r) => {
-          const key = String(r[keyLabel] || "").trim().toLowerCase();
-          const name = String(r["Product Name"] || "").trim().toLowerCase();
-          const productId = (key && byKey[key]) || (name && byName[name]) || null;
+          const codeCells = [r[keyLabel], r.SKU, r.UPC].map(normCode).filter(Boolean);
+          const name = normName(r["Product Name"]);
+          const productId = codeCells.map((k) => byKey[k]).find(Boolean) || (name && byName[name]) || null;
           const weekEnding = toISODate(r["Week Ending (YYYY-MM-DD)"] || r["Week Ending"]);
           if (!productId || !weekEnding) { unmatchedRows++; return; }
 
