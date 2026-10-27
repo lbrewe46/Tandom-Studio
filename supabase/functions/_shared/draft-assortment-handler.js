@@ -76,6 +76,23 @@ export function validateParams(body) {
   return { params: { category: p.category.trim(), weeks, compare, scope, planogramFilter, segmentFieldIds, assumptions } };
 }
 
+// What each item recommended for one planogram is expected to add, per week, in the chosen metric. Stored on the proposal so
+// a plan (and the presentation built from it) can quote it without re-running the engine.
+export function impactFor(rec, planogramId) {
+  const items = [];
+  (rec.items || []).forEach((it) => {
+    const c = (it.candidates || []).find((x) => x.planogramId === planogramId && x.status === "recommended");
+    if (!c) return;
+    items.push({
+      productId: it.productId, name: it.name, stores: c.stores, netPerStoreWeek: c.netPerStoreWeek, netNetworkWeek: c.netNetworkWeek,
+      gainNetworkWeek: c.gainPerStoreWeek === undefined ? null : Math.round(c.gainPerStoreWeek * c.stores * 100) / 100,
+      lossNetworkWeek: c.lossPerStoreWeek === undefined ? null : Math.round(c.lossPerStoreWeek * c.stores * 100) / 100,
+      forecastUnitsPerStoreWeek: it.forecast?.unitsPerStoreWeek ?? null, basis: it.forecast?.basis ?? null, gives: (c.removes || []).map((r) => ({ name: r.name, velocity: r.velocity })),
+    });
+  });
+  return { metric: rec.metric, netNetworkWeek: Math.round(items.reduce((sum, i) => sum + (i.netNetworkWeek || 0), 0) * 100) / 100, items };
+}
+
 export async function handleDraftAssortment(req, db) {
   const early = preflightOrWrongMethod(req);
   if (early) return early;
@@ -172,7 +189,7 @@ export async function handleDraftAssortment(req, db) {
       const removes = g.changes.filter((c) => c.type === "delete").length;
       const result = {
         changes: g.changes, skipped: g.skipped, notes: [], startISO: rec.startISO, endISO: rec.endISO, lookbackWeeks: rec.lookbackWeeks,
-        assortment: { category: checked.params.category, scope: ctx.scope.label, metric: rec.metric, assumptions: rec.assumptions, newItems: g.changes.filter((c) => c.type === "addProduct").map((c) => c.productName) },
+        assortment: { impact: impactFor(rec, planogramId), kind: core ? "core" : "new", category: checked.params.category, scope: ctx.scope.label, metric: rec.metric, assumptions: rec.assumptions, newItems: g.changes.filter((c) => c.type === "addProduct").map((c) => c.productName) },
       };
       result.sourceFingerprint = await fingerprint(planogram.sections ?? null);
       const score = Math.round((adds / (adds + g.skipped.length)) * 100);

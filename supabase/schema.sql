@@ -859,3 +859,47 @@ begin
 end $$;
 revoke all on function usage_metrics(int, text) from public;
 grant execute on function usage_metrics(int, text) to authenticated;
+
+-- ------------------------------------------------------------------
+-- Assortment plans: the approved output of the Assortment Planner, with dates, a status and a share link
+-- ------------------------------------------------------------------
+-- A plan groups the assortment proposals a category manager approved (proposals.status approved or applied,
+-- agent 'assortment-agent'). It snapshots what each proposal changes so the plan still reads after the
+-- proposal moves on, and carries the dates and status the reset teams plan around.
+create table if not exists assortment_plans (
+  id uuid primary key default gen_random_uuid(),
+  name text not null check (length(btrim(name)) > 0),
+  category text,
+  status text not null default 'draft' check (status in ('draft', 'shared', 'approved', 'scheduled', 'executed', 'cancelled')),
+  effective_date date,
+  review_by date,
+  notes text,
+  proposal_ids uuid[] not null default '{}',
+  items jsonb not null default '[]'::jsonb,       -- [{ proposalId, planogramId, planogramName, adds: [name], removes: [name], facings: n }]
+  created_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_by uuid references auth.users(id) on delete set null,
+  updated_at timestamptz not null default now()
+);
+create index if not exists assortment_plans_status_idx on assortment_plans (status, effective_date);
+
+alter table assortment_plans enable row level security;
+
+-- Anyone signed in can read a plan (that is what the share link relies on); only Admins and Category Managers
+-- create, change or delete one.
+drop policy if exists "Any role can read assortment plans" on assortment_plans;
+create policy "Any role can read assortment plans" on assortment_plans for select to authenticated using (true);
+drop policy if exists "Planners write assortment plans" on assortment_plans;
+create policy "Planners write assortment plans" on assortment_plans for all to authenticated
+  using (current_user_role() in ('admin', 'category_manager'))
+  with check (current_user_role() in ('admin', 'category_manager'));
+
+create or replace function stamp_assortment_plan() returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'INSERT' then new.created_by := auth.uid(); new.created_at := now(); end if;
+  if tg_op = 'UPDATE' then new.created_by := old.created_by; new.created_at := old.created_at; end if;
+  new.updated_by := auth.uid(); new.updated_at := now();
+  return new;
+end $$;
+drop trigger if exists stamp_assortment_plan on assortment_plans;
+create trigger stamp_assortment_plan before insert or update on assortment_plans for each row execute function stamp_assortment_plan();

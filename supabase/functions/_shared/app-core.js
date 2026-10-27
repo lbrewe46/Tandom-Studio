@@ -306,6 +306,7 @@ const HELP_SECTIONS = [
         "**Segments:** list the product attributes in the order a shopper decides at the shelf (for cereal: Age group, then Sugar level, then Brand). The table splits the category that way and shows each segment's sales, share of sales, share of shelf space, space index (over 100 earns more than the room it takes), growth, and which segment holds the most space.",
         "**Slow movers:** every item ranked slowest first by units per store per week, with the bottom quarter flagged. Compare across regions, clusters, formats or stores to see where an item is slow in most places versus just one.",
         "**Core items:** finds the fundamental, everyday items of the category. An item is core when it sells in most weeks (frequent), with little week-to-week swing (steady) and sits in the top share of category sales (the backbone). Thresholds are editable. Each item shows its stores and coverage by store format, so you can see a core item carried only in large stores; a core item carried by too few stores and missing from planograms is flagged as a gap. Tick gap items to see where they would earn their space (forecast from how they sell where carried, adjusted for store strength) and draft the changes for review. Staple-versus-impulse and competitive pricing can't be read from sales: use Mark core / Not core, and the Price steady column as a hint.",
+        "**Plans:** a plan collects the assortment drafts you approved (use Review in the draft queue first), with an effective date, a review-by date and a status (Draft, Shared for review, Approved, Scheduled, Executed, Cancelled). Open a plan to preview what changes on each planogram, copy a share link for colleagues who are signed in, or download it as Excel. Plans past their effective date that are not executed show in red. Download PowerPoint builds an editable deck for a buyer from the plan (recommendation, category context, changes by planogram, why each item, where the changes land by store format/region/cluster, a low/base/high range, trade-offs, execution, method); you can hide the names of items removed. Each planogram in a plan shows a size check: whether its fixtures are too small or too large for the items at your days-of-supply targets, in whole sections (hover for the reasoning). Draft major reset re-lays the planograms from scratch (blocks by your segmentation, best sellers at eye level, sections added if needed; anything that cannot be placed is named, never dropped silently) for plans that change a lot. Open a plan and use Draft minor reset to queue the quick follow-up (facings, stacking and case-pack changes for days of supply) on the versions its applied drafts created. You set the most products that may move per planogram; anything beyond that is listed for a major reset. Only Admins and Category Managers can change a plan.",
         "**New items:** import what the category manager sent (Excel, CSV or a Google Sheet link; download the template first) or add items by hand. Each is added to the product library as Pending. Give it a forecast, or pick similar items and say how much it sells compared with them. It also needs its size, and a price (or a similar item's price).",
         "**Recommendations:** for each new item, every planogram in the category is checked. It goes into free space if there is any; otherwise the slowest items are removed, but only if the new item is expected to beat what is given up, and never so many that a segment loses all its variety. Untick a planogram to leave an item off it, lock an item to protect it, then press **Draft changes for review**.",
         "Drafts land in the **AI Draft Review Queue** on the Space Planner's Planograms tab like any other draft (the Review link takes you there). Approving one builds a new Work-in-Progress version; live planograms are not touched.",
@@ -817,7 +818,15 @@ function applyResetDraftChanges(sections, changes) {
   const highEdits = {}; // placementId -> new Facings High (stack height)
   const deepEdits = {}; // placementId -> new Facings Deep (case-pack fit)
   const additions = []; // addProduct changes, applied per-fixture below
+  const layouts = {}; // fixtureInstId -> the complete placement list a major reset set for that shelf
   changes.forEach((c) => {
+    if (c.type === "addSection") {
+      // a major reset that needs more width: a new, empty section (its ids are chosen by the draft so setLayout can refer to them)
+      const at = next.findIndex((sec) => sec.id === c.afterSectionId);
+      next.splice(at >= 0 ? at + 1 : next.length, 0, JSON.parse(JSON.stringify(c.section)));
+      return;
+    }
+    if (c.type === "setLayout") { layouts[c.fixtureInstId] = c.placements; return; }
     if (c.type === "delete") toDelete.add(c.placementId);
     else if (c.type === "reduceFacings" || c.type === "increaseFacings") facingEdits[c.placementId] = c.newFacings;
     else if (c.type === "increaseHigh" || c.type === "reduceHigh") highEdits[c.placementId] = c.newHigh;
@@ -826,6 +835,7 @@ function applyResetDraftChanges(sections, changes) {
   });
   next.forEach((section) => {
     (section.fixtures || []).forEach((fixtureInst) => {
+      if (layouts[fixtureInst.id]) { fixtureInst.placements = JSON.parse(JSON.stringify(layouts[fixtureInst.id])); return; }
       fixtureInst.placements = (fixtureInst.placements || [])
         .filter((pl) => !toDelete.has(pl.id))
         .map((pl) => (facingEdits[pl.id] !== undefined ? { ...pl, facings: facingEdits[pl.id] } : pl))

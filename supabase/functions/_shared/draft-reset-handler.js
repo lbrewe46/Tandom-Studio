@@ -5,6 +5,13 @@
 // Contract
 //   POST { planogramIds: string[] (1..MAX_PLANOGRAMS_PER_CALL), lookbackWeeks?: int, storeId?: string|null }
 //     (planogramId: string is accepted as shorthand for a one-element planogramIds)
+//   Minor reset from an Assortment plan: POST { planId: uuid, maxMoves?: int 0..50 (default 5), lookbackWeeks?, storeId? }.
+//     Drafts, for each planogram the plan's applied assortment drafts created, the facing / days-of-supply / case-pack changes
+//     (never more than maxMoves products moved). planogramIds is not needed; a plan item whose draft is not applied yet is
+//     reported as a failure asking for it to be applied first.
+//   Major reset from a plan: POST { planId, mode: "major", segmentFieldIds?: string[] (blocking order, up to 6), allowResize?: boolean (default true) }.
+//     Re-lays each planogram the plan's applied drafts created: blocks by segment, best sellers at eye level, sections added when the
+//     items need more width. Nothing is removed without being named in the draft; maxMoves does not apply.
 //   200 { results: [{ planogramId, ok: true, score, proposalId, result: {changes, skipped, startISO, endISO, lookbackWeeks} }
 //                 | { planogramId, ok: false, error }] }
 //
@@ -17,9 +24,10 @@
 // The caller never supplies thresholds, protection rules or data — those are read here, with
 // the service-role key, so they never travel to (or from) the browser.
 
-import { computeResetDraft, computeDraftScore, createDraftCache } from "./reset-agent.js";
+import { computeResetDraft, computeDraftScore, createDraftCache, limitMovement } from "./reset-agent.js";
 import { json, preflightOrWrongMethod, authenticate } from "./http.js";
 import { fingerprint } from "./proposal-core.js";
+import { computeMajorReset } from "./major-reset.js";
 
 export const AGENT_ID = "reset-drafting-agent";
 export const TARGET_TYPE = "planogram_version";
@@ -117,7 +125,34 @@ export async function handleDraftReset(req, db) {
   // --- input ---------------------------------------------------------------------------
   let body;
   try { body = await req.json(); } catch { return json(400, { error: "Body must be JSON" }); }
-  const rawIds = Array.isArray(body?.planogramIds) ? body.planogramIds : body?.planogramId ? [body.planogramId] : [];
+  const planMode = body?.planId !== undefined;
+  let plan = null;
+  let planFailures = [];
+  let rawIds = Array.isArray(body?.planogramIds) ? body.planogramIds : body?.planogramId ? [body.planogramId] : [];
+  const major = body?.mode === "major";
+  if (body?.mode !== undefined && !["minor", "major"].includes(body.mode)) return json(400, { error: "mode must be minor or major" });
+  if (major && !planMode) return json(400, { error: "A major reset needs a planId" });
+  const segmentFieldIds = body.segmentFieldIds === undefined ? [] : body.segmentFieldIds;
+  if (!Array.isArray(segmentFieldIds) || segmentFieldIds.length > 6 || segmentFieldIds.some((x) => typeof x !== "string" || !x)) return json(400, { error: "segmentFieldIds must be up to six attribute ids" });
+  if (body.allowResize !== undefined && typeof body.allowResize !== "boolean") return json(400, { error: "allowResize must be true or false" });
+  const maxMoves = body.maxMoves === undefined ? 5 : body.maxMoves;
+  if (planMode) {
+    if (typeof body.planId !== "string" || !/^[0-9a-f-]{36}$/i.test(body.planId)) return json(400, { error: "planId must be a plan id" });
+    if (!Number.isInteger(maxMoves) || maxMoves < 0 || maxMoves > 50) return json(400, { error: "maxMoves must be an integer from 0 to 50" });
+    const { data: planRow, error: planErr } = await db.from("assortment_plans").select("id, name, status, proposal_ids").eq("id", body.planId).maybeSingle();
+    if (planErr) return json(500, { error: "Could not read the plan", detail: planErr.message });
+    if (!planRow) return json(404, { error: "Plan not found" });
+    if (["executed", "cancelled"].includes(planRow.status)) return json(409, { error: `This plan is ${planRow.status}` });
+    plan = planRow;
+    const { data: planProposals, error: propErr } = await db.from("proposals").select("id, target_id, status, applied_id").in("id", plan.proposal_ids || []);
+    if (propErr) return json(500, { error: "Could not read the plan's drafts", detail: propErr.message });
+    rawIds = [];
+    (planProposals || []).forEach((pr) => {
+      if (pr.status === "applied" && pr.applied_id) rawIds.push(pr.applied_id);
+      else planFailures.push({ planogramId: pr.target_id, ok: false, error: `The assortment draft for this planogram is ${pr.status}; apply it first so a version exists to reset.` });
+    });
+    if (rawIds.length === 0) return json(200, { results: planFailures });
+  }
   const ids = [...new Set(rawIds)]; // one proposal per planogram per call, even if an id is repeated
   if (ids.length === 0 || ids.some((id) => typeof id !== "string" || !id)) return json(400, { error: "planogramIds must be a non-empty array of ids" });
   if (ids.length > MAX_PLANOGRAMS_PER_CALL) return json(400, { error: `At most ${MAX_PLANOGRAMS_PER_CALL} planograms per call` });
@@ -151,17 +186,32 @@ export async function handleDraftReset(req, db) {
       const planogram = planogramById[planogramId];
       if (!planogram) { results.push({ planogramId, ok: false, error: "Planogram not found" }); continue; }
       try {
-        const result = computeResetDraft(planogram, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, storeId, cache, dosTargets);
+        let result;
+        if (major) {
+          result = computeMajorReset(planogram, { products, fixtures, performance, dosTargets, segmentFieldIds, weeks: lookbackWeeks, allowResize: body.allowResize !== false });
+          result.majorPlan = { planId: plan.id, planName: plan.name, segmentFieldIds };
+        } else {
+          result = computeResetDraft(planogram, products, fixtures, performance, productSchema, resetThresholds, lookbackWeeks, storeId, cache, dosTargets);
+          if (plan) result = { ...limitMovement(result, maxMoves), minor: { planId: plan.id, planName: plan.name, maxMoves } };
+        }
         // what the planogram looked like when this was drafted; apply-proposal refuses to apply
         // the proposal if the planogram has been edited since (its placement ids may have moved)
         result.sourceFingerprint = await fingerprint(planogram.sections ?? null);
-        results.push({ planogramId, ok: true, score: computeDraftScore(result), result });
+        const entry = { planogramId, ok: true, score: computeDraftScore(result), result };
+        if (major) {
+          const m = result.movement;
+          entry.reason = `Major reset for plan "${plan.name}": ${m.items} items re-laid, ${m.moved} on a different shelf (${m.pctMoved}%)${result.major.sectionsAdded ? `, ${result.major.sectionsAdded} section${result.major.sectionsAdded === 1 ? "" : "s"} added` : ""}${m.unplaced || m.trimmedOut ? `, ${m.unplaced + m.trimmedOut} left out for lack of room` : ""}.`;
+        } else if (plan) {
+          const m = result.movement;
+          entry.reason = `Minor reset for plan "${plan.name}": ${result.changes.length} change${result.changes.length === 1 ? "" : "s"} (${m.facingChanges} facing/stack/case-pack, ${m.adds} added, ${m.removes} removed)${m.trimmed ? `, ${m.trimmed} move${m.trimmed === 1 ? "" : "s"} left for a major reset` : ""}.`;
+        }
+        results.push(entry);
       } catch (e) {
         results.push({ planogramId, ok: false, error: `Draft failed: ${e?.message || e}` });
       }
     }
     await recordProposals(db, results, userData.user.id);
-    return json(200, { results });
+    return json(200, { results: [...planFailures, ...results] });
   } catch (e) {
     console.error("draft-reset failed", e);
     return json(500, { error: "Could not read the data needed to draft a reset" });

@@ -584,6 +584,8 @@ export function recommend(ctx, newItemIds, options = {}) {
       cand.add = { sectionId: best.section.id, sectionName: best.section.name || "", fixtureInstId: best.fixtureInst.id, fixtureName: (best.def?.name || "Shelf"), placementId: best.add.placement.id, newHigh: best.add.placement.high || 1, spaceFreeIn: round(best.add.remainder + getPlacementSpaceIn(product, best.add.placement), 1), spaceNeededIn: round(getPlacementSpaceIn(product, best.add.placement), 1) };
       cand.removes = best.removes.map((t) => ({ placementId: t.pl.id, productId: t.p.id, name: t.p.name, valuePerStoreWeek: round(t.value), velocity: round(t.velocity, 2), sectionId: best.section.id, fixtureInstId: best.fixtureInst.id }));
       cand.netPerStoreWeek = round(net);
+      cand.gainPerStoreWeek = round(gain);
+      cand.lossPerStoreWeek = round(best.loss);
       cand.netNetworkWeek = round(net * storeIds.length);
       cand.score = round(score * storeIds.length);
       cand.metric = a.metric;

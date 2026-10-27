@@ -308,3 +308,78 @@ export async function loadUsageMetrics(days, timeZone) {
     return { ok: false, error: e?.message || "Couldn't load usage." };
   }
 }
+
+// -------------------------------------------------------------------
+// Assortment plans: approved Assortment Planner output with dates and a status
+// -------------------------------------------------------------------
+
+// Newest first. `ok` is false when the table can't be read (schema.sql not run yet).
+export async function loadAssortmentPlans() {
+  if (!supabase) return { ok: false, rows: [], error: "Supabase isn't configured." };
+  try {
+    const { data, error } = await supabase.from("assortment_plans").select("*").order("created_at", { ascending: false }).limit(500);
+    if (error || !data) return { ok: false, rows: [], error: error?.message };
+    return { ok: true, rows: data };
+  } catch (e) {
+    return { ok: false, rows: [], error: e?.message };
+  }
+}
+
+// Creates (no id) or updates (with id) a plan. Throws with the database's message so the caller can show it.
+export async function saveAssortmentPlan(plan) {
+  if (!supabase) throw new Error("Supabase isn't configured.");
+  const row = {
+    name: plan.name, category: plan.category || null, status: plan.status || "draft",
+    effective_date: plan.effective_date || null, review_by: plan.review_by || null, notes: plan.notes || null,
+    proposal_ids: plan.proposal_ids || [], items: plan.items || [],
+  };
+  const q = plan.id ? supabase.from("assortment_plans").update(row).eq("id", plan.id) : supabase.from("assortment_plans").insert(row);
+  const { data, error } = await q.select("*").maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!data) throw new Error("The plan wasn't saved (does your role allow it?).");
+  return data;
+}
+
+export async function deleteAssortmentPlan(id) {
+  if (!supabase) throw new Error("Supabase isn't configured.");
+  const { data, error } = await supabase.from("assortment_plans").delete().eq("id", id).select("id");
+  if (error) throw new Error(error.message);
+  if (!data || data.length === 0) throw new Error("The plan wasn't deleted (does your role allow it?).");
+}
+
+// Assortment drafts a person has approved (waiting to be applied, or already applied), newest first, with their change sets.
+export async function loadApprovedAssortmentProposals() {
+  if (!supabase) return { ok: false, rows: [] };
+  try {
+    const rows = [];
+    for (let from = 0; from < 5000; from += 500) {
+      const { data, error } = await supabase.from("proposals")
+        .select("id, target_id, reason, score, status, created_at, reviewed_at, proposed_change")
+        .eq("agent_id", "assortment-agent").in("status", ["approved", "applied"])
+        .order("reviewed_at", { ascending: false }).range(from, from + 499);
+      if (error || !data) return { ok: false, rows: [] };
+      rows.push(...data);
+      if (data.length < 500) break;
+    }
+    return { ok: true, rows };
+  } catch (e) {
+    return { ok: false, rows: [] };
+  }
+}
+
+// Current change sets for the given proposals (used to preview a plan).
+export async function loadProposalsByIds(ids) {
+  const unique = [...new Set((ids || []).filter(Boolean))];
+  if (!supabase || unique.length === 0) return { ok: true, rows: [] };
+  try {
+    const rows = [];
+    for (let i = 0; i < unique.length; i += 100) {
+      const { data, error } = await supabase.from("proposals").select("id, target_id, status, reason, proposed_change, applied_id").in("id", unique.slice(i, i + 100));
+      if (error || !data) return { ok: false, rows: [] };
+      rows.push(...data);
+    }
+    return { ok: true, rows };
+  } catch (e) {
+    return { ok: false, rows: [] };
+  }
+}

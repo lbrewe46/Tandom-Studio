@@ -392,4 +392,29 @@ function computeResetDraft(planogram, products, fixtures, performance, productSc
   return { changes, skipped, notes, startISO, endISO, lookbackWeeks };
 }
 
-export { facingIncreaseFits, computeDraftScore, computeResetDraft, createDraftCache };
+// Minor reset: product movement is what costs a store labour, so a draft may move at most `maxMoves` products (each product
+// deleted from a shelf, or added to one, counts once). Facing, stack and case-pack changes are not movement and are never
+// trimmed. Moves beyond the limit come out of the draft and are listed as skipped, so a planner sees what a major reset
+// would pick up. Returns the same result object with a `movement` summary.
+function limitMovement(result, maxMoves) {
+  const isMove = (c) => c.type === "delete" || c.type === "addProduct";
+  const order = [];
+  result.changes.forEach((c) => { if (isMove(c) && !order.includes(c.productId)) order.push(c.productId); });
+  const keep = new Set(order.slice(0, Math.max(0, maxMoves)));
+  const dropped = order.filter((id) => !keep.has(id));
+  const droppedSet = new Set(dropped);
+  const trimmed = [];
+  const changes = result.changes.filter((c) => {
+    if (isMove(c) && droppedSet.has(c.productId)) { trimmed.push(c); return false; }
+    return true;
+  });
+  const skipped = [...result.skipped];
+  dropped.forEach((id) => {
+    const c = trimmed.find((x) => x.productId === id);
+    skipped.push({ productId: id, productName: c.productName, reason: `${c.type === "delete" ? "Removal" : "Addition"} left for a major reset: a minor reset moves at most ${maxMoves} product${maxMoves === 1 ? "" : "s"}.` });
+  });
+  const facingChanges = changes.filter((c) => !isMove(c) && ["increaseFacings", "reduceFacings", "increaseHigh", "reduceHigh", "setDeep"].includes(c.type)).length;
+  return { ...result, changes, skipped, movement: { maxMoves, moved: keep.size, trimmed: dropped.length, adds: new Set(changes.filter((c) => c.type === "addProduct").map((c) => c.productId)).size, removes: new Set(changes.filter((c) => c.type === "delete").map((c) => c.productId)).size, facingChanges } };
+}
+
+export { facingIncreaseFits, computeDraftScore, computeResetDraft, createDraftCache, limitMovement };

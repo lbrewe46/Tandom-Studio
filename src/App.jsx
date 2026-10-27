@@ -12,7 +12,11 @@ import {
   safeGet, safeSet, safeDelete, loadIndexed, saveIndexed, deleteIndexed, waitForPendingWrites,
   loadPendingProposals, reviewProposal, loadProfileNames, loadActivity, loadProposal, applyProposal, invokeEdgeFunction,
   loadResetImpacts, loadEscalations, resolveEscalation, loadUsageMetrics,
+  loadAssortmentPlans, saveAssortmentPlan, deleteAssortmentPlan, loadApprovedAssortmentProposals, loadProposalsByIds,
 } from "./lib/db.js";
+import { spaceFit, createFitCache } from "../supabase/functions/_shared/space-fit.js";
+import { downloadPack } from "./lib/pack-pptx.js";
+import { PLAN_STATUSES, buildPack, contextRows, storeGroups, planStatusLabel, planItemFromProposal, planTotals, proposalsAvailableForPlan, planRows, planDateFlags, planLink, planIdFromHash } from "./lib/plans.js";
 import { startUsageTracking } from "./lib/usage.js";
 import { coreProfile, coreForecasts, coreValueScale, buildContext, segmentTree, slowMovers, forecastFor, recommend, scopeOptions, DEFAULT_ASSUMPTIONS } from "../supabase/functions/_shared/assortment.js";
 
@@ -1481,6 +1485,7 @@ function parsePerformanceWorkbook(file, products, stores, productSchema, primary
         const grouped = {}; // productId -> [{weekEnding, unitCost, price, units, storeId}]
         let matchedRows = 0;
         let unmatchedRows = 0;
+        const unmatchedWhy = new Map(); // product label -> {rows, why}
         let unmatchedStoreRows = 0;
 
         rows.forEach((r) => {
@@ -1488,7 +1493,13 @@ function parsePerformanceWorkbook(file, products, stores, productSchema, primary
           const name = normName(r["Product Name"]);
           const productId = codeCells.map((k) => byKey[k]).find(Boolean) || (name && byName[name]) || null;
           const weekEnding = toISODate(r["Week Ending (YYYY-MM-DD)"] || r["Week Ending"]);
-          if (!productId || !weekEnding) { unmatchedRows++; return; }
+          if (!productId || !weekEnding) {
+            unmatchedRows++;
+            const label = String(r["Product Name"] || r[keyLabel] || r.SKU || r.UPC || "(blank)").trim();
+            const e = unmatchedWhy.get(label) || { rows: 0, why: !productId ? "no product with this name/SKU/UPC" : `date not recognised (${String(r["Week Ending (YYYY-MM-DD)"] ?? r["Week Ending"] ?? "blank")})` };
+            e.rows++; unmatchedWhy.set(label, e);
+            return;
+          }
 
           const storeNum = String(r["Store Number"] || "").trim().toLowerCase();
           const storeName = String(r["Store Name"] || "").trim().toLowerCase();
@@ -1510,7 +1521,7 @@ function parsePerformanceWorkbook(file, products, stores, productSchema, primary
           matchedRows++;
         });
 
-        resolve({ grouped, matchedRows, unmatchedRows, unmatchedStoreRows, totalRows: rows.length });
+        resolve({ grouped, matchedRows, unmatchedRows, unmatchedStoreRows, totalRows: rows.length, unmatchedList: [...unmatchedWhy.entries()].map(([label, e]) => ({ label, ...e })).sort((x, y) => y.rows - x.rows) });
       } catch (err) {
         reject(err);
       }
@@ -3773,7 +3784,7 @@ function PerformanceModule({ products, performance, stores, productSchema, prima
     if (!file) return;
     setImporting(true); setImportStatus(null); setImportProgress({ current: 0, total: 0, phase: "reading" });
     try {
-      const { grouped, matchedRows, unmatchedRows, unmatchedStoreRows } = await parsePerformanceWorkbook(file, products, stores, productSchema, primaryKeyField);
+      const { grouped, matchedRows, unmatchedRows, unmatchedStoreRows, unmatchedList } = await parsePerformanceWorkbook(file, products, stores, productSchema, primaryKeyField);
       const productIds = Object.keys(grouped);
       if (productIds.length === 0) {
         const reason = unmatchedStoreRows > 0 && unmatchedRows === 0
@@ -3790,7 +3801,7 @@ function PerformanceModule({ products, performance, stores, productSchema, prima
           await new Promise((res) => setTimeout(res, 0));
         }
         const parts = [];
-        if (unmatchedRows > 0) parts.push(`${unmatchedRows} row${unmatchedRows !== 1 ? "s" : ""} skipped — no matching product or missing date`);
+        if (unmatchedRows > 0) parts.push(`${unmatchedRows} row${unmatchedRows !== 1 ? "s" : ""} skipped — no matching product or missing date${unmatchedList && unmatchedList.length ? ` (${unmatchedList.slice(0, 4).map((u) => `${u.label}: ${u.rows} rows, ${u.why}`).join("; ")}${unmatchedList.length > 4 ? `; and ${unmatchedList.length - 4} more` : ""})` : ""}`);
         if (unmatchedStoreRows > 0) parts.push(`${unmatchedStoreRows} row${unmatchedStoreRows !== 1 ? "s" : ""} skipped — no matching store`);
         setImportStatus({
           type: "ok",
@@ -4042,6 +4053,7 @@ const HELP_SECTIONS = [
         "**Segments:** list the product attributes in the order a shopper decides at the shelf (for cereal: Age group, then Sugar level, then Brand). The table splits the category that way and shows each segment's sales, share of sales, share of shelf space, space index (over 100 earns more than the room it takes), growth, and which segment holds the most space.",
         "**Slow movers:** every item ranked slowest first by units per store per week, with the bottom quarter flagged. Compare across regions, clusters, formats or stores to see where an item is slow in most places versus just one.",
         "**Core items:** finds the fundamental, everyday items of the category. An item is core when it sells in most weeks (frequent), with little week-to-week swing (steady) and sits in the top share of category sales (the backbone). Thresholds are editable. Each item shows its stores and coverage by store format, so you can see a core item carried only in large stores; a core item carried by too few stores and missing from planograms is flagged as a gap. Tick gap items to see where they would earn their space (forecast from how they sell where carried, adjusted for store strength) and draft the changes for review. Staple-versus-impulse and competitive pricing can't be read from sales: use Mark core / Not core, and the Price steady column as a hint.",
+        "**Plans:** a plan collects the assortment drafts you approved (use Review in the draft queue first), with an effective date, a review-by date and a status (Draft, Shared for review, Approved, Scheduled, Executed, Cancelled). Open a plan to preview what changes on each planogram, copy a share link for colleagues who are signed in, or download it as Excel. Plans past their effective date that are not executed show in red. Download PowerPoint builds an editable deck for a buyer from the plan (recommendation, category context, changes by planogram, why each item, where the changes land by store format/region/cluster, a low/base/high range, trade-offs, execution, method); you can hide the names of items removed. Each planogram in a plan shows a size check: whether its fixtures are too small or too large for the items at your days-of-supply targets, in whole sections (hover for the reasoning). Draft major reset re-lays the planograms from scratch (blocks by your segmentation, best sellers at eye level, sections added if needed; anything that cannot be placed is named, never dropped silently) for plans that change a lot. Open a plan and use Draft minor reset to queue the quick follow-up (facings, stacking and case-pack changes for days of supply) on the versions its applied drafts created. You set the most products that may move per planogram; anything beyond that is listed for a major reset. Only Admins and Category Managers can change a plan.",
         "**New items:** import what the category manager sent (Excel, CSV or a Google Sheet link; download the template first) or add items by hand. Each is added to the product library as Pending. Give it a forecast, or pick similar items and say how much it sells compared with them. It also needs its size, and a price (or a similar item's price).",
         "**Recommendations:** for each new item, every planogram in the category is checked. It goes into free space if there is any; otherwise the slowest items are removed, but only if the new item is expected to beat what is given up, and never so many that a segment loses all its variety. Untick a planogram to leave an item off it, lock an item to protect it, then press **Draft changes for review**.",
         "Drafts land in the **AI Draft Review Queue** on the Space Planner's Planograms tab like any other draft (the Review link takes you there). Approving one builds a new Work-in-Progress version; live planograms are not touched.",
@@ -6060,7 +6072,15 @@ function applyResetDraftChanges(sections, changes) {
   const highEdits = {}; // placementId -> new Facings High (stack height)
   const deepEdits = {}; // placementId -> new Facings Deep (case-pack fit)
   const additions = []; // addProduct changes, applied per-fixture below
+  const layouts = {}; // fixtureInstId -> the complete placement list a major reset set for that shelf
   changes.forEach((c) => {
+    if (c.type === "addSection") {
+      // a major reset that needs more width: a new, empty section (its ids are chosen by the draft so setLayout can refer to them)
+      const at = next.findIndex((sec) => sec.id === c.afterSectionId);
+      next.splice(at >= 0 ? at + 1 : next.length, 0, JSON.parse(JSON.stringify(c.section)));
+      return;
+    }
+    if (c.type === "setLayout") { layouts[c.fixtureInstId] = c.placements; return; }
     if (c.type === "delete") toDelete.add(c.placementId);
     else if (c.type === "reduceFacings" || c.type === "increaseFacings") facingEdits[c.placementId] = c.newFacings;
     else if (c.type === "increaseHigh" || c.type === "reduceHigh") highEdits[c.placementId] = c.newHigh;
@@ -6069,6 +6089,7 @@ function applyResetDraftChanges(sections, changes) {
   });
   next.forEach((section) => {
     (section.fixtures || []).forEach((fixtureInst) => {
+      if (layouts[fixtureInst.id]) { fixtureInst.placements = JSON.parse(JSON.stringify(layouts[fixtureInst.id])); return; }
       fixtureInst.placements = (fixtureInst.placements || [])
         .filter((pl) => !toDelete.has(pl.id))
         .map((pl) => (facingEdits[pl.id] !== undefined ? { ...pl, facings: facingEdits[pl.id] } : pl))
@@ -8480,6 +8501,8 @@ function ResetDraftReviewPanel({ planogram, onApprove, onDiscard, onBack, approv
   const deleted = changes.filter((c) => c.type === "delete");
   const added = changes.filter((c) => c.type === "addProduct");
   const deepSet = changes.filter((c) => c.type === "setDeep");
+  const relaid = changes.filter((c) => c.type === "setLayout");
+  const newSections = changes.filter((c) => c.type === "addSection");
   const notes = draft.notes || [];
 
   const Group = ({ title, icon: Icon, colorCls, items }) => {
@@ -8508,9 +8531,19 @@ function ResetDraftReviewPanel({ planogram, onApprove, onDiscard, onBack, approv
       <p className="text-sm text-slate-600 mb-4">
         Drafted from the last {draft.lookbackWeeks} weeks of performance ({draft.startISO} to {draft.endISO}). {changes.length} change{changes.length === 1 ? "" : "s"} proposed{skipped.length ? `, ${skipped.length} item${skipped.length === 1 ? "" : "s"} skipped` : ""}.
       </p>
+      {draft.movement && draft.major && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 text-sm text-blue-900">
+          <div className="font-semibold">Major reset{draft.majorPlan?.planName ? ` for "${draft.majorPlan.planName}"` : ""}</div>
+          <div>{draft.movement.items} items re-laid; {draft.movement.moved} change shelf ({draft.movement.pctMoved}%), {draft.movement.unchanged} stay on their shelf, {draft.movement.facingsChanged} get a different number of facings{draft.major.sectionsAdded ? `; ${draft.major.sectionsAdded} section${draft.major.sectionsAdded === 1 ? "" : "s"} added` : ""}.</div>
+          <div className="text-xs mt-1">Blocks, biggest-selling first: {draft.major.blocks.map((b) => `${b.path} (${b.items})`).join(", ") || "none"}. Best sellers go on the shelf nearest {draft.major.eyeLevelIn}in (eye level).</div>
+          {skipped.length > 0 && <div className="text-xs mt-1 font-semibold text-red-700">{skipped.length} item{skipped.length === 1 ? "" : "s"} would drop off the planogram if you approve; they are listed under Skipped.</div>}
+        </div>
+      )}
       {changes.length === 0 && (
         <p className="text-sm text-slate-500 mb-4">No changes met the thresholds for this window — nothing was proposed.</p>
       )}
+      <Group title="New sections" icon={Plus} colorCls="text-indigo-700" items={newSections.map((c) => ({ ...c, productName: "Section added" }))} />
+      <Group title="Re-laid shelves" icon={Layers} colorCls="text-indigo-700" items={relaid} />
       <Group title="Missing-Winner Additions" icon={Sparkles} colorCls="text-blue-700" items={added} />
       <Group title="Facing Reductions" icon={Minus} colorCls="text-amber-700" items={reduced} />
       <Group title="Facing / Stack Increases" icon={Plus} colorCls="text-emerald-700" items={increased} />
@@ -12975,12 +13008,386 @@ function CoreItemsView({ ctx, cfg, setCfg, planogramFilter, onOpenProposal, onDr
   );
 }
 
+// ---- Plans: approved Assortment Planner output, with dates, a status and a share link ----------------------------
+
+const PLAN_STATUS_CLS = {
+  draft: "bg-slate-100 text-slate-600 border-slate-200", shared: "bg-blue-50 text-blue-700 border-blue-200", approved: "bg-emerald-50 text-emerald-700 border-emerald-200",
+  scheduled: "bg-amber-50 text-amber-700 border-amber-200", executed: "bg-slate-800 text-white border-slate-800", cancelled: "bg-red-50 text-red-600 border-red-200",
+};
+
+function PlanDetail({ plan, planograms, products, fixtures, performance, dosTargets, stores, productSchema, segmentFieldIds, assumptions, canEdit, onSave, onDelete, onClose, onOpenProposal, onDrafted }) {
+  const [draft, setDraft] = useState(plan);
+  const [maxMoves, setMaxMoves] = useState(5);
+  const [pack, setPack] = useState(() => ({ preparedBy: readLocalJSON("assortPackPreparedBy", ""), preparedFor: "", hideRemovedNames: false, notes: "", groupBy: "format" }));
+  const [packBusy, setPackBusy] = useState(false);
+  const [packError, setPackError] = useState("");
+  const packSlides = React.useMemo(() => buildPack(plan, pack), [plan, pack]);
+  const downloadDeck = async () => {
+    setPackBusy(true); setPackError("");
+    try {
+      writeLocalJSON("assortPackPreparedBy", pack.preparedBy);
+      const options = { ...pack };
+      const byId = Object.fromEntries((planograms || []).map((p) => [p.id, p]));
+      // category context: the segment tree for the plan's category, from the retailer's sales
+      const counts = {};
+      (plan.items || []).forEach((it) => { const c = byId[it.planogramId]?.category; if (c) counts[c] = (counts[c] || 0) + 1; });
+      const category = plan.category || Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0];
+      if (category) {
+        const ctx = buildContext({ products, planograms, fixtures, performance, stores, productSchema }, { category, scope: { type: "all" }, weeks: 13, compare: "prior", segmentFieldIds: segmentFieldIds || [], assumptions: assumptions || DEFAULT_ASSUMPTIONS });
+        options.context = contextRows(segmentTree(ctx));
+      }
+      // where the changes land, by store field
+      const storesById = Object.fromEntries((stores || []).map((st) => [st.id, st]));
+      const rows = storeGroups(plan.items, (it) => { const wip = live[it.proposalId]?.applied_id; return (wip && byId[wip]) || byId[it.planogramId] || null; }, storesById, pack.groupBy);
+      options.byGroup = { label: pack.groupBy, rows };
+      await downloadPack(buildPack(plan, options), options, plan.name);
+    }
+    catch (e) { setPackError(e?.message || "Couldn't build the PowerPoint."); }
+    finally { setPackBusy(false); }
+  };
+  const [resetBusy, setResetBusy] = useState(false);
+  const [resetOut, setResetOut] = useState(null);
+  const [resetError, setResetError] = useState("");
+  const canReset = canEdit && !["executed", "cancelled"].includes(plan.status);
+  const [allowResize, setAllowResize] = useState(true);
+  const [majorBusy, setMajorBusy] = useState(false);
+  const [majorOut, setMajorOut] = useState(null);
+  const [majorError, setMajorError] = useState("");
+  const runMajorReset = async () => {
+    setMajorBusy(true); setMajorError(""); setMajorOut(null);
+    try {
+      const out = await invokeEdgeFunction("draft-reset", { planId: plan.id, mode: "major", segmentFieldIds: segmentFieldIds || [], allowResize, lookbackWeeks: 13 });
+      setMajorOut(out.results || []);
+      if (onDrafted) onDrafted();
+    } catch (e) { setMajorError(e?.message || "Couldn't draft the major reset."); }
+    finally { setMajorBusy(false); }
+  };
+  const runMinorReset = async () => {
+    setResetBusy(true); setResetError(""); setResetOut(null);
+    try {
+      const out = await invokeEdgeFunction("draft-reset", { planId: plan.id, maxMoves, lookbackWeeks: 13 });
+      setResetOut(out.results || []);
+      if (onDrafted) onDrafted();
+    } catch (e) { setResetError(e?.message || "Couldn't draft the minor reset."); }
+    finally { setResetBusy(false); }
+  };
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [live, setLive] = useState({}); // proposalId -> current proposal row (status + change list) for the preview
+  const [open, setOpen] = useState(() => new Set());
+  const dirty = ["name", "status", "effective_date", "review_by", "notes"].some((k) => (draft[k] || "") !== (plan[k] || ""));
+  useEffect(() => {
+    let cancelled = false;
+    loadProposalsByIds(plan.proposal_ids || []).then((r) => { if (!cancelled && r.ok) setLive(Object.fromEntries(r.rows.map((p) => [p.id, p]))); });
+    return () => { cancelled = true; };
+  }, [plan.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const totals = planTotals(plan.items);
+  const fits = React.useMemo(() => {
+    const cache = createFitCache();
+    const byId = Object.fromEntries((planograms || []).map((p) => [p.id, p]));
+    const out = {};
+    (plan.items || []).forEach((it) => {
+      const wipId = live[it.proposalId]?.applied_id;
+      const pg = (wipId && byId[wipId]) || byId[it.planogramId];
+      if (pg) out[it.proposalId] = spaceFit(pg, { products, fixtures, performance, dosTargets, cache });
+    });
+    return out;
+  }, [plan.items, live, planograms, products, fixtures, performance, dosTargets]);
+  const flags = planDateFlags(draft, todayISO());
+  const link = planLink(window.location.origin, plan.id);
+  const save = async (patch) => {
+    setSaving(true); setError("");
+    try { const saved = await onSave({ ...draft, ...patch }); setDraft(saved); } catch (e) { setError(e?.message || "Couldn't save the plan."); }
+    finally { setSaving(false); }
+  };
+  const share = async () => {
+    try { await window.navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) { window.prompt("Copy this link", link); }
+    if (canEdit && draft.status === "draft") save({ status: "shared" });
+  };
+  const download = () => {
+    const ws = XLSX.utils.json_to_sheet(planRows(plan));
+    ws["!cols"] = [{ wch: 36 }, { wch: 16 }, { wch: 52 }];
+    const info = XLSX.utils.aoa_to_sheet([["Plan", plan.name], ["Status", planStatusLabel(draft.status)], ["Effective", draft.effective_date || ""], ["Review by", draft.review_by || ""], ["Category", plan.category || ""], ["Planograms", totals.planograms], ["Items added", totals.adds], ["Items removed", totals.removes], ["Notes", draft.notes || ""]]);
+    info["!cols"] = [{ wch: 16 }, { wch: 60 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, info, "Plan");
+    XLSX.utils.book_append_sheet(wb, ws, "Changes");
+    XLSX.writeFile(wb, `${(plan.name || "assortment-plan").replace(/[^\w.-]+/g, "_")}.xlsx`);
+  };
+  const toggle = (id) => setOpen((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  const planogramById = Object.fromEntries((planograms || []).map((p) => [p.id, p]));
+  return (
+    <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-4">
+      <div className="flex flex-wrap items-start gap-3">
+        <div className="flex-1 min-w-[260px]">
+          <label className={labelCls}>Plan name</label>
+          <input className={inputCls} disabled={!canEdit} value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} />
+        </div>
+        <div><label className={labelCls}>Status</label>
+          <select className={inputCls} disabled={!canEdit} value={draft.status} onChange={(e) => setDraft({ ...draft, status: e.target.value })}>{PLAN_STATUSES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select></div>
+        <div><label className={labelCls}>Effective date</label><input type="date" className={inputCls} disabled={!canEdit} value={draft.effective_date || ""} onChange={(e) => setDraft({ ...draft, effective_date: e.target.value })} /></div>
+        <div><label className={labelCls}>Review by</label><input type="date" className={inputCls} disabled={!canEdit} value={draft.review_by || ""} onChange={(e) => setDraft({ ...draft, review_by: e.target.value })} /></div>
+      </div>
+      {(flags.late || flags.reviewDue) && <div className="text-xs text-amber-700">{flags.late ? "This plan is past its effective date and not executed. " : ""}{flags.reviewDue ? "Its review date has arrived." : ""}</div>}
+      <div><label className={labelCls}>Notes</label><textarea rows={2} className={inputCls} disabled={!canEdit} value={draft.notes || ""} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} placeholder="Why these changes, who needs to act, store communications…" /></div>
+      <div className="flex flex-wrap items-center gap-2">
+        {canEdit && <button className={btnPrimary} disabled={!dirty || saving || !draft.name.trim()} onClick={() => save({})}>{saving ? "Saving…" : "Save changes"}</button>}
+        <button className={btnGhost} onClick={share}><Link2 size={13} /> {copied ? "Link copied" : "Copy share link"}</button>
+        <button className={btnGhost} onClick={download}><Download size={13} /> Download Excel</button>
+        <button className={btnGhost} onClick={() => window.print()} title="Print or save as PDF"><Printer size={13} /> Print</button>
+        <span className="text-[11px] text-slate-400">The link opens this plan for colleagues who are signed in to Tandom.</span>
+        <button className="ml-auto text-xs text-slate-500 hover:underline" onClick={onClose}>Close</button>
+        {canEdit && <button className="text-xs text-red-600 hover:underline" onClick={onDelete}>Delete plan</button>}
+      </div>
+      {error && <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{error}</div>}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        {[["Planograms", totals.planograms], ["Items added", totals.adds], ["Items removed", totals.removes], ["Facing changes", totals.facings]].map(([l, v]) => (
+          <div key={l} className="border border-slate-200 rounded-lg p-2.5"><div className="text-[11px] uppercase tracking-wide text-slate-400 font-semibold">{l}</div><div className="text-lg font-bold text-slate-800">{v}</div></div>
+        ))}
+      </div>
+      <div className="border border-slate-200 rounded-lg p-3 space-y-2">
+        <div>
+          <div className="text-sm font-semibold text-slate-800">Presentation for a buyer</div>
+          <p className="text-xs text-slate-500">Builds an editable PowerPoint from this plan: the recommendation, the changes by planogram, why each item, the trade-offs and assumptions, execution, and the method. Every figure comes from the plan; where an expected impact wasn't recorded the slide says so.</p>
+        </div>
+        <div className="flex flex-wrap items-end gap-3">
+          <div><label className={labelCls}>Prepared by</label><input className={inputCls + " w-48 text-xs py-1"} value={pack.preparedBy} onChange={(e) => setPack({ ...pack, preparedBy: e.target.value })} placeholder="Your company" /></div>
+          <div><label className={labelCls}>Prepared for</label><input className={inputCls + " w-48 text-xs py-1"} value={pack.preparedFor} onChange={(e) => setPack({ ...pack, preparedFor: e.target.value })} placeholder="Buyer / retailer" /></div>
+          <div><label className={labelCls}>Group stores by</label>
+            <select className={inputCls + " w-auto text-xs py-1"} value={pack.groupBy} onChange={(e) => setPack({ ...pack, groupBy: e.target.value })}><option value="format">Format</option><option value="region">Region</option><option value="cluster">Cluster</option></select></div>
+          <label className="text-xs text-slate-600 flex items-center gap-1.5 pb-1.5" title="Items removed to make room show as 'Item on the same shelf' with their sales rate only"><input type="checkbox" className="accent-amber-500" checked={pack.hideRemovedNames} onChange={(e) => setPack({ ...pack, hideRemovedNames: e.target.checked })} /> Hide names of items removed</label>
+        </div>
+        <div><label className={labelCls}>Note for the execution slide (optional)</label><input className={inputCls + " text-xs py-1"} value={pack.notes} onChange={(e) => setPack({ ...pack, notes: e.target.value })} placeholder="e.g. Store communication goes out two weeks before the set date" /></div>
+        <div className="flex flex-wrap items-center gap-3">
+          <button className={btnPrimary} disabled={packBusy || (plan.items || []).length === 0} onClick={downloadDeck}><Download size={14} /> {packBusy ? "Building…" : "Download PowerPoint"}</button>
+          <span className="text-xs text-slate-400">{packSlides.length} slides: {packSlides.map((s) => s.title).slice(0, 4).join(" · ")}…</span>
+        </div>
+        {packError && <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{packError}</div>}
+      </div>
+      <div className="border border-slate-200 rounded-lg p-3 space-y-2">
+        <div>
+          <div className="text-sm font-semibold text-slate-800">Minor reset</div>
+          <p className="text-xs text-slate-500">Drafts the quick follow-up for this plan: facings, stacking and case-pack changes to meet days of supply on the versions its approved drafts created, with product movement kept to the limit below. Anything beyond the limit is listed for a major reset. It only works on drafts you have already applied (approved in the queue).</p>
+        </div>
+        <div className="flex flex-wrap items-end gap-3">
+          <div><label className={labelCls} title="Each product removed from or added to a shelf counts as one move">Most products to move per planogram</label>
+            <input type="number" min="0" max="50" className={inputCls + " w-24 text-xs py-1"} value={maxMoves} onChange={(e) => setMaxMoves(clamp(Math.round(Number(e.target.value) || 0), 0, 50))} /></div>
+          <button className={btnPrimary} disabled={!canReset || resetBusy} onClick={runMinorReset}><Sparkles size={14} /> {resetBusy ? "Drafting…" : "Draft minor reset for review"}</button>
+        </div>
+        {resetError && <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{resetError}</div>}
+        {resetOut && (
+          <div className="space-y-1">
+            {resetOut.filter((r) => r.ok).map((r) => (
+              <div key={r.proposalId || r.planogramId} className="flex flex-wrap items-center gap-x-3 text-sm">
+                <span className="font-medium text-slate-800">{planogramById[r.planogramId]?.name || r.planogramId}</span>
+                <span className="text-xs text-slate-500">{r.result.changes.length} change{r.result.changes.length === 1 ? "" : "s"}, {r.result.movement?.moved ?? 0} product{(r.result.movement?.moved ?? 0) === 1 ? "" : "s"} moved{r.result.movement?.trimmed ? `, ${r.result.movement.trimmed} left for a major reset` : ""}</span>
+                {r.proposalId && onOpenProposal && <button className="text-xs text-amber-700 font-semibold hover:underline ml-auto" onClick={() => onOpenProposal(r.proposalId)}>Review</button>}
+              </div>
+            ))}
+            {resetOut.filter((r) => !r.ok).map((r, i) => <div key={i} className="text-xs text-amber-700">{planogramById[r.planogramId]?.name || r.planogramId}: {r.error}</div>)}
+            {resetOut.length === 0 && <div className="text-xs text-slate-400 italic">Nothing to draft.</div>}
+          </div>
+        )}
+      </div>
+      <div className="border border-slate-200 rounded-lg p-3 space-y-2">
+        <div>
+          <div className="text-sm font-semibold text-slate-800">Major reset</div>
+          <p className="text-xs text-slate-500">Re-lays each planogram from scratch: items grouped into blocks by your segmentation (biggest-selling block first), best sellers on the shelf nearest eye level, facings sized to days of supply. If the items need more width it adds sections. Nothing is removed silently: anything that cannot be placed is listed as skipped. Use it when the plan changes a lot; the minor reset above is for small sets.</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="text-xs text-slate-600 flex items-center gap-1.5"><input type="checkbox" className="accent-amber-500" checked={allowResize} onChange={(e) => setAllowResize(e.target.checked)} /> Add sections when the items need more room</label>
+          <span className="text-xs text-slate-400">Blocks by: {(segmentFieldIds || []).length ? (segmentFieldIds || []).map((id) => (productSchema || []).find((f) => f.id === id)?.label || id).join(" › ") : "no segmentation set (one block)"}</span>
+          <button className={btnPrimary} disabled={!canReset || majorBusy} onClick={runMajorReset}><Sparkles size={14} /> {majorBusy ? "Drafting…" : "Draft major reset for review"}</button>
+        </div>
+        {majorError && <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{majorError}</div>}
+        {majorOut && (
+          <div className="space-y-1">
+            {majorOut.filter((r) => r.ok).map((r) => (
+              <div key={r.proposalId || r.planogramId} className="flex flex-wrap items-center gap-x-3 text-sm">
+                <span className="font-medium text-slate-800">{planogramById[r.planogramId]?.name || r.planogramId}</span>
+                <span className="text-xs text-slate-500">{r.result.movement.items} items, {r.result.movement.moved} change shelf ({r.result.movement.pctMoved}%){r.result.major.sectionsAdded ? `, +${r.result.major.sectionsAdded} section${r.result.major.sectionsAdded === 1 ? "" : "s"}` : ""}</span>
+                {(r.result.skipped || []).length > 0 && <span className="text-xs text-red-600 font-semibold">{r.result.skipped.length} would drop off</span>}
+                {r.proposalId && onOpenProposal && <button className="text-xs text-amber-700 font-semibold hover:underline ml-auto" onClick={() => onOpenProposal(r.proposalId)}>Review</button>}
+              </div>
+            ))}
+            {majorOut.filter((r) => !r.ok).map((r, i) => <div key={i} className="text-xs text-amber-700">{planogramById[r.planogramId]?.name || r.planogramId}: {r.error}</div>)}
+          </div>
+        )}
+      </div>
+      <div>
+        <div className={labelCls}>Preview: what changes on each planogram</div>
+        <div className="border border-slate-200 rounded-lg divide-y divide-slate-100">
+          {(plan.items || []).map((it) => {
+            const pg = planogramById[it.planogramId];
+            const proposal = live[it.proposalId];
+            const changes = proposal?.proposed_change?.changes || [];
+            const isOpen = open.has(it.proposalId);
+            return (
+              <div key={it.proposalId} className="px-3 py-2">
+                <button className="w-full text-left flex flex-wrap items-center gap-x-4 gap-y-1" onClick={() => toggle(it.proposalId)}>
+                  <ChevronRight size={13} className={`text-slate-400 transition-transform ${isOpen ? "rotate-90" : ""}`} />
+                  <span className="text-sm font-medium text-slate-800">{pg?.name || it.planogramName}</span>
+                  <span className="text-xs text-emerald-700">+{it.adds.length} added</span>
+                  <span className="text-xs text-red-600">−{it.removes.length} removed</span>
+                  {it.facings > 0 && <span className="text-xs text-slate-500">{it.facings} facing change{it.facings === 1 ? "" : "s"}</span>}
+                  {fits[it.proposalId]?.ok && fits[it.proposalId].action !== "ok" && (
+                    <span className={`text-[10px] font-bold rounded px-1.5 py-0.5 border ${fits[it.proposalId].action === "add" ? "bg-amber-50 text-amber-700 border-amber-200" : "bg-blue-50 text-blue-700 border-blue-200"}`} title={fits[it.proposalId].reason}>
+                      {fits[it.proposalId].action === "add" ? `Needs ${fits[it.proposalId].sectionsNeeded} sections (has ${fits[it.proposalId].sectionCount})` : `Could be ${fits[it.proposalId].sectionsNeeded} section${fits[it.proposalId].sectionsNeeded === 1 ? "" : "s"} (has ${fits[it.proposalId].sectionCount})`}
+                    </span>
+                  )}
+                  {fits[it.proposalId]?.ok && fits[it.proposalId].action === "ok" && <span className="text-[10px] text-slate-400" title={fits[it.proposalId].reason}>Size fits</span>}
+                  {proposal && <span className="ml-auto text-[10px] uppercase tracking-wide font-bold text-slate-400">draft {proposal.status}</span>}
+                </button>
+                {isOpen && (
+                  <div className="mt-2 ml-5 text-xs space-y-1">
+                    {changes.length === 0 && <div className="text-slate-400 italic">{proposal ? "No change list on this draft." : "Loading the draft…"}</div>}
+                    {changes.map((c, i) => (
+                      <div key={i} className="flex gap-2">
+                        <span className={`w-16 shrink-0 font-semibold ${c.type === "addProduct" ? "text-emerald-700" : c.type === "delete" ? "text-red-600" : "text-slate-500"}`}>{c.type === "addProduct" ? "Add" : c.type === "delete" ? "Remove" : "Change"}</span>
+                        <span className="text-slate-800">{c.productName || c.productId}</span>
+                        <span className="text-slate-400">{c.reason || ""}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {(plan.items || []).length === 0 && <div className="px-3 py-3 text-xs text-slate-400 italic">This plan has no changes.</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PlansView({ planograms, products, fixtures, performance, dosTargets, stores, productSchema, segmentFieldIds, assumptions, canEdit, initialPlanId, onOpenProposal, onDrafted }) {
+  const [plans, setPlans] = useState({ loaded: false, ok: true, rows: [], error: "" });
+  const [approved, setApproved] = useState({ loaded: false, rows: [] });
+  const [openId, setOpenId] = useState(initialPlanId || null);
+  const [creating, setCreating] = useState(false);
+  const [form, setForm] = useState({ name: "", category: "", effective_date: "", review_by: "", notes: "" });
+  const [selected, setSelected] = useState(() => new Set());
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [statusFilter, setStatusFilter] = useState("open");
+  const planogramById = React.useMemo(() => Object.fromEntries((planograms || []).map((p) => [p.id, p])), [planograms]);
+  const reload = useCallback(async () => {
+    const r = await loadAssortmentPlans();
+    setPlans({ loaded: true, ok: r.ok, rows: r.rows, error: r.error || "" });
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+  const startCreate = async () => {
+    setCreating(true); setError("");
+    const r = await loadApprovedAssortmentProposals();
+    setApproved({ loaded: true, rows: r.rows });
+    if (!r.ok) setError("Couldn't read the approved drafts.");
+  };
+  const available = React.useMemo(() => proposalsAvailableForPlan(approved.rows, plans.rows, { category: form.category, planogramById }), [approved.rows, plans.rows, form.category, planogramById]);
+  const categories = React.useMemo(() => Array.from(new Set(approved.rows.map((p) => planogramById[p.target_id]?.category).filter(Boolean))).sort(), [approved.rows, planogramById]);
+  const toggleSel = (id) => setSelected((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  const create = async () => {
+    setBusy(true); setError("");
+    try {
+      const chosen = available.filter((p) => selected.has(p.id));
+      const items = chosen.map((p) => planItemFromProposal(p, planogramById[p.target_id]?.name));
+      const saved = await saveAssortmentPlan({ ...form, proposal_ids: chosen.map((p) => p.id), items });
+      setCreating(false); setSelected(new Set()); setForm({ name: "", category: "", effective_date: "", review_by: "", notes: "" });
+      await reload(); setOpenId(saved.id);
+    } catch (e) { setError(e?.message || "Couldn't create the plan."); }
+    finally { setBusy(false); }
+  };
+  const onSave = async (plan) => { const saved = await saveAssortmentPlan(plan); await reload(); return saved; };
+  const onDelete = async (plan) => {
+    if (!window.confirm(`Delete the plan "${plan.name}"? The drafts it lists stay as they are.`)) return;
+    try { await deleteAssortmentPlan(plan.id); setOpenId(null); await reload(); } catch (e) { window.alert(e?.message || "Couldn't delete the plan."); }
+  };
+  if (!plans.loaded) return <div className="text-xs text-slate-400 flex items-center gap-2"><RefreshCw size={12} className="animate-spin" /> Loading plans…</div>;
+  if (!plans.ok) return <div className="text-sm rounded-md px-3 py-2 bg-amber-50 text-amber-800 border border-amber-200">Plans aren't available yet{plans.error ? ` (${plans.error})` : ""}. Run the latest supabase/schema.sql in Supabase.</div>;
+  const open = plans.rows.find((p) => p.id === openId);
+  const shown = plans.rows.filter((p) => statusFilter === "all" || (statusFilter === "open" ? !["executed", "cancelled"].includes(p.status) : p.status === statusFilter));
+  const today = todayISO();
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-3">
+        <p className="text-xs text-slate-500 flex-1 min-w-[260px]">A plan collects the assortment drafts you approved, with the dates and status the reset teams plan around. Preview it, share a link, or download it.</p>
+        <select className={inputCls + " w-auto text-xs py-1"} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+          <option value="open">Open plans</option><option value="all">All plans</option>{PLAN_STATUSES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+        </select>
+        {canEdit && <button className={btnPrimary} onClick={startCreate}><Plus size={14} /> New plan from approved drafts</button>}
+      </div>
+      {error && <div className="text-sm rounded-md px-3 py-2 bg-red-50 text-red-700 border border-red-200">{error}</div>}
+      {creating && (
+        <div className="bg-white border border-amber-200 rounded-lg p-4 space-y-3">
+          <div className="flex flex-wrap gap-3">
+            <div className="flex-1 min-w-[240px]"><label className={labelCls}>Plan name</label><input className={inputCls} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. Bath Tissue — Spring 2027 set" /></div>
+            <div><label className={labelCls}>Category</label>
+              <select className={inputCls} value={form.category} onChange={(e) => { setForm({ ...form, category: e.target.value }); setSelected(new Set()); }}><option value="">All categories</option>{categories.map((c) => <option key={c} value={c}>{c}</option>)}</select></div>
+            <div><label className={labelCls}>Effective date</label><input type="date" className={inputCls} value={form.effective_date} onChange={(e) => setForm({ ...form, effective_date: e.target.value })} /></div>
+            <div><label className={labelCls}>Review by</label><input type="date" className={inputCls} value={form.review_by} onChange={(e) => setForm({ ...form, review_by: e.target.value })} /></div>
+          </div>
+          <div>
+            <div className="flex items-center gap-3 mb-1"><span className={labelCls + " mb-0"}>Approved drafts to include</span>
+              <button className="text-xs text-amber-700 hover:underline" onClick={() => setSelected(new Set(available.map((p) => p.id)))}>Select all ({available.length})</button>
+              <button className="text-xs text-slate-500 hover:underline" onClick={() => setSelected(new Set())}>Clear</button></div>
+            <div className="max-h-64 overflow-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+              {available.map((p) => {
+                const it = planItemFromProposal(p, planogramById[p.target_id]?.name);
+                return (
+                  <label key={p.id} className="flex items-center gap-3 px-3 py-1.5 text-xs cursor-pointer hover:bg-slate-50">
+                    <input type="checkbox" className="accent-amber-500" checked={selected.has(p.id)} onChange={() => toggleSel(p.id)} />
+                    <span className="font-medium text-slate-800 w-64 truncate">{it.planogramName}</span>
+                    <span className="text-emerald-700">+{it.adds.length}</span><span className="text-red-600">−{it.removes.length}</span>
+                    <span className="text-slate-400 truncate flex-1">{it.adds.slice(0, 3).join(", ")}{it.adds.length > 3 ? "…" : ""}</span>
+                    <span className="text-[10px] uppercase font-bold text-slate-400">{p.status}</span>
+                    <span className="text-slate-400">{p.reviewed_at ? new Date(p.reviewed_at).toLocaleDateString() : ""}</span>
+                  </label>
+                );
+              })}
+              {available.length === 0 && <div className="px-3 py-3 text-xs text-slate-400 italic">{approved.loaded ? "No approved assortment drafts are free to add. Approve drafts in the review queue first." : "Loading…"}</div>}
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <button className={btnPrimary} disabled={busy || !form.name.trim() || selected.size === 0} onClick={create}>{busy ? "Creating…" : `Create plan (${selected.size} planogram${selected.size === 1 ? "" : "s"})`}</button>
+            <button className={btnGhost} onClick={() => setCreating(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
+      {open && <PlanDetail key={open.id} plan={open} planograms={planograms} products={products} fixtures={fixtures} performance={performance} dosTargets={dosTargets} stores={stores} productSchema={productSchema} segmentFieldIds={segmentFieldIds} assumptions={assumptions} canEdit={canEdit} onSave={onSave} onDelete={() => onDelete(open)} onClose={() => setOpenId(null)} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
+      {openId && !open && <p className="text-sm text-amber-700">That plan no longer exists or can't be read.</p>}
+      <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead><tr className="text-left text-slate-400 uppercase tracking-wide border-b border-slate-100">
+            <th className="px-3 py-1.5 font-semibold">Plan</th><th className="px-2 py-1.5 font-semibold">Status</th><th className="px-2 py-1.5 font-semibold">Effective</th><th className="px-2 py-1.5 font-semibold">Review by</th>
+            <th className="px-2 py-1.5 font-semibold text-right">Planograms</th><th className="px-2 py-1.5 font-semibold text-right">Added</th><th className="px-2 py-1.5 font-semibold text-right">Removed</th>
+          </tr></thead>
+          <tbody className="divide-y divide-slate-100">
+            {shown.map((p) => {
+              const t = planTotals(p.items); const f = planDateFlags(p, today);
+              return (
+                <tr key={p.id} className={`cursor-pointer hover:bg-slate-50 ${p.id === openId ? "bg-amber-50/50" : ""}`} onClick={() => setOpenId(p.id)}>
+                  <td className="px-3 py-2"><div className="font-medium text-slate-800">{p.name}</div>{p.category && <div className="text-[10px] text-slate-400">{p.category}</div>}</td>
+                  <td className="px-2 py-2"><span className={`text-[10px] font-bold uppercase tracking-wide rounded px-1.5 py-0.5 border ${PLAN_STATUS_CLS[p.status] || ""}`}>{planStatusLabel(p.status)}</span></td>
+                  <td className={`px-2 py-2 ${f.late ? "text-red-600 font-semibold" : ""}`} title={f.late ? "Past its effective date and not executed" : ""}>{p.effective_date || "—"}</td>
+                  <td className={`px-2 py-2 ${f.reviewDue ? "text-amber-700 font-semibold" : ""}`}>{p.review_by || "—"}</td>
+                  <td className="px-2 py-2 text-right">{t.planograms}</td><td className="px-2 py-2 text-right text-emerald-700">+{t.adds}</td><td className="px-2 py-2 text-right text-red-600">−{t.removes}</td>
+                </tr>
+              );
+            })}
+            {shown.length === 0 && <tr><td colSpan={7} className="px-3 py-5 text-center text-slate-400 italic">No plans yet.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 // ---- The tab -------------------------------------------------------------------------------------------------
 
-function AssortmentModule({ products, planograms, fixtures, stores, performance, productSchema, storeSchema, planogramSchema, primaryKeyField, onCreateProduct, onUpdateProduct, onDeleteProduct, onOpenProposal, onDrafted }) {
+function AssortmentModule({ dosTargets = [], canEditPlans = true, initialPlanId = null, products, planograms, fixtures, stores, performance, productSchema, storeSchema, planogramSchema, primaryKeyField, onCreateProduct, onUpdateProduct, onDeleteProduct, onOpenProposal, onDrafted }) {
   const [cfg, setCfgState] = useState(ASSORT_DEFAULT_CFG);
   const [loaded, setLoaded] = useState(false);
-  const [view, setView] = useState("segments"); // segments | slow | core | newItems | recommend
+  const [view, setView] = useState(initialPlanId ? "plans" : "segments"); // segments | slow | core | newItems | recommend | plans
   const saveTimer = useRef(null);
 
   useEffect(() => {
@@ -13016,7 +13423,7 @@ function AssortmentModule({ products, planograms, fixtures, stores, performance,
   );
   const tree = React.useMemo(() => segmentTree(ctx), [ctx]);
 
-  const tabs = [["segments", "Segments"], ["slow", "Slow movers"], ["core", "Core items"], ["newItems", "New items"], ["recommend", "Recommendations"]];
+  const tabs = [["segments", "Segments"], ["slow", "Slow movers"], ["core", "Core items"], ["newItems", "New items"], ["recommend", "Recommendations"], ["plans", "Plans"]];
   return (
     <div>
       <div className="flex items-center justify-between mb-1">
@@ -13036,6 +13443,7 @@ function AssortmentModule({ products, planograms, fixtures, stores, performance,
           {view === "slow" && <SlowMoversView ctx={ctx} cfg={cfg} setCfg={setCfg} segLabel="" storeSchema={storeSchema} />}
           {view === "core" && <CoreItemsView ctx={ctx} cfg={cfg} setCfg={setCfg} planogramFilter={planogramFilter} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
           {view === "newItems" && <NewItemsView ctx={ctx} products={products} productSchema={productSchema} categories={categories} primaryKeyField={primaryKeyField} cfg={cfg} onCreate={onCreateProduct} onUpdate={onUpdateProduct} onDelete={onDeleteProduct} />}
+          {view === "plans" && <PlansView planograms={planograms} products={products} fixtures={fixtures} performance={performance} dosTargets={dosTargets} stores={stores} productSchema={productSchema} segmentFieldIds={cfg.segmentFieldIds} assumptions={cfg.assumptions} canEdit={canEditPlans} initialPlanId={initialPlanId} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
           {view === "recommend" && <RecommendationsView ctx={ctx} products={products} cfg={cfg} setCfg={setCfg} planogramFilter={planogramFilter} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
         </>
       )}
@@ -13306,6 +13714,7 @@ function AppContent({ session }) {
         if (upcLk) setUpcLookup({ ...DEFAULT_UPC_LOOKUP, ...migrateUpcLookup(JSON.parse(upcLk)) });
         if (capWarn !== null) setCapacityWarningsEnabled(capWarn === "true");
         if (savedMode) setAppModeState(savedMode);
+        if (planIdFromHash(window.location.hash) && !isRestricted) setAppModeState("assortment"); // a shared plan link opens the Assortment Planner
         if (savedStoreId) setSelectedStoreIdState(savedStoreId);
         if (savedEvents) setEvents(JSON.parse(savedEvents));
         if (savedEventTypes) setEventTypes(JSON.parse(savedEventTypes));
@@ -13951,7 +14360,7 @@ function AppContent({ session }) {
           </div>
         </div>
         <div className="p-6 max-w-[1400px] mx-auto">
-          <AssortmentModule
+          <AssortmentModule dosTargets={dosTargets} canEditPlans={isPlanner} initialPlanId={planIdFromHash(window.location.hash)}
             products={products} planograms={planograms} fixtures={fixtures} stores={stores} performance={performance}
             productSchema={productSchema} storeSchema={storeSchema} planogramSchema={planogramSchema} primaryKeyField={primaryKeyField}
             onCreateProduct={createProduct} onUpdateProduct={updateProductEntity} onDeleteProduct={deleteProductEntity}

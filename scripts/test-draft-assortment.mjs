@@ -150,4 +150,14 @@ await test("core mode: only core items with gaps are drafted, with a core-item r
   assert.equal((await call(fresh(), { body: { mode: "weird", newItemIds: ["ks1"], params } })).status, 400);
   assert.equal((await call(fresh(), { body: { newItemIds: ["n1"], params: { ...params, assumptions: { coreMaxCv: -1 } } } })).status, 400);
 });
+await test("the proposal carries what it is expected to add, so a plan can quote it", async () => {
+  const db = fresh();
+  await call(db);
+  const impact = db.t.proposals[0].proposed_change.assortment.impact;
+  assert.equal(impact.metric, "sales");
+  assert.ok(impact.netNetworkWeek > 0, "positive weekly impact");
+  assert.equal(impact.items[0].name, "N1"); assert.ok(impact.items[0].stores >= 1); assert.equal(impact.items[0].basis != null, true);
+  assert.equal(db.t.proposals[0].proposed_change.assortment.kind, "new");
+  assert.ok(impact.items[0].gainNetworkWeek > 0 && impact.items[0].lossNetworkWeek >= 0); assert.ok(Math.abs(impact.items[0].gainNetworkWeek - impact.items[0].lossNetworkWeek - impact.items[0].netNetworkWeek) < 0.05, "gain - loss = net");
+});
 console.log(`\n${passed} passed`);

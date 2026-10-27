@@ -273,4 +273,63 @@ await test("rejected callers and bad input write nothing", async () => {
   assert.equal((t.proposals || []).length, 0); assert.equal((t.activity_log || []).length, 0);
 });
 
+
+// ---- Minor reset from an Assortment plan ----------------------------------------------------------------------------
+const PLAN = "11111111-1111-1111-1111-111111111111", PR_APPLIED = "22222222-2222-2222-2222-222222222222", PR_PENDING = "33333333-3333-3333-3333-333333333333";
+const planTables = (planStatus = "approved") => {
+  const t = baseTables();
+  t.assortment_plans = [{ id: PLAN, name: "Spring set", status: planStatus, proposal_ids: [PR_APPLIED, PR_PENDING] }];
+  t.proposals = [{ id: PR_APPLIED, target_id: "srcX", status: "applied", applied_id: "pog1" }, { id: PR_PENDING, target_id: "srcY", status: "pending", applied_id: null }];
+  return t;
+};
+const planDb = (status) => makeDb({ tables: planTables(status), tokens });
+await test("plan mode drafts the applied versions only, and names the draft that still needs applying", async () => {
+  const db = planDb();
+  const res = await call(db, { body: { planId: PLAN, maxMoves: 5, lookbackWeeks: 8 } });
+  assert.equal(res.status, 200);
+  const { results } = await res.json();
+  const ok = results.filter((r) => r.ok), bad = results.filter((r) => !r.ok);
+  assert.equal(ok.length, 1); assert.equal(ok[0].planogramId, "pog1");
+  assert.equal(bad.length, 1); assert.match(bad[0].error, /apply it first/);
+  assert.equal(ok[0].result.minor.planName, "Spring set");
+  assert.match(db.calls.length ? JSON.stringify(ok[0].result.movement) : "", /"moved":2/);
+  assert.equal(ok[0].result.changes.length, 4);
+});
+await test("the movement limit trims extra moves into skipped and keeps facing changes", async () => {
+  const { results } = await (await call(planDb(), { body: { planId: PLAN, maxMoves: 1, lookbackWeeks: 8 } })).json();
+  const r = results.find((x) => x.ok);
+  const types = r.result.changes.map((c) => c.type).sort();
+  assert.deepEqual(types, ["delete", "increaseFacings", "reduceFacings"]);
+  assert.equal(r.result.movement.trimmed, 1);
+  assert.ok(r.result.skipped.some((s) => s.productId === "M" && /major reset/.test(s.reason)));
+  const none = (await (await call(planDb(), { body: { planId: PLAN, maxMoves: 0, lookbackWeeks: 8 } })).json()).results.find((x) => x.ok);
+  assert.equal(none.result.changes.filter((c) => c.type === "delete" || c.type === "addProduct").length, 0);
+  assert.equal(none.result.changes.length, 2);
+});
+await test("plan mode refuses a cancelled or executed plan, a missing plan, and bad input", async () => {
+  assert.equal((await call(planDb("cancelled"), { body: { planId: PLAN } })).status, 409);
+  assert.equal((await call(planDb("executed"), { body: { planId: PLAN } })).status, 409);
+  assert.equal((await call(planDb(), { body: { planId: "44444444-4444-4444-4444-444444444444" } })).status, 404);
+  assert.equal((await call(planDb(), { body: { planId: "nope" } })).status, 400);
+  assert.equal((await call(planDb(), { body: { planId: PLAN, maxMoves: 99 } })).status, 400);
+  assert.equal((await call(planDb(), { token: "tok-store", body: { planId: PLAN } })).status, 403);
+});
+
+await test("major mode re-lays the plan's applied versions and records a major reset proposal", async () => {
+  const db = planDb();
+  const res = await call(db, { body: { planId: PLAN, mode: "major", segmentFieldIds: ["fcat"], lookbackWeeks: 8 } });
+  assert.equal(res.status, 200);
+  const { results } = await res.json();
+  const ok = results.find((r) => r.ok);
+  assert.ok(ok, JSON.stringify(results)); assert.equal(ok.planogramId, "pog1");
+  assert.ok(ok.result.changes.some((c) => c.type === "setLayout" || c.type === "addSection") || ok.result.movement.moved === 0);
+  assert.equal(ok.result.majorPlan.planName, "Spring set"); assert.ok(ok.result.movement.items >= 1);
+});
+await test("major mode needs a plan and sane options", async () => {
+  assert.equal((await call(planDb(), { body: { planogramIds: ["pog1"], mode: "major" } })).status, 400);
+  assert.equal((await call(planDb(), { body: { planId: PLAN, mode: "huge" } })).status, 400);
+  assert.equal((await call(planDb(), { body: { planId: PLAN, mode: "major", segmentFieldIds: "x" } })).status, 400);
+  assert.equal((await call(planDb(), { body: { planId: PLAN, mode: "major", allowResize: "yes" } })).status, 400);
+  assert.equal((await call(planDb(), { token: "tok-store", body: { planId: PLAN, mode: "major" } })).status, 403);
+});
 console.log(`\n${passed} passed${process.exitCode ? ", with failures" : ""}`);
