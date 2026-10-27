@@ -90,6 +90,28 @@ export function windowsFor(performance, weeks, compare) {
 }
 
 // Everything the screens and the recommender share, computed once for a (category, scope, period).
+// The planograms that will be on the shelf on `asOf`, one version per family. Each version with a date counts
+// from that date, whether it is Live, Approved, Pending or still a work-in-progress that a plan has scheduled
+// (so a later plan builds on an earlier plan's version). A family with no dated change keeps what is live.
+// Returns the original planogram objects (not copies) so fingerprints and ids stay the same.
+export function planogramsAsOf(planograms, asOf) {
+  const fam = new Map();
+  (planograms || []).forEach((p) => { const k = p.masterId || p.id; if (!fam.has(k)) fam.set(k, []); fam.get(k).push(p); });
+  const out = [];
+  fam.forEach((members) => {
+    const eligible = members.filter((m) => {
+      const st = m.status || "wip";
+      const eff = effectivePlanogramStatus(m);
+      if (m.eventDate) return m.eventDate <= asOf && st !== "historical";
+      return eff === "live";
+    });
+    if (!eligible.length) return;
+    eligible.sort((a, b) => (a.eventDate || "").localeCompare(b.eventDate || "") || (a.versionNumber || 1) - (b.versionNumber || 1));
+    out.push(eligible[eligible.length - 1]);
+  });
+  return out;
+}
+
 export function buildContext(data, params) {
   const { products, planograms, fixtures, performance, stores, productSchema } = data;
   const category = params.category || "";
@@ -104,8 +126,8 @@ export function buildContext(data, params) {
   const win = windowsFor(performance || {}, weeks, compare);
 
   // planograms of this category that are (or are about to be) on shelves in the scope
-  const pogs = (planograms || [])
-    .filter((p) => (p.category || "") === category && ["live", "pending"].includes(effectivePlanogramStatus(p)))
+  const asOf = /^\d{4}-\d{2}-\d{2}$/.test(params.asOf || "") ? params.asOf : "";
+  const pogs = (asOf ? planogramsAsOf(planograms, asOf).filter((p) => (p.category || "") === category) : (planograms || []).filter((p) => (p.category || "") === category && ["live", "pending"].includes(effectivePlanogramStatus(p))))
     .filter((p) => !pf || attrText(p, pf.fieldId) === pf.value)
     .map((p) => ({ planogram: p, storeIds: (p.storeIds || []).filter((id) => scope.storeIds.has(id)) }))
     .filter((x) => x.storeIds.length > 0);

@@ -331,7 +331,7 @@ export async function saveAssortmentPlan(plan) {
   const row = {
     name: plan.name, category: plan.category || null, status: plan.status || "draft",
     effective_date: plan.effective_date || null, review_by: plan.review_by || null, notes: plan.notes || null,
-    proposal_ids: plan.proposal_ids || [], items: plan.items || [],
+    proposal_ids: plan.proposal_ids || [], items: plan.items || [], event_id: plan.event_id || null,
   };
   const q = plan.id ? supabase.from("assortment_plans").update(row).eq("id", plan.id) : supabase.from("assortment_plans").insert(row);
   const { data, error } = await q.select("*").maybeSingle();

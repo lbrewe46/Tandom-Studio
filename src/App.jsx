@@ -16,7 +16,7 @@ import {
 } from "./lib/db.js";
 import { spaceFit, createFitCache } from "../supabase/functions/_shared/space-fit.js";
 import { downloadPack } from "./lib/pack-pptx.js";
-import { PLAN_STATUSES, buildPack, contextRows, storeGroups, planStatusLabel, planItemFromProposal, planTotals, proposalsAvailableForPlan, planRows, planDateFlags, planLink, planIdFromHash } from "./lib/plans.js";
+import { PLAN_STATUSES, buildPack, contextRows, storeGroups, planStatusLabel, planItemFromProposal, planTotals, proposalsAvailableForPlan, planRows, planDateFlags, planLink, planIdFromHash, planVersionIds, eventLinkChanges, eventDrift, planSequence, planTimeline } from "./lib/plans.js";
 import { startUsageTracking } from "./lib/usage.js";
 import { coreProfile, coreForecasts, coreValueScale, buildContext, segmentTree, slowMovers, forecastFor, recommend, scopeOptions, DEFAULT_ASSUMPTIONS } from "../supabase/functions/_shared/assortment.js";
 
@@ -11258,6 +11258,16 @@ function EventForm({ event, eventTypes, planograms, onSave, onCancel, onDelete }
             </div>
           )}
           <Field label="Linked Planograms (optional)">
+            {planograms.length > 0 && (
+              <div className="flex flex-wrap items-center gap-3 mb-1 text-xs">
+                <button type="button" className="text-amber-700 hover:underline" onClick={() => setLinkedPlanogramIds(planograms.map((p) => p.id))}>Select all ({planograms.length})</button>
+                {category && planograms.some((p) => p.category === category) && (
+                  <button type="button" className="text-amber-700 hover:underline" onClick={() => setLinkedPlanogramIds((prev) => Array.from(new Set([...prev, ...planograms.filter((p) => p.category === category).map((p) => p.id)])))}>Select all in {category}</button>
+                )}
+                <button type="button" className="text-slate-500 hover:underline" onClick={() => setLinkedPlanogramIds([])}>Clear</button>
+                <span className="text-slate-400 ml-auto">{linkedPlanogramIds.length} selected</span>
+              </div>
+            )}
             <div className="max-h-32 overflow-y-auto border border-slate-200 rounded-lg p-2 space-y-1">
               {planograms.length === 0 ? (
                 <p className="text-xs text-slate-400 italic">No planograms yet.</p>
@@ -12052,7 +12062,7 @@ function RegionalEscalationsView() {
 /* (the calculations live in supabase/functions/_shared/assortment.js)  */
 /* ------------------------------------------------------------------ */
 
-const ASSORT_DEFAULT_CFG = { category: "", segmentFieldIds: [], planogramFilter: { fieldId: "", value: "" }, scope: { type: "all", value: "" }, weeks: 13, compare: "prior", groupBy: "region", coreOverrides: {}, assumptions: { ...DEFAULT_ASSUMPTIONS } };
+const ASSORT_DEFAULT_CFG = { category: "", segmentFieldIds: [], planogramFilter: { fieldId: "", value: "" }, scope: { type: "all", value: "" }, weeks: 13, compare: "prior", groupBy: "region", coreOverrides: {}, asOf: "", assumptions: { ...DEFAULT_ASSUMPTIONS } };
 const moneyA = (n) => (n === null || n === undefined || !Number.isFinite(n) ? "—" : `${n < 0 ? "-" : ""}$${Math.abs(Math.round(n)).toLocaleString()}`);
 const money2A = (n) => (n === null || n === undefined || !Number.isFinite(n) ? "—" : `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`);
 const growthA = (g) => (g === null || g === undefined ? "—" : `${g >= 0 ? "+" : ""}${(g * 100).toFixed(1)}%`);
@@ -12240,6 +12250,13 @@ function AssortmentFilterBar({ cfg, setCfg, categories, stores, storeSchema, pla
           </div>
         </div>
       )}
+      <div title="Plan for the shelf as it will be on this date: versions scheduled by earlier plans or events count from their date.">
+        <label className={labelCls}>Shelf as of</label>
+        <div className="flex items-center gap-1">
+          <input type="date" className={inputCls + " w-auto text-xs py-1"} value={cfg.asOf || ""} onChange={(e) => set({ asOf: e.target.value })} />
+          {cfg.asOf && <button className="text-[11px] text-slate-500 hover:underline" onClick={() => set({ asOf: "" })}>Today</button>}
+        </div>
+      </div>
       <div>
         <label className={labelCls}>Period</label>
         <AssortSelect value={String(cfg.weeks)} onChange={(w) => set({ weeks: Number(w) })}>
@@ -12758,7 +12775,7 @@ function RecommendationsView({ ctx, products, cfg, setCfg, planogramFilter, onOp
     try {
       const res = await invokeEdgeFunction("draft-assortment", {
         newItemIds: chosen,
-        params: { category: cfg.category, scope: cfg.scope.type === "all" ? { type: "all" } : cfg.scope, planogramFilter, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds, assumptions: { metric: a.metric, cannibalization: a.cannibalization, transfer: a.transfer, maxRemovalsPerAdd: a.maxRemovalsPerAdd } },
+        params: { category: cfg.category, asOf: cfg.asOf || undefined, scope: cfg.scope.type === "all" ? { type: "all" } : cfg.scope, planogramFilter, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds, assumptions: { metric: a.metric, cannibalization: a.cannibalization, transfer: a.transfer, maxRemovalsPerAdd: a.maxRemovalsPerAdd } },
         exclude: [...exclude], protect: [...protect],
       });
       setDraftResult(res);
@@ -12889,7 +12906,7 @@ function CoreItemsView({ ctx, cfg, setCfg, planogramFilter, onOpenProposal, onDr
     try {
       const res = await invokeEdgeFunction("draft-assortment", {
         mode: "core", newItemIds: chosen, coreOverrides: overrides,
-        params: { category: cfg.category, scope: cfg.scope.type === "all" ? { type: "all" } : cfg.scope, planogramFilter, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds,
+        params: { category: cfg.category, asOf: cfg.asOf || undefined, scope: cfg.scope.type === "all" ? { type: "all" } : cfg.scope, planogramFilter, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds,
           assumptions: { metric: a.metric, cannibalization: a.cannibalization, transfer: a.transfer, maxRemovalsPerAdd: a.maxRemovalsPerAdd, coreMinWeeksSelling: a.coreMinWeeksSelling, coreMaxCv: a.coreMaxCv, coreSalesShare: a.coreSalesShare, coreMinCoverage: a.coreMinCoverage } },
         exclude: [...exclude], protect: [...protect],
       });
@@ -13015,7 +13032,7 @@ const PLAN_STATUS_CLS = {
   scheduled: "bg-amber-50 text-amber-700 border-amber-200", executed: "bg-slate-800 text-white border-slate-800", cancelled: "bg-red-50 text-red-600 border-red-200",
 };
 
-function PlanDetail({ plan, planograms, products, fixtures, performance, dosTargets, stores, productSchema, segmentFieldIds, assumptions, canEdit, onSave, onDelete, onClose, onOpenProposal, onDrafted }) {
+function PlanDetail({ plan, seq, onOpenPlan, events = [], onApplyEvent, planograms, products, fixtures, performance, dosTargets, stores, productSchema, segmentFieldIds, assumptions, canEdit, onSave, onDelete, onClose, onOpenProposal, onDrafted }) {
   const [draft, setDraft] = useState(plan);
   const [maxMoves, setMaxMoves] = useState(5);
   const [pack, setPack] = useState(() => ({ preparedBy: readLocalJSON("assortPackPreparedBy", ""), preparedFor: "", hideRemovedNames: false, notes: "", groupBy: "format" }));
@@ -13076,7 +13093,7 @@ function PlanDetail({ plan, planograms, products, fixtures, performance, dosTarg
   const [copied, setCopied] = useState(false);
   const [live, setLive] = useState({}); // proposalId -> current proposal row (status + change list) for the preview
   const [open, setOpen] = useState(() => new Set());
-  const dirty = ["name", "status", "effective_date", "review_by", "notes"].some((k) => (draft[k] || "") !== (plan[k] || ""));
+  const dirty = ["name", "status", "effective_date", "review_by", "notes", "event_id"].some((k) => (draft[k] || "") !== (plan[k] || ""));
   useEffect(() => {
     let cancelled = false;
     loadProposalsByIds(plan.proposal_ids || []).then((r) => { if (!cancelled && r.ok) setLive(Object.fromEntries(r.rows.map((p) => [p.id, p]))); });
@@ -13100,6 +13117,27 @@ function PlanDetail({ plan, planograms, products, fixtures, performance, dosTarg
     setSaving(true); setError("");
     try { const saved = await onSave({ ...draft, ...patch }); setDraft(saved); } catch (e) { setError(e?.message || "Couldn't save the plan."); }
     finally { setSaving(false); }
+  };
+  const planEvent = events.find((e) => e.id === draft.event_id) || null;
+  const savedEvent = events.find((e) => e.id === plan.event_id) || null;
+  const drift = eventDrift(plan, savedEvent);
+  const versionIds = planVersionIds(plan, live);
+  const [linkMsg, setLinkMsg] = useState("");
+  // Stamp the event's start date on the versions this plan made. Approved/pending ones already have a schedule, so ask first.
+  const pushEventDate = (ev) => {
+    const ch = eventLinkChanges(planograms, versionIds, ev);
+    let moving = ch.move;
+    if (ch.confirm.length && window.confirm(`${ch.confirm.length} version(s) are already approved or pending (${ch.confirm.slice(0, 3).map((p) => p.name).join(", ")}${ch.confirm.length > 3 ? "…" : ""}). Move them to ${ev.startDate} as well?`)) moving = [...moving, ...ch.confirm];
+    if (onApplyEvent) onApplyEvent(moving.map((p) => p.id), ev);
+    setLinkMsg(moving.length ? `${moving.length} version(s) now carry the event date ${ev.startDate}.` : "No existing versions needed a new date. Versions made from now on will get it automatically.");
+  };
+  const pickEvent = (id) => {
+    const ev = events.find((e) => e.id === id);
+    setDraft({ ...draft, event_id: id || null, effective_date: ev ? (ev.startDate || draft.effective_date || "") : draft.effective_date, category: draft.category || ev?.category || draft.category });
+  };
+  const saveAndLink = async () => {
+    await save({});
+    if (planEvent && planEvent.id !== plan.event_id) pushEventDate(planEvent);
   };
   const share = async () => {
     try { await window.navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) { window.prompt("Copy this link", link); }
@@ -13126,13 +13164,36 @@ function PlanDetail({ plan, planograms, products, fixtures, performance, dosTarg
         </div>
         <div><label className={labelCls}>Status</label>
           <select className={inputCls} disabled={!canEdit} value={draft.status} onChange={(e) => setDraft({ ...draft, status: e.target.value })}>{PLAN_STATUSES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select></div>
-        <div><label className={labelCls}>Effective date</label><input type="date" className={inputCls} disabled={!canEdit} value={draft.effective_date || ""} onChange={(e) => setDraft({ ...draft, effective_date: e.target.value })} /></div>
+        <div><label className={labelCls}>Effective date</label><input type="date" className={inputCls} disabled={!canEdit || !!draft.event_id} title={draft.event_id ? "Set by the linked event" : ""} value={draft.effective_date || ""} onChange={(e) => setDraft({ ...draft, effective_date: e.target.value })} /></div>
         <div><label className={labelCls}>Review by</label><input type="date" className={inputCls} disabled={!canEdit} value={draft.review_by || ""} onChange={(e) => setDraft({ ...draft, review_by: e.target.value })} /></div>
       </div>
+      {seq && (seq.predecessors.length > 0 || seq.successors.length > 0 || seq.conflicts.length > 0 || seq.outOfOrder.length > 0 || seq.redraft.length > 0) && (
+        <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs space-y-1">
+          {seq.predecessors.length > 0 && <div>Builds on: {seq.predecessors.map((q) => <button key={q.id} className="text-amber-700 hover:underline mr-2" onClick={() => onOpenPlan && onOpenPlan(q.id)}>{q.name} ({q.date})</button>)}</div>}
+          {seq.successors.length > 0 && <div>Later plans build on this: {seq.successors.map((q) => <button key={q.id} className="text-amber-700 hover:underline mr-2" onClick={() => onOpenPlan && onOpenPlan(q.id)}>{q.name} ({q.date})</button>)}</div>}
+          {seq.outOfOrder.length > 0 && <div className="text-red-700">Approved ahead of an earlier plan that isn't: {seq.outOfOrder.join(", ")}. Approve the earlier plan first.</div>}
+          {seq.redraft.map((r, i) => <div key={i} className="text-amber-700">{r.planogram} was drafted before {r.behind} changed it. Run the assortment again with "Shelf as of" set to {plan.effective_date || "this plan's date"} so it builds on that version.</div>)}
+          {seq.conflicts.map((c, i) => <div key={i} className="text-red-700">{c}.</div>)}
+        </div>
+      )}
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="min-w-[260px]"><label className={labelCls}>Event Planner event</label>
+          <select className={inputCls} disabled={!canEdit} value={draft.event_id || ""} onChange={(e) => pickEvent(e.target.value)}>
+            <option value="">Not linked to an event</option>
+            {events.filter((e) => !plan.category || !e.category || e.category === plan.category || e.id === draft.event_id).map((e) => <option key={e.id} value={e.id}>{e.name} · {e.startDate || "no date"}</option>)}
+          </select></div>
+        {planEvent && <div className="text-xs text-slate-500 pb-2">Starts {planEvent.startDate || "—"}{planEvent.leadTimeWeeks ? ` · supplier deadline ${getSupplierDeadline(planEvent) || "—"}` : ""}. The effective date follows the event, and versions this plan creates carry it.</div>}
+      </div>
+      {drift && !drift.missing && <div className="text-xs rounded-md px-3 py-2 bg-amber-50 text-amber-800 border border-amber-200 flex flex-wrap items-center gap-2">The event now starts {drift.to}, but this plan says {drift.from || "no date"}.
+        {canEdit && <button className={btnGhost} onClick={async () => { await save({ effective_date: drift.to }); pushEventDate(savedEvent); }}>Update the plan and its versions</button>}</div>}
+      {drift?.missing && <div className="text-xs text-amber-700">The linked event no longer exists in the Event Planner.</div>}
+      {!drift && savedEvent && versionIds.length > 0 && eventLinkChanges(planograms, versionIds, savedEvent).move.length + eventLinkChanges(planograms, versionIds, savedEvent).confirm.length > 0 && canEdit &&
+        <div className="text-xs rounded-md px-3 py-2 bg-slate-50 text-slate-600 border border-slate-200 flex flex-wrap items-center gap-2">Some versions don't carry the event date yet.<button className={btnGhost} onClick={() => pushEventDate(savedEvent)}>Apply {savedEvent.startDate}</button></div>}
+      {linkMsg && <div className="text-xs text-emerald-700">{linkMsg}</div>}
       {(flags.late || flags.reviewDue) && <div className="text-xs text-amber-700">{flags.late ? "This plan is past its effective date and not executed. " : ""}{flags.reviewDue ? "Its review date has arrived." : ""}</div>}
       <div><label className={labelCls}>Notes</label><textarea rows={2} className={inputCls} disabled={!canEdit} value={draft.notes || ""} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} placeholder="Why these changes, who needs to act, store communications…" /></div>
       <div className="flex flex-wrap items-center gap-2">
-        {canEdit && <button className={btnPrimary} disabled={!dirty || saving || !draft.name.trim()} onClick={() => save({})}>{saving ? "Saving…" : "Save changes"}</button>}
+        {canEdit && <button className={btnPrimary} disabled={!dirty || saving || !draft.name.trim()} onClick={saveAndLink}>{saving ? "Saving…" : "Save changes"}</button>}
         <button className={btnGhost} onClick={share}><Link2 size={13} /> {copied ? "Link copied" : "Copy share link"}</button>
         <button className={btnGhost} onClick={download}><Download size={13} /> Download Excel</button>
         <button className={btnGhost} onClick={() => window.print()} title="Print or save as PDF"><Printer size={13} /> Print</button>
@@ -13261,17 +13322,50 @@ function PlanDetail({ plan, planograms, products, fixtures, performance, dosTarg
   );
 }
 
-function PlansView({ planograms, products, fixtures, performance, dosTargets, stores, productSchema, segmentFieldIds, assumptions, canEdit, initialPlanId, onOpenProposal, onDrafted }) {
+// One lane per category; each plan sits at its effective date. Plans that build on each other are joined by their order in the lane.
+function PlanTimeline({ plans, seq, today, openId, onOpen }) {
+  const tl = React.useMemo(() => planTimeline(plans, today), [plans, today]);
+  if (!tl.lanes.length) return <p className="text-sm text-slate-400 italic border border-dashed border-slate-300 rounded-lg p-6 text-center">No dated plans to show. Give a plan an effective date (or link it to an event).</p>;
+  return (
+    <div className="bg-white border border-slate-200 rounded-lg p-4 overflow-x-auto">
+      <div className="min-w-[640px]">
+        <div className="flex justify-between text-[10px] text-slate-400 mb-1 pl-32"><span>{tl.start}</span><span>{tl.end}</span></div>
+        {tl.lanes.map((lane) => (
+          <div key={lane.category} className="flex items-stretch border-t border-slate-100">
+            <div className="w-32 shrink-0 text-xs font-semibold text-slate-600 py-3 pr-2">{lane.category}</div>
+            <div className="relative flex-1 h-16">
+              <div className="absolute top-0 bottom-0 border-l border-dashed border-blue-300" style={{ left: `${tl.todayPct}%` }} title={`Today ${today}`} />
+              <div className="absolute left-0 right-0 top-1/2 border-t border-slate-200" />
+              {lane.plans.map((p, i) => {
+                const s = seq[p.id]; const bad = s && (s.conflicts.length || s.outOfOrder.length || s.redraft.length);
+                return (
+                  <button key={p.id} onClick={() => onOpen(p.id)} title={`${p.name} · ${p.date} · ${planStatusLabel(p.status)}`}
+                    className={`absolute -translate-x-1/2 max-w-[140px] truncate rounded px-1.5 py-0.5 text-[10px] font-semibold border ${PLAN_STATUS_CLS[p.status] || ""} ${bad ? "ring-2 ring-red-400" : ""} ${p.id === openId ? "outline outline-2 outline-amber-400" : ""}`}
+                    style={{ left: `${Math.min(92, Math.max(8, p.pct))}%`, top: i % 2 ? "58%" : "10%" }}>{p.name}</button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+        <p className="text-[10px] text-slate-400 mt-2">Dashed line is today. A red ring means the plan clashes with, or was drafted before, another plan on the same planogram.</p>
+      </div>
+    </div>
+  );
+}
+
+function PlansView({ events = [], onApplyEvent, planograms, products, fixtures, performance, dosTargets, stores, productSchema, segmentFieldIds, assumptions, canEdit, initialPlanId, onOpenProposal, onDrafted }) {
   const [plans, setPlans] = useState({ loaded: false, ok: true, rows: [], error: "" });
   const [approved, setApproved] = useState({ loaded: false, rows: [] });
   const [openId, setOpenId] = useState(initialPlanId || null);
   const [creating, setCreating] = useState(false);
-  const [form, setForm] = useState({ name: "", category: "", effective_date: "", review_by: "", notes: "" });
+  const [form, setForm] = useState({ name: "", category: "", effective_date: "", review_by: "", notes: "", event_id: "" });
   const [selected, setSelected] = useState(() => new Set());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [statusFilter, setStatusFilter] = useState("open");
+  const [layout, setLayout] = useState("list"); // list | timeline
   const planogramById = React.useMemo(() => Object.fromEntries((planograms || []).map((p) => [p.id, p])), [planograms]);
+  const seq = React.useMemo(() => planSequence(plans.rows, planograms), [plans.rows, planograms]);
   const reload = useCallback(async () => {
     const r = await loadAssortmentPlans();
     setPlans({ loaded: true, ok: r.ok, rows: r.rows, error: r.error || "" });
@@ -13292,7 +13386,7 @@ function PlansView({ planograms, products, fixtures, performance, dosTargets, st
       const chosen = available.filter((p) => selected.has(p.id));
       const items = chosen.map((p) => planItemFromProposal(p, planogramById[p.target_id]?.name));
       const saved = await saveAssortmentPlan({ ...form, proposal_ids: chosen.map((p) => p.id), items });
-      setCreating(false); setSelected(new Set()); setForm({ name: "", category: "", effective_date: "", review_by: "", notes: "" });
+      setCreating(false); setSelected(new Set()); setForm({ name: "", category: "", effective_date: "", review_by: "", notes: "", event_id: "" });
       await reload(); setOpenId(saved.id);
     } catch (e) { setError(e?.message || "Couldn't create the plan."); }
     finally { setBusy(false); }
@@ -13311,6 +13405,7 @@ function PlansView({ planograms, products, fixtures, performance, dosTargets, st
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
         <p className="text-xs text-slate-500 flex-1 min-w-[260px]">A plan collects the assortment drafts you approved, with the dates and status the reset teams plan around. Preview it, share a link, or download it.</p>
+        <div className="flex rounded-md border border-slate-200 overflow-hidden text-xs">{[["list", "List"], ["timeline", "Timeline"]].map(([k, l]) => <button key={k} className={`px-2.5 py-1 ${layout === k ? "bg-slate-800 text-white" : "bg-white text-slate-600"}`} onClick={() => setLayout(k)}>{l}</button>)}</div>
         <select className={inputCls + " w-auto text-xs py-1"} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
           <option value="open">Open plans</option><option value="all">All plans</option>{PLAN_STATUSES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
         </select>
@@ -13323,7 +13418,11 @@ function PlansView({ planograms, products, fixtures, performance, dosTargets, st
             <div className="flex-1 min-w-[240px]"><label className={labelCls}>Plan name</label><input className={inputCls} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. Bath Tissue — Spring 2027 set" /></div>
             <div><label className={labelCls}>Category</label>
               <select className={inputCls} value={form.category} onChange={(e) => { setForm({ ...form, category: e.target.value }); setSelected(new Set()); }}><option value="">All categories</option>{categories.map((c) => <option key={c} value={c}>{c}</option>)}</select></div>
-            <div><label className={labelCls}>Effective date</label><input type="date" className={inputCls} value={form.effective_date} onChange={(e) => setForm({ ...form, effective_date: e.target.value })} /></div>
+            <div><label className={labelCls}>Event</label>
+              <select className={inputCls} value={form.event_id} onChange={(e) => { const ev = events.find((x) => x.id === e.target.value); setForm({ ...form, event_id: e.target.value, effective_date: ev?.startDate || form.effective_date }); }}>
+                <option value="">None</option>{events.filter((e) => !form.category || !e.category || e.category === form.category).map((e) => <option key={e.id} value={e.id}>{e.name} · {e.startDate || "no date"}</option>)}
+              </select></div>
+            <div><label className={labelCls}>Effective date</label><input type="date" className={inputCls} disabled={!!form.event_id} value={form.effective_date} onChange={(e) => setForm({ ...form, effective_date: e.target.value })} /></div>
             <div><label className={labelCls}>Review by</label><input type="date" className={inputCls} value={form.review_by} onChange={(e) => setForm({ ...form, review_by: e.target.value })} /></div>
           </div>
           <div>
@@ -13353,9 +13452,10 @@ function PlansView({ planograms, products, fixtures, performance, dosTargets, st
           </div>
         </div>
       )}
-      {open && <PlanDetail key={open.id} plan={open} planograms={planograms} products={products} fixtures={fixtures} performance={performance} dosTargets={dosTargets} stores={stores} productSchema={productSchema} segmentFieldIds={segmentFieldIds} assumptions={assumptions} canEdit={canEdit} onSave={onSave} onDelete={() => onDelete(open)} onClose={() => setOpenId(null)} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
+      {open && <PlanDetail key={open.id} plan={open} seq={seq[open.id]} onOpenPlan={setOpenId} events={events} onApplyEvent={onApplyEvent} planograms={planograms} products={products} fixtures={fixtures} performance={performance} dosTargets={dosTargets} stores={stores} productSchema={productSchema} segmentFieldIds={segmentFieldIds} assumptions={assumptions} canEdit={canEdit} onSave={onSave} onDelete={() => onDelete(open)} onClose={() => setOpenId(null)} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
       {openId && !open && <p className="text-sm text-amber-700">That plan no longer exists or can't be read.</p>}
-      <div className="bg-white border border-slate-200 rounded-lg overflow-x-auto">
+      {layout === "timeline" && <PlanTimeline plans={shown} seq={seq} today={today} openId={openId} onOpen={setOpenId} />}
+      <div className={`bg-white border border-slate-200 rounded-lg overflow-x-auto ${layout === "timeline" ? "hidden" : ""}`}>
         <table className="w-full text-xs">
           <thead><tr className="text-left text-slate-400 uppercase tracking-wide border-b border-slate-100">
             <th className="px-3 py-1.5 font-semibold">Plan</th><th className="px-2 py-1.5 font-semibold">Status</th><th className="px-2 py-1.5 font-semibold">Effective</th><th className="px-2 py-1.5 font-semibold">Review by</th>
@@ -13366,7 +13466,7 @@ function PlansView({ planograms, products, fixtures, performance, dosTargets, st
               const t = planTotals(p.items); const f = planDateFlags(p, today);
               return (
                 <tr key={p.id} className={`cursor-pointer hover:bg-slate-50 ${p.id === openId ? "bg-amber-50/50" : ""}`} onClick={() => setOpenId(p.id)}>
-                  <td className="px-3 py-2"><div className="font-medium text-slate-800">{p.name}</div>{p.category && <div className="text-[10px] text-slate-400">{p.category}</div>}</td>
+                  <td className="px-3 py-2"><div className="font-medium text-slate-800">{p.name}</div>{seq[p.id] && (seq[p.id].conflicts.length > 0 || seq[p.id].outOfOrder.length > 0 || seq[p.id].redraft.length > 0) && <span className="text-[10px] font-bold text-red-600 mr-1" title="Open the plan for details">Needs attention</span>}{seq[p.id]?.predecessors.length > 0 && <span className="text-[10px] text-slate-400 mr-1" title={seq[p.id].predecessors.map((q) => q.name).join(", ")}>builds on {seq[p.id].predecessors.length}</span>}{(p.category || p.event_id) && <div className="text-[10px] text-slate-400">{p.category}{p.event_id ? `${p.category ? " · " : ""}${(events.find((e) => e.id === p.event_id) || {}).name || "event removed"}` : ""}</div>}</td>
                   <td className="px-2 py-2"><span className={`text-[10px] font-bold uppercase tracking-wide rounded px-1.5 py-0.5 border ${PLAN_STATUS_CLS[p.status] || ""}`}>{planStatusLabel(p.status)}</span></td>
                   <td className={`px-2 py-2 ${f.late ? "text-red-600 font-semibold" : ""}`} title={f.late ? "Past its effective date and not executed" : ""}>{p.effective_date || "—"}</td>
                   <td className={`px-2 py-2 ${f.reviewDue ? "text-amber-700 font-semibold" : ""}`}>{p.review_by || "—"}</td>
@@ -13384,7 +13484,7 @@ function PlansView({ planograms, products, fixtures, performance, dosTargets, st
 
 // ---- The tab -------------------------------------------------------------------------------------------------
 
-function AssortmentModule({ dosTargets = [], canEditPlans = true, initialPlanId = null, products, planograms, fixtures, stores, performance, productSchema, storeSchema, planogramSchema, primaryKeyField, onCreateProduct, onUpdateProduct, onDeleteProduct, onOpenProposal, onDrafted }) {
+function AssortmentModule({ events = [], onApplyEvent, dosTargets = [], canEditPlans = true, initialPlanId = null, products, planograms, fixtures, stores, performance, productSchema, storeSchema, planogramSchema, primaryKeyField, onCreateProduct, onUpdateProduct, onDeleteProduct, onOpenProposal, onDrafted }) {
   const [cfg, setCfgState] = useState(ASSORT_DEFAULT_CFG);
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState(initialPlanId ? "plans" : "segments"); // segments | slow | core | newItems | recommend | plans
@@ -13417,9 +13517,9 @@ function AssortmentModule({ dosTargets = [], canEditPlans = true, initialPlanId 
   const planogramFilter = cfg.planogramFilter?.fieldId && cfg.planogramFilter?.value ? { ...cfg.planogramFilter, fieldLabel: (planogramSchema || []).find((f) => f.id === cfg.planogramFilter.fieldId)?.label } : undefined;
   const ctx = React.useMemo(
     () => buildContext({ products, planograms, fixtures, performance, stores, productSchema }, {
-      category: cfg.category, scope: scopeReady ? cfg.scope : { type: "all" }, planogramFilter, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds, assumptions: cfg.assumptions,
+      category: cfg.category, scope: scopeReady ? cfg.scope : { type: "all" }, planogramFilter, weeks: cfg.weeks, compare: cfg.compare, segmentFieldIds: cfg.segmentFieldIds, assumptions: cfg.assumptions, asOf: cfg.asOf || "",
     }),
-    [products, planograms, fixtures, performance, stores, productSchema, cfg.category, cfg.scope, planogramFilter?.fieldId, planogramFilter?.value, scopeReady, cfg.weeks, cfg.compare, cfg.segmentFieldIds, cfg.assumptions],
+    [products, planograms, fixtures, performance, stores, productSchema, cfg.category, cfg.scope, planogramFilter?.fieldId, planogramFilter?.value, scopeReady, cfg.weeks, cfg.compare, cfg.segmentFieldIds, cfg.assumptions, cfg.asOf],
   );
   const tree = React.useMemo(() => segmentTree(ctx), [ctx]);
 
@@ -13431,6 +13531,7 @@ function AssortmentModule({ dosTargets = [], canEditPlans = true, initialPlanId 
       </div>
       <p className="text-sm text-slate-500 mb-3">See which segments are growing, which items are slow, and where new items earn their space.</p>
       <AssortmentFilterBar cfg={cfg} setCfg={setCfg} categories={categories} stores={stores} storeSchema={storeSchema} planogramSchema={planogramSchema} planograms={planograms} />
+      {cfg.asOf && <p className="text-xs text-blue-700 mb-3">Showing the shelf as it will be on {cfg.asOf}: versions scheduled by earlier plans or events count from their date, and drafts are built on them.</p>}
       {!scopeReady && <p className="text-xs text-amber-700 mb-3">Choose a {cfg.scope.type} above; until then all stores are shown.</p>}
       <div className="flex gap-1 mb-4 border-b border-slate-200">
         {tabs.map(([id, label]) => (
@@ -13443,7 +13544,7 @@ function AssortmentModule({ dosTargets = [], canEditPlans = true, initialPlanId 
           {view === "slow" && <SlowMoversView ctx={ctx} cfg={cfg} setCfg={setCfg} segLabel="" storeSchema={storeSchema} />}
           {view === "core" && <CoreItemsView ctx={ctx} cfg={cfg} setCfg={setCfg} planogramFilter={planogramFilter} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
           {view === "newItems" && <NewItemsView ctx={ctx} products={products} productSchema={productSchema} categories={categories} primaryKeyField={primaryKeyField} cfg={cfg} onCreate={onCreateProduct} onUpdate={onUpdateProduct} onDelete={onDeleteProduct} />}
-          {view === "plans" && <PlansView planograms={planograms} products={products} fixtures={fixtures} performance={performance} dosTargets={dosTargets} stores={stores} productSchema={productSchema} segmentFieldIds={cfg.segmentFieldIds} assumptions={cfg.assumptions} canEdit={canEditPlans} initialPlanId={initialPlanId} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
+          {view === "plans" && <PlansView events={events} onApplyEvent={onApplyEvent} planograms={planograms} products={products} fixtures={fixtures} performance={performance} dosTargets={dosTargets} stores={stores} productSchema={productSchema} segmentFieldIds={cfg.segmentFieldIds} assumptions={cfg.assumptions} canEdit={canEditPlans} initialPlanId={initialPlanId} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
           {view === "recommend" && <RecommendationsView ctx={ctx} products={products} cfg={cfg} setCfg={setCfg} planogramFilter={planogramFilter} onOpenProposal={onOpenProposal} onDrafted={onDrafted} />}
         </>
       )}
@@ -13880,6 +13981,14 @@ function AppContent({ session }) {
       safeSet("settings:events", JSON.stringify(next));
       return next;
     });
+  };
+  // Stamp an event's start date on planogram versions (from an assortment plan linked to it) and list them on the event.
+  const applyEventToVersions = (ids, event) => {
+    if (!ids?.length || !event) return;
+    const set = new Set(ids);
+    planograms.filter((p) => set.has(p.id)).forEach((p) => updatePlanogramEntity({ ...p, eventDate: event.startDate }));
+    const linked = Array.from(new Set([...(event.linkedPlanogramIds || []), ...ids]));
+    updateEvent({ ...event, linkedPlanogramIds: linked });
   };
   const deleteEvent = (id) => {
     setEvents((prev) => {
@@ -14360,7 +14469,7 @@ function AppContent({ session }) {
           </div>
         </div>
         <div className="p-6 max-w-[1400px] mx-auto">
-          <AssortmentModule dosTargets={dosTargets} canEditPlans={isPlanner} initialPlanId={planIdFromHash(window.location.hash)}
+          <AssortmentModule events={events} onApplyEvent={applyEventToVersions} dosTargets={dosTargets} canEditPlans={isPlanner} initialPlanId={planIdFromHash(window.location.hash)}
             products={products} planograms={planograms} fixtures={fixtures} stores={stores} performance={performance}
             productSchema={productSchema} storeSchema={storeSchema} planogramSchema={planogramSchema} primaryKeyField={primaryKeyField}
             onCreateProduct={createProduct} onUpdateProduct={updateProductEntity} onDeleteProduct={deleteProductEntity}

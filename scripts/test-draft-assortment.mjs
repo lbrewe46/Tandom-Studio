@@ -85,10 +85,11 @@ await test("input validation", async () => {
   for (const body of ["nope", { newItemIds: [], params }, { newItemIds: 5, params }, { newItemIds: ["n1"], params: { ...params, category: "" } }, { newItemIds: ["n1"], params: { ...params, weeks: 0 } },
     { newItemIds: ["n1"], params: { ...params, scope: { type: "galaxy" } } }, { newItemIds: ["n1"], params: { ...params, scope: { type: "region" } } },
     { newItemIds: ["n1"], params: { ...params, assumptions: { metric: "vibes" } } }, { newItemIds: ["n1"], params: { ...params, assumptions: { cannibalization: 3 } } },
-    { newItemIds: ["n1"], params, exclude: "x" }, { newItemIds: ["ghost"], params }, { newItemIds: ["ks1"], params }]) {
+    { newItemIds: ["n1"], params: { ...params, asOf: "soon" } }, { newItemIds: ["n1"], params, exclude: "x" }, { newItemIds: ["ghost"], params }, { newItemIds: ["ks1"], params }]) {
     assert.equal((await call(fresh(), { body })).status, 400, JSON.stringify(body).slice(0, 80));
   }
   assert.ok(validateParams({ params }).params);
+  assert.equal(validateParams({ params: { ...params, asOf: "2027-03-01" } }).params.asOf, "2027-03-01");
 });
 await test("records one pending proposal per planogram, attributed to the assortment agent and the person", async () => {
   const db = fresh();

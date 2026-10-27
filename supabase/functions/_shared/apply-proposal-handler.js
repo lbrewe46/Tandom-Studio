@@ -32,6 +32,21 @@ async function fetchAll(db, table, columns, applyFilters = (q) => q) {
   }
 }
 
+// Best effort: the plan (if any) that lists this proposal, its event, and that event's startDate. Any
+// problem (no plans table yet, no event_id column) just means "no event date".
+export async function eventDateForProposal(db, proposalId) {
+  try {
+    const { data: plans, error } = await db.from("assortment_plans").select("id, event_id, proposal_ids, status");
+    if (error || !plans) return null;
+    const plan = plans.find((p) => p.event_id && p.status !== "cancelled" && (p.proposal_ids || []).includes(proposalId));
+    if (!plan) return null;
+    const { data: row } = await db.from("app_settings").select("value").eq("key", "settings:events").maybeSingle();
+    const events = typeof row?.value === "string" ? JSON.parse(row.value) : row?.value;
+    const ev = Array.isArray(events) ? events.find((e) => e.id === plan.event_id) : null;
+    return ev?.startDate || null;
+  } catch { return null; }
+}
+
 export async function handleApplyProposal(req, db) {
   const early = preflightOrWrongMethod(req);
   if (early) return early;
@@ -86,6 +101,10 @@ export async function handleApplyProposal(req, db) {
       resetDraft: undefined, // never inherit a pending review from the version it was drafted from
       aiDraft: { proposalId, sourceId: source.id, score: proposal.score ?? null },
     };
+
+    // A version made from a plan that's linked to an Event Planner event takes that event's start date.
+    const eventDate = await eventDateForProposal(db, proposalId);
+    if (eventDate) newPlanogram.eventDate = eventDate;
 
     const { data: appliedId, error: applyErr } = await db.rpc("apply_proposal", { p_id: proposalId, p_user: auth.user.id, p_planogram: newPlanogram });
     if (applyErr) {

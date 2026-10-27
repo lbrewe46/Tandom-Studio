@@ -112,3 +112,49 @@ test("the pack adds context, store-group and range slides when it has the data",
   assert.equal(buildPack(plan()).some((s) => s.kind === "range"), false, "no range without gain and loss");
 });
 console.log(`\n${passed} passed`);
+
+// ---- event link ----
+{
+  const { planVersionIds, eventLinkChanges, eventDrift } = await import("../src/lib/plans.js");
+  const pgs = [{ id: "a", status: "wip" }, { id: "b", status: "approved", eventDate: "2027-01-01" }, { id: "c", status: "live" }, { id: "d", status: "wip", eventDate: "2027-03-01" }];
+  const ev = { id: "e1", startDate: "2027-03-01" };
+  const ch = eventLinkChanges(pgs, ["a", "b", "c", "d", "zz"], ev);
+  assert.deepEqual(ch.move.map((p) => p.id), ["a"]);
+  assert.deepEqual(ch.confirm.map((p) => p.id), ["b"]);
+  assert.deepEqual(ch.skipped.map((p) => p.id), ["c"]);
+  assert.deepEqual(planVersionIds({ items: [{ proposalId: "p1" }, { proposalId: "p2" }] }, { p1: { applied_id: "a" } }), ["a"]);
+  assert.equal(eventDrift({ event_id: null }, null), null);
+  assert.deepEqual(eventDrift({ event_id: "e1", effective_date: "2027-02-01" }, ev), { from: "2027-02-01", to: "2027-03-01" });
+  assert.equal(eventDrift({ event_id: "e1", effective_date: "2027-03-01" }, ev), null);
+  assert.deepEqual(eventDrift({ event_id: "e1" }, undefined), { missing: true });
+  console.log("ok  event link helpers");
+}
+
+// ---- sequencing ----
+{
+  const { planSequence, planTimeline } = await import("../src/lib/plans.js");
+  const pgs = [
+    { id: "m", versionNumber: 1 },
+    { id: "v2", masterId: "m", versionNumber: 2, aiDraft: { proposalId: "pA" } },
+    { id: "other", versionNumber: 1 },
+  ];
+  const A = { id: "A", name: "Spring", category: "Tissue", status: "shared", effective_date: "2027-03-01", created_at: "1", proposal_ids: ["pA"], items: [{ planogramId: "m", planogramName: "Main", adds: ["Foo"] }] };
+  const B = { id: "B", name: "Fall", category: "Tissue", status: "approved", effective_date: "2027-09-01", created_at: "2", proposal_ids: ["pB"], items: [{ planogramId: "m", planogramName: "Main", adds: ["foo", "Bar"] }] };
+  const C = { id: "C", name: "Other cat", category: "Soap", status: "draft", effective_date: "2027-03-01", created_at: "3", items: [{ planogramId: "other", adds: [] }] };
+  const D = { id: "D", name: "Cancelled", category: "Tissue", status: "cancelled", effective_date: "2027-01-01", items: [{ planogramId: "m", adds: [] }] };
+  const seq = planSequence([A, B, C, D], pgs);
+  assert.deepEqual(seq.B.predecessors.map((x) => x.id), ["A"]);
+  assert.deepEqual(seq.A.successors.map((x) => x.id), ["B"]);
+  assert.deepEqual(seq.B.outOfOrder, ["Spring"]);
+  assert.deepEqual(seq.B.redraft, [{ planogram: "Main", behind: "Spring" }]);
+  assert.ok(seq.B.conflicts[0].includes("also adds foo"));
+  assert.equal(seq.C.predecessors.length, 0);
+  assert.equal(seq.D, undefined);
+  const same = planSequence([A, { ...B, effective_date: "2027-03-01" }], pgs);
+  assert.ok(same.A.conflicts.some((c) => c.includes("same date")));
+  const tl = planTimeline([A, B, C, D], "2027-02-01");
+  assert.deepEqual(tl.lanes.map((l) => l.category), ["Soap", "Tissue"]);
+  assert.equal(tl.start, "2027-02-01");
+  assert.equal(tl.lanes[1].plans[1].pct, 100);
+  console.log("ok  sequencing and timeline");
+}

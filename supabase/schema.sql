@@ -903,3 +903,6 @@ begin
 end $$;
 drop trigger if exists stamp_assortment_plan on assortment_plans;
 create trigger stamp_assortment_plan before insert or update on assortment_plans for each row execute function stamp_assortment_plan();
+
+-- Plans can be tied to an Event Planner event (events live in app_settings 'settings:events'); versions take its start date.
+alter table assortment_plans add column if not exists event_id text;

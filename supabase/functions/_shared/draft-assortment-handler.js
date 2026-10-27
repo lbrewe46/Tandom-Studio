@@ -73,7 +73,9 @@ export function validateParams(body) {
     if (a[k] !== undefined) { if (typeof a[k] !== "number" || a[k] < lo || a[k] > hi) return { error: `assumptions.${k} must be a number from ${lo} to ${hi}` }; assumptions[k] = a[k]; }
   }
   if (a.maxRemovalsPerAdd !== undefined) { if (!Number.isInteger(a.maxRemovalsPerAdd) || a.maxRemovalsPerAdd < 0 || a.maxRemovalsPerAdd > 5) return { error: "assumptions.maxRemovalsPerAdd must be 0 to 5" }; assumptions.maxRemovalsPerAdd = a.maxRemovalsPerAdd; }
-  return { params: { category: p.category.trim(), weeks, compare, scope, planogramFilter, segmentFieldIds, assumptions } };
+  if (p.asOf !== undefined && p.asOf !== null && p.asOf !== "" && (typeof p.asOf !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(p.asOf))) return { error: "asOf must be a date (YYYY-MM-DD)" };
+  const asOf = p.asOf || undefined;
+  return { params: { category: p.category.trim(), weeks, compare, scope, planogramFilter, segmentFieldIds, assumptions, asOf } };
 }
 
 // What each item recommended for one planogram is expected to add, per week, in the chosen metric. Stored on the proposal so

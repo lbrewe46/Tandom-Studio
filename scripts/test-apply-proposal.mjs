@@ -173,6 +173,22 @@ await test("applying builds the next WIP version with exactly the proposed chang
   // the source planogram itself is untouched
   assert.deepEqual(shelf(t.planograms[0].data), [["A", 2], ["B", 3], ["C", 1], ["D", 1], ["E", 2]]);
 });
+await test("a proposal in a plan linked to an event gives the new version that event's start date", async () => {
+  const { t, db } = await fresh();
+  t.assortment_plans = [{ id: "pl1", event_id: "ev1", status: "approved", proposal_ids: [PID] }];
+  t.app_settings = [{ key: "settings:events", value: JSON.stringify([{ id: "ev1", startDate: "2027-03-01" }]) }];
+  const out = await (await call(db)).json();
+  assert.equal(out.planogram.eventDate, "2027-03-01");
+});
+await test("a plan with no event, or a cancelled one, leaves the date blank", async () => {
+  for (const plan of [{ id: "pl1", event_id: null, status: "approved", proposal_ids: [PID] }, { id: "pl1", event_id: "ev1", status: "cancelled", proposal_ids: [PID] }]) {
+    const { t, db } = await fresh();
+    t.assortment_plans = [plan];
+    t.app_settings = [{ key: "settings:events", value: JSON.stringify([{ id: "ev1", startDate: "2027-03-01" }]) }];
+    const out = await (await call(db)).json();
+    assert.equal(out.planogram.eventDate, "");
+  }
+});
 await test("the new version gets fresh section, fixture and placement ids", async () => {
   const { db } = await fresh();
   const np = (await (await call(db)).json()).planogram;

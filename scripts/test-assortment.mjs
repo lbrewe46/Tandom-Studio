@@ -2,7 +2,7 @@
 // Assortment engine: segments, slow movers, forecast and SKU rationalization on a hand-built Cereal category
 // whose right answers are known in advance. Run: node scripts/test-assortment.mjs
 import assert from "node:assert/strict";
-import { buildContext, segmentTree, slowMovers, forecastFor, recommend, resolveScope, scopeOptions, windowsFor, coreProfile, coreForecasts, coreValueScale, storeProductivity } from "../supabase/functions/_shared/assortment.js";
+import { buildContext, segmentTree, slowMovers, forecastFor, recommend, resolveScope, scopeOptions, windowsFor, coreProfile, coreForecasts, coreValueScale, storeProductivity, planogramsAsOf } from "../supabase/functions/_shared/assortment.js";
 import { applyResetDraftChanges, addDaysISO } from "../supabase/functions/_shared/app-core.js";
 
 let passed = 0, failed = 0;
@@ -289,6 +289,22 @@ test("a planogram attribute filters which planograms are considered", () => {
 test("slow movers can be compared across a store attribute", () => {
   const sm = slowMovers(buildContext(attrData(), params()), { groupBy: "storeAttr:fs" });
   assert.deepEqual(sm.groups.map((g) => g.label).sort(), ["High", "Low"]);
+});
+
+// ---- as-of date: the shelf as it will be on a date ----
+test("planogramsAsOf picks the version standing on a date", () => {
+  const fam = [
+    { id: "m", status: "live", versionNumber: 1, eventDate: "" },
+    { id: "v2", masterId: "m", status: "wip", versionNumber: 2, eventDate: "2027-03-01" },
+    { id: "v3", masterId: "m", status: "wip", versionNumber: 3, eventDate: "2027-06-01" },
+    { id: "v4", masterId: "m", status: "wip", versionNumber: 4, eventDate: "" },
+    { id: "solo", status: "live", versionNumber: 1 },
+  ];
+  const ids = (d) => planogramsAsOf(fam, d).map((p) => p.id).sort();
+  assert.deepEqual(ids("2027-01-01"), ["m", "solo"]);
+  assert.deepEqual(ids("2027-03-01"), ["solo", "v2"]);
+  assert.deepEqual(ids("2027-12-31"), ["solo", "v3"]); // a dated version wins; the undated WIP is not scheduled
+  assert.equal(planogramsAsOf(fam, "2027-12-31")[0], fam[2]); // original objects, not copies
 });
 
 console.log(`\n${passed} passed${failed ? `, ${failed} FAILED` : ""}`);

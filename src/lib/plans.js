@@ -220,3 +220,94 @@ export function buildPack(plan, options = {}) {
   });
   return slides;
 }
+
+// ---- Event link -------------------------------------------------------------------------------
+// The versions a plan has made (applied drafts) -> planogram ids, via the live proposal rows.
+export function planVersionIds(plan, liveByProposalId) {
+  return (plan?.items || []).map((it) => liveByProposalId?.[it.proposalId]?.applied_id).filter(Boolean);
+}
+
+// What linking a plan to an event does to its versions: those whose eventDate differs get the event's start date.
+// Approved/pending versions already carry a schedule (they are on their way to the shelf), so they are listed
+// separately for the person to confirm. Live/archived versions are never touched.
+export function eventLinkChanges(planograms, versionIds, event) {
+  const byId = Object.fromEntries((planograms || []).map((p) => [p.id, p]));
+  const date = event?.startDate || "";
+  const move = [], confirm = [], skipped = [];
+  (versionIds || []).forEach((id) => {
+    const p = byId[id];
+    if (!p || !date || (p.eventDate || "") === date) return;
+    const st = p.status || "wip";
+    if (st === "wip" || st === "draft") move.push(p);
+    else if (st === "approved" || st === "pending") confirm.push(p);
+    else skipped.push(p);
+  });
+  return { date, move, confirm, skipped };
+}
+
+// The plan's date no longer matches its event (the event was moved in the Event Planner).
+export function eventDrift(plan, event) {
+  if (!plan?.event_id) return null;
+  if (!event) return { missing: true };
+  if (event.startDate && plan.effective_date !== event.startDate) return { from: plan.effective_date || "", to: event.startDate };
+  return null;
+}
+
+// ---- Sequencing -------------------------------------------------------------------------------
+// Several plans can target the same planogram family on different dates. For each open plan: which earlier plans it
+// builds on, which later plans build on it, clashes (same planogram on the same date, same item added twice), plans
+// approved ahead of an earlier plan that is not, and items drafted from a version older than the earlier plan's result.
+const OPEN = (p) => !["executed", "cancelled"].includes(p.status);
+const BEFORE_APPROVAL = ["draft", "shared"];
+export function planSequence(plans, planograms) {
+  const byId = Object.fromEntries((planograms || []).map((p) => [p.id, p]));
+  const famOf = (id) => { const p = byId[id]; return p ? (p.masterId || p.id) : id; };
+  const open = (plans || []).filter(OPEN);
+  const info = Object.fromEntries(open.map((p) => [p.id, {
+    fams: new Set((p.items || []).map((i) => famOf(i.planogramId))),
+    adds: new Set((p.items || []).flatMap((i) => (i.adds || []).map((n) => `${famOf(i.planogramId)}|${String(n).toLowerCase()}`))),
+  }]));
+  const shares = (a, b) => [...info[a.id].fams].some((f) => info[b.id].fams.has(f));
+  const sameCat = (a, b) => (a.category || "") === (b.category || "");
+  const earlier = (q, p) => !!q.effective_date && !!p.effective_date && (q.effective_date < p.effective_date || (q.effective_date === p.effective_date && String(q.created_at || "") < String(p.created_at || "")));
+  const out = {};
+  open.forEach((p) => {
+    const rel = open.filter((q) => q.id !== p.id && sameCat(p, q) && shares(p, q));
+    const predecessors = rel.filter((q) => earlier(q, p)).sort((a, b) => a.effective_date.localeCompare(b.effective_date));
+    const successors = rel.filter((q) => earlier(p, q)).sort((a, b) => a.effective_date.localeCompare(b.effective_date));
+    const conflicts = [];
+    rel.forEach((q) => {
+      if (q.effective_date && q.effective_date === p.effective_date) conflicts.push(`${q.name} changes the same planogram on the same date`);
+      const dup = [...info[p.id].adds].filter((k) => info[q.id].adds.has(k)).map((k) => k.split("|")[1]);
+      if (dup.length) conflicts.push(`${q.name} also adds ${dup.slice(0, 3).join(", ")}${dup.length > 3 ? "…" : ""}`);
+    });
+    const outOfOrder = predecessors.filter((q) => BEFORE_APPROVAL.includes(q.status) && !BEFORE_APPROVAL.includes(p.status)).map((q) => q.name);
+    const redraft = [];
+    predecessors.forEach((q) => {
+      const qOut = (planograms || []).filter((g) => g.aiDraft && (q.proposal_ids || []).includes(g.aiDraft.proposalId));
+      (p.items || []).forEach((it) => {
+        const src = byId[it.planogramId];
+        const res = qOut.find((g) => famOf(g.id) === famOf(it.planogramId));
+        if (src && res && (src.versionNumber || 1) < (res.versionNumber || 1)) redraft.push({ planogram: it.planogramName || src.name, behind: q.name });
+      });
+    });
+    out[p.id] = { predecessors: predecessors.map((q) => ({ id: q.id, name: q.name, date: q.effective_date })), successors: successors.map((q) => ({ id: q.id, name: q.name, date: q.effective_date })), conflicts, outOfOrder, redraft };
+  });
+  return out;
+}
+
+// Timeline lanes: one per category, plans in date order, each positioned 0-100 across the span of dates.
+export function planTimeline(plans, todayISO) {
+  const dated = (plans || []).filter((p) => OPEN(p) && p.effective_date);
+  if (!dated.length) return { lanes: [], start: todayISO, end: todayISO, todayPct: 0 };
+  const dates = dated.map((p) => p.effective_date).concat(todayISO).sort();
+  const t = (d) => Date.parse(d + "T00:00:00Z");
+  const start = dates[0], end = dates[dates.length - 1];
+  const span = Math.max(1, t(end) - t(start));
+  const pct = (d) => Math.round(((t(d) - t(start)) / span) * 1000) / 10;
+  const cats = [...new Set(dated.map((p) => p.category || "No category"))].sort();
+  return {
+    start, end, todayPct: pct(todayISO),
+    lanes: cats.map((c) => ({ category: c, plans: dated.filter((p) => (p.category || "No category") === c).sort((a, b) => a.effective_date.localeCompare(b.effective_date)).map((p) => ({ id: p.id, name: p.name, date: p.effective_date, pct: pct(p.effective_date), status: p.status })) })),
+  };
+}
