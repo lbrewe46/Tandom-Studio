@@ -5,7 +5,7 @@ import {
   RotateCw, X, Layers, Package, Boxes, Ruler, ArrowLeft, Check, Grid3x3,
   Pencil, Save, AlertTriangle, RefreshCw, Download, Upload, FileSpreadsheet, CalendarDays, TrendingUp,
   Maximize2, Minimize2, Store, ChevronDown, ChevronUp, AlignLeft, AlignCenter, AlignRight, Search, Eye, Printer, Copy,
-  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe, HelpCircle, BarChart3, Sparkles, Users, Send, Link2
+  LogOut, Mail, Lock, ImageOff, Palette, ZoomIn, ZoomOut, Crosshair, Globe, HelpCircle, BarChart3, Sparkles, Users, Send, Link2, Undo2, Redo2
 } from "lucide-react";
 import {
   supabase, supabaseConfigured, pendingWriteListeners,
@@ -1698,6 +1698,17 @@ const METRIC_FIELDS = [
   { id: "unitProfit", label: "Profit Per Unit", format: (v) => money(v) },
   { id: "grossMarginPct", label: "Gross Margin %", format: (v) => `${v.toFixed(1)}%` },
 ];
+// Not a stored metric: worked out per placement from the units its stack holds and the product's weekly sales.
+const OVERLAY_EXTRA_METRICS = [
+  { id: "dos", label: "Days of Supply (vs target)" },
+];
+// Tone for a Days of Supply line, matching the placement inspector: red below target, amber past 2x target, green between.
+function dosTone(dos, target) {
+  if (!target) return "";
+  return dos < target ? "text-red-300" : dos > target * DOS_EXCESS_FACTOR ? "text-amber-300" : "text-emerald-300";
+}
+// Gives the product boxes the category's days-of-supply target without threading it through every layer.
+const DosTargetContext = React.createContext(() => null);
 
 const DEFAULT_OVERLAY_SETTINGS = {
   mode: "off", // off | always | noImageOnly
@@ -1706,10 +1717,11 @@ const DEFAULT_OVERLAY_SETTINGS = {
   layout: "compact", // compact | detailed
   position: "bottom", // top | bottom | center
   showLabels: true, // false = show just the value ("$1.24") instead of "Profit Per Unit: $1.24"
+  showDeep: true, // the small "3D" badge on a facing that is stacked more than one deep
   wrapText: false, // true = wrap onto multiple lines instead of truncating with an ellipsis
 };
 
-function resolveOverlayLines(product, placement, metrics, schema, settings) {
+function resolveOverlayLines(product, placement, metrics, schema, settings, stack, dosTargetDays) {
   const detailLines = (settings.details || []).map((key) => {
     if (key === "name") return product.name;
     if (key === "sku") return product.sku || "";
@@ -1724,6 +1736,13 @@ function resolveOverlayLines(product, placement, metrics, schema, settings) {
   // whole box, truncating before the actual number ever appeared
   const metricLines = (settings.metrics || []).map((key) => {
     if (!metrics) return null;
+    if (key === "dos") {
+      if (!metrics || !stack || !(stack.units > 0)) return null;
+      const dos = getDaysOfSupply(stack.units, metrics.avgWeeklyUnits);
+      if (dos === null) return null;
+      const txt = `${dos.toFixed(1)}${dosTargetDays ? ` / ${dosTargetDays}` : ""} d`;
+      return { label: "DOS", value: txt, tone: dosTone(dos, dosTargetDays) };
+    }
     if (key === "facingProductivity") {
       const perFacing = (metrics.totalSales / metrics.weeksOfData) / (placement.facings || 1);
       return { label: "$/Facing/Wk", value: money(perFacing) };
@@ -6559,10 +6578,14 @@ function computeJoinedGroupLayouts(planogram, fixtures, products) {
 // The product currently selected in the Product Library (or implied by the selected placement); every facing of it on
 // the planogram draws a blue outline so the library and the shelf point at the same thing.
 const LinkedProductContext = React.createContext(null);
+// When a product was last picked by pressing on it. A product is draggable, so a click that wobbles a pixel never fires; to be
+// reliable the product is selected on mouse-down, and the section's "click empty space to deselect" ignores the click that follows.
+let lastProductPressAt = 0;
 
 function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, schema, overlaySettings, onDragStartPlacement, onDragEndPlacement, dragging, readOnly, capacityWarningsEnabled, hideImages, highlightField, zoomLevel, pegYIn, stackProblem }) {
   const { placement, product, xIn, wIn, overflow, effectiveDims, stack } = box;
   const linkedProductId = React.useContext(LinkedProductContext);
+  const dosTargetFor = React.useContext(DosTargetContext);
   const linked = !!linkedProductId && linkedProductId === product.id;
   const dims = effectiveDims || product.dims;
   const img = hideImages ? null : product.images?.[placement.orientation];
@@ -6598,11 +6621,11 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
 
   const settings = overlaySettings || DEFAULT_OVERLAY_SETTINGS;
   const showOverlay = settings.mode === "always" || (settings.mode === "noImageOnly" && !img);
-  const { detailLines, metricLines } = showOverlay ? resolveOverlayLines(product, placement, metrics, schema, settings) : { detailLines: [], metricLines: [] };
+  const { detailLines, metricLines } = showOverlay ? resolveOverlayLines(product, placement, metrics, schema, settings, stack, dosTargetFor(product)) : { detailLines: [], metricLines: [] };
   const hasOverlayContent = detailLines.length > 0 || metricLines.length > 0;
   // showLabels off = just the number ("$1.24") instead of "Profit Per Unit: $1.24" — much more
   // likely to actually fit. wrapText lets a line break onto a second line instead of truncating.
-  const metricLineTexts = metricLines.map((m) => (settings.showLabels === false ? m.value : `${m.label}: ${m.value}`));
+  const metricLineTexts = metricLines.map((m) => ({ text: settings.showLabels === false ? m.value : `${m.label}: ${m.value}`, tone: m.tone || "" }));
   const lineWrapCls = settings.wrapText ? "whitespace-normal break-words" : "truncate";
 
   const posCls = settings.position === "top" ? "top-0" : settings.position === "center" ? "top-1/2 -translate-y-1/2" : "bottom-0";
@@ -6631,7 +6654,10 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
         // mousemove/mouseup listeners ever see it, silently swallowing the rubberband. Suppressing
         // the native drag start specifically while Ctrl/Cmd is held lets the mousedown fall
         // through normally instead, so the section's rubberband handler gets it.
-        onMouseDown={readOnly ? undefined : (e) => { if (e.ctrlKey || e.metaKey) e.preventDefault(); }}
+        onMouseDown={readOnly ? undefined : (e) => {
+          if (e.ctrlKey || e.metaKey) { e.preventDefault(); return; }
+          if (e.button === 0) { lastProductPressAt = Date.now(); onSelect(placement.id); }
+        }}
         onDragStart={readOnly ? undefined : (e) => { e.stopPropagation(); onDragStartPlacement(e, placement); }}
         onDragEnd={readOnly ? undefined : (e) => { e.stopPropagation(); onDragEndPlacement(); }}
         onClick={readOnly ? undefined : (e) => { e.stopPropagation(); onSelect(placement.id); }}
@@ -6657,13 +6683,13 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
         {layer === 0 && hasOverlayContent && settings.layout === "compact" && (
           <div className={`absolute ${posCls} left-0 max-w-full bg-black/70 text-white px-0.5 leading-tight overflow-hidden`} style={{ fontSize: overlayFontSize }}>
             {detailLines.slice(0, 1).map((l, i) => <div key={"d" + i} className={`font-semibold ${lineWrapCls}`}>{l}</div>)}
-            {metricLineTexts.slice(0, 2).map((l, i) => <div key={"m" + i} className={lineWrapCls}>{l}</div>)}
+            {metricLineTexts.slice(0, 2).map((l, i) => <div key={"m" + i} className={`${lineWrapCls} ${l.tone}`}>{l.text}</div>)}
           </div>
         )}
         {layer === 0 && hasOverlayContent && settings.layout === "detailed" && (
           <div className={`absolute ${posCls} left-0 right-0 bg-black/75 text-white px-0.5 py-0.5 leading-tight overflow-hidden`} style={{ fontSize: overlayFontSize }}>
             {detailLines.map((l, i) => <div key={"d" + i} className={`font-semibold ${lineWrapCls}`}>{l}</div>)}
-            {metricLineTexts.map((l, i) => <div key={"m" + i} className={lineWrapCls}>{l}</div>)}
+            {metricLineTexts.map((l, i) => <div key={"m" + i} className={`${lineWrapCls} ${l.tone}`}>{l.text}</div>)}
           </div>
         )}
       </div>
@@ -6691,7 +6717,7 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
           )}
         </div>
       ))}
-      {deepCount > 1 && (
+      {deepCount > 1 && settings.showDeep !== false && (
         <span className="absolute right-0 top-0 z-20 pointer-events-none bg-slate-900/80 text-white font-mono leading-none px-0.5 rounded-bl" style={{ fontSize: overlayFontSize }}>{deepCount}D</span>
       )}
       {stackProblem && (
@@ -7474,6 +7500,7 @@ function SectionColumn({
               className="text-xs font-bold text-slate-700 bg-transparent border-b border-transparent hover:border-slate-300 focus:border-amber-400 focus:outline-none min-w-0 flex-1"
             />
             {!showTools && <span className="text-[10px] font-mono text-slate-400 shrink-0">{section.width}in</span>}
+            <button className={btnIcon} onClick={onAddFixture} title="Add a fixture (shelf, pegboard...) to this section"><Plus size={13} /></button>
             {!toolsOpen && (
               <button className={btnIcon + (localToolsOpen ? " bg-slate-100" : "")} onClick={() => setLocalToolsOpen((v) => !v)} title={localToolsOpen ? "Hide this section's settings" : "Section settings: width, backdrop, move, delete"}><Settings2 size={12} /></button>
             )}
@@ -7511,7 +7538,7 @@ function SectionColumn({
 
       <div
         onMouseDown={readOnly ? undefined : (e) => { if (e.ctrlKey || e.metaKey) handleRubberDown(e); }}
-        onClick={readOnly ? undefined : (e) => { if (groupSelectedFixtureIds.size || groupSelectedPlacementIds.size) { clearGroupSelection(); return; } onDeselectAll(); }}
+        onClick={readOnly ? undefined : (e) => { if (Date.now() - lastProductPressAt < 600) return; if (groupSelectedFixtureIds.size || groupSelectedPlacementIds.size) { clearGroupSelection(); return; } onDeselectAll(); }}
         onContextMenu={readOnly ? undefined : (e) => e.preventDefault()}
         className="relative border-x border-slate-300 bg-gradient-to-b from-slate-100 to-slate-200"
         style={{ width: section.width * scale, height: heightPx }}
@@ -7649,19 +7676,11 @@ function SectionColumn({
         )}
       </div>
 
-      {!readOnly && (
-        <button
-          className="mt-1.5 text-xs text-amber-600 font-medium hover:underline flex items-center gap-1 justify-center"
-          onClick={onAddFixture}
-        >
-          <Plus size={12} /> Add Fixture
-        </button>
-      )}
     </div>
   );
 }
 
-function AddFixturePopover({ fixtures, onAdd, onClose }) {
+function AddFixturePopover({ fixtures, onAdd, onClose, sectionName }) {
   const [fixtureId, setFixtureId] = useState(fixtures[0]?.id || "");
   const [notchY, setNotchY] = useState(12);
   const [xOffset, setXOffset] = useState(0);
@@ -7675,7 +7694,7 @@ function AddFixturePopover({ fixtures, onAdd, onClose }) {
   }
   return (
     <div className="bg-white border border-slate-200 rounded-lg p-4 shadow-lg space-y-3 w-72">
-      <h4 className="font-bold text-sm text-slate-800">Add Fixture to Section</h4>
+      <h4 className="font-bold text-sm text-slate-800">Add fixture{sectionName ? ` to ${sectionName}` : " to section"}</h4>
       <Field label="Fixture">
         <select className={inputCls} value={fixtureId} onChange={(e) => setFixtureId(e.target.value)}>
           {fixtures.map((f) => <option key={f.id} value={f.id}>{f.name} ({f.dims.w}×{f.dims.h}×{f.dims.d})</option>)}
@@ -8161,7 +8180,7 @@ function OverlaySettingsPanel({ settings, schema, onChange, onClose }) {
       <div>
         <label className={labelCls}>Metrics to show</label>
         <div className="grid grid-cols-2 gap-1">
-          {METRIC_FIELDS.map((m) => (
+          {[...METRIC_FIELDS, ...OVERLAY_EXTRA_METRICS].map((m) => (
             <label key={m.id} className="flex items-center gap-1.5 text-xs text-slate-700">
               <input type="checkbox" className="accent-amber-500 w-3.5 h-3.5" checked={(settings.metrics || []).includes(m.id)} onChange={() => toggleInList("metrics", m.id)} />
               {m.label}
@@ -8210,6 +8229,10 @@ function OverlaySettingsPanel({ settings, schema, onChange, onClose }) {
         <label className="flex items-center gap-1.5 text-xs text-slate-700">
           <input type="checkbox" className="accent-amber-500 w-3.5 h-3.5" checked={settings.showLabels !== false} onChange={(e) => onChange({ showLabels: e.target.checked })} />
           Show labels (e.g. "Profit Per Unit: $1.24" vs. just "$1.24")
+        </label>
+        <label className="flex items-center gap-1.5 text-xs text-slate-700">
+          <input type="checkbox" className="accent-amber-500 w-3.5 h-3.5" checked={settings.showDeep !== false} onChange={(e) => onChange({ showDeep: e.target.checked })} />
+          Show the depth badge (e.g. "3D" on facings stacked deep). Works even when the overlay is off.
         </label>
         <label className="flex items-center gap-1.5 text-xs text-slate-700">
           <input type="checkbox" className="accent-amber-500 w-3.5 h-3.5" checked={!!settings.wrapText} onChange={(e) => onChange({ wrapText: e.target.checked })} />
@@ -8893,8 +8916,68 @@ function PlanogramVersionsBar({ planogram, allPlanograms, onCreateVersion, onOpe
   );
 }
 
-function PlanogramEditor({ planogram, products, fixtures, performance, productSchema, planogramSchema, resetThresholds, dosTargets, stores, capacityWarningsEnabled, onAssignStores, onUpdate, onBack, allPlanograms, onCreateVersion, onOpenVersion, onMakeLive, onResolveIssue, onDraftReset, draftingReset, onApproveResetDraft, onDiscardResetDraft }) {
+function PlanogramEditor({ planogram, products, fixtures, performance, productSchema, planogramSchema, resetThresholds, dosTargets, stores, capacityWarningsEnabled, onAssignStores, onUpdate: onUpdateRaw, onBack, allPlanograms, onCreateVersion, onOpenVersion, onMakeLive, onResolveIssue, onDraftReset, draftingReset, onApproveResetDraft, onDiscardResetDraft }) {
   const [presentMode, setPresentMode] = useState(false);
+  // Undo / redo for the layout (sections, their fixtures and products, planogram size and base). Every edit goes through
+  // onUpdate, so that is where each "before" is captured. Edits that arrive within 700ms of each other (typing a name or
+  // width) count as one step. Metadata changes (name, dates, overlay settings) are not undoable here.
+  const HISTORY_LIMIT = 30;
+  const historyRef = useRef({ id: planogram.id, past: [], future: [], at: 0 });
+  const planogramRef = useRef(planogram);
+  planogramRef.current = planogram;
+  const [, setHistoryTick] = useState(0);
+  if (historyRef.current.id !== planogram.id) historyRef.current = { id: planogram.id, past: [], future: [], at: 0 };
+  const layoutOf = (p) => ({ sections: p.sections, dims: p.dims, base: p.base });
+  const layoutChanged = (a, b) => a.sections !== b.sections || a.dims !== b.dims || a.base !== b.base;
+  const onUpdate = (next) => {
+    const h = historyRef.current;
+    const cur = planogramRef.current;
+    if (layoutChanged(cur, next)) {
+      const now = Date.now();
+      if (now - h.at > 700 || h.past.length === 0) { h.past.push(layoutOf(cur)); if (h.past.length > HISTORY_LIMIT) h.past.shift(); }
+      h.at = now; h.future = [];
+      setHistoryTick((t) => t + 1);
+    }
+    onUpdateRaw(next);
+  };
+  const undo = () => {
+    const h = historyRef.current; const cur = planogramRef.current;
+    const prev = h.past.pop();
+    if (!prev) return;
+    h.future.push(layoutOf(cur)); h.at = 0;
+    setSelectedFixtureId(null); setSelectedPlacement(null);
+    onUpdateRaw({ ...cur, ...prev });
+    setHistoryTick((t) => t + 1);
+  };
+  const redo = () => {
+    const h = historyRef.current; const cur = planogramRef.current;
+    const nxt = h.future.pop();
+    if (!nxt) return;
+    h.past.push(layoutOf(cur)); h.at = 0;
+    setSelectedFixtureId(null); setSelectedPlacement(null);
+    onUpdateRaw({ ...cur, ...nxt });
+    setHistoryTick((t) => t + 1);
+  };
+  const undoRef = useRef(undo); undoRef.current = undo;
+  const redoRef = useRef(redo); redoRef.current = redo;
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      const t = e.target; const tag = (t?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select" || t?.isContentEditable) return; // leave the browser's own text undo alone
+      const k = e.key.toLowerCase();
+      if (k === "z" && !e.shiftKey) { e.preventDefault(); undoRef.current(); }
+      else if ((k === "z" && e.shiftKey) || k === "y") { e.preventDefault(); redoRef.current(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  const undoRedoButtons = (
+    <div className="flex items-center gap-0.5 rounded-full border border-slate-300 px-1 py-0.5 bg-white">
+      <button className={btnIcon} disabled={historyRef.current.past.length === 0} onClick={undo} title={`Undo (Ctrl+Z)${historyRef.current.past.length ? ` · ${historyRef.current.past.length} step${historyRef.current.past.length === 1 ? "" : "s"} available` : ""}`}><Undo2 size={14} /></button>
+      <button className={btnIcon} disabled={historyRef.current.future.length === 0} onClick={redo} title={`Redo (Ctrl+Shift+Z or Ctrl+Y)${historyRef.current.future.length ? ` · ${historyRef.current.future.length} available` : ""}`}><Redo2 size={14} /></button>
+    </div>
+  );
   const [hideImages, setHideImages] = useState(false); // session-only view toggle, not saved with the planogram
   const [highlightField, setHighlightField] = useState(null); // attribute field id, or null = off
   const [highlightPanelOpen, setHighlightPanelOpen] = useState(false);
@@ -8902,8 +8985,6 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false); // session-only, not saved
   const [topBarCollapsed, setTopBarCollapsed] = useState(false); // session-only, not saved
   const [editorTab, setEditorTab] = useState(null); // which of Analyze / Planogram Attributes / Lifecycle / Versions is open; null = all closed (session-only)
-  const [sectionToolsOpen, setSectionToolsOpen] = useState(() => !!readLocalJSON("pogSectionTools", false)); // show every section's width/backdrop/move/delete controls
-  const toggleSectionTools = () => setSectionToolsOpen((v) => { writeLocalJSON("pogSectionTools", !v); return !v; });
   const [fitBox, setFitBox] = useState({ w: 900, h: 560 }); // room the canvas actually has, in px
   const canvasScrollRef = useRef(null);
   const measureCanvas = useCallback(() => {
@@ -8912,7 +8993,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
     const w = Math.max(320, el.clientWidth - 32);
     const top = el.getBoundingClientRect().top + window.scrollY;
     const h = Math.max(320, window.innerHeight - top - 40);
-    setFitBox((b) => (Math.abs(b.w - w) > 2 || Math.abs(b.h - h) > 2 ? { w, h } : b));
+    setFitBox((b) => (Math.abs(b.w - w) > 24 || Math.abs(b.h - h) > 24 ? { w, h } : b)); // ignore small shifts (a scrollbar appearing) so the planogram doesn't rescale under the cursor
   }, []);
   useEffect(() => { measureCanvas(); }); // the header above the canvas changes height with the tabs, so re-measure after each render (cheap, guarded)
   useEffect(() => {
@@ -8921,6 +9002,28 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
     if (ro) ro.observe(canvasScrollRef.current);
     return () => { window.removeEventListener("resize", measureCanvas); if (ro) ro.disconnect(); };
   }, [measureCanvas, presentMode]);
+  // Right-mouse drag pans the planogram inside the viewer (scrolls the canvas), for when it is zoomed in past the screen.
+  const panRef = useRef(null);
+  const [panning, setPanning] = useState(false);
+  const startPan = (e) => {
+    if (e.button !== 2 || !canvasScrollRef.current) return;
+    e.preventDefault(); e.stopPropagation();
+    const el = canvasScrollRef.current;
+    panRef.current = { x: e.clientX, y: e.clientY, left: el.scrollLeft, top: el.scrollTop, moved: false };
+    setPanning(true);
+    const move = (ev) => {
+      const st = panRef.current; if (!st) return;
+      if (Math.abs(ev.clientX - st.x) + Math.abs(ev.clientY - st.y) > 3) st.moved = true;
+      el.scrollLeft = st.left - (ev.clientX - st.x);
+      el.scrollTop = st.top - (ev.clientY - st.y);
+    };
+    const up = () => {
+      window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up);
+      setPanning(false);
+      setTimeout(() => { panRef.current = null; }, 0);
+    };
+    window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+  };
   const recenterCanvas = () => {
     const el = canvasScrollRef.current;
     if (!el) return;
@@ -8943,14 +9046,15 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   const [analysisStoreId, setAnalysisStoreId] = useState(planogram.analysisStoreId || "blended");
   const [assigningStores, setAssigningStores] = useState(false);
   const [overlayPanelOpen, setOverlayPanelOpen] = useState(false);
+  const dosTargetFor = useCallback((product) => getDosTargetDays(planogram.category || "", dosTargets, product), [planogram.category, dosTargets]);
   const overlaySettings = planogram.overlaySettings || DEFAULT_OVERLAY_SETTINGS;
   const updateOverlaySettings = (patch) => onUpdate({ ...planogram, overlaySettings: { ...overlaySettings, ...patch } });
   const [zoomLevel, setZoomLevel] = useState(1); // session-only canvas zoom, not saved with the planogram
 
   const totalSectionsWidth = planogram.sections.reduce((s, sec) => s + sec.width, 0);
   // "Fit": the largest scale at which every section fits across the canvas and the planogram's height fits down it
-  // (leaving room for the section headers and the Add Fixture row). Zoom multiplies this; at 1 the whole planogram is in view.
-  const chromePx = (presentMode ? 24 : sectionToolsOpen ? 96 : 56) + (presentMode ? 0 : 34) + (topBarCollapsed || presentMode ? 0 : 44);
+  // (leaving room for the section headers). Zoom multiplies this; at 1 the whole planogram is in view.
+  const chromePx = (presentMode ? 24 : 56) + (topBarCollapsed || presentMode ? 0 : 44);
   const fitW = (fitBox.w - planogram.sections.length * 2 - 8) / Math.max(totalSectionsWidth, 24); // minus each section's border
   const fitH = Math.max(120, fitBox.h - chromePx) / Math.max(planogram.dims.h, 12);
   const baseScale = clamp(Math.min(fitW, fitH), 1.2, 8);
@@ -9511,6 +9615,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
 
   return (
     <LinkedProductContext.Provider value={libraryProductId}>
+    <DosTargetContext.Provider value={dosTargetFor}>
     <div>
       <div className="flex items-center gap-3 mb-4 no-print">
         <button className={btnGhost} onClick={onBack}><ArrowLeft size={14} /> All Planograms</button>
@@ -9761,10 +9866,13 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
           )
         )}
 
-        <div ref={canvasScrollRef} className="flex-1 overflow-x-auto bg-slate-50 border border-slate-200 rounded-lg p-4 print-area">
+        <div ref={canvasScrollRef} onMouseDownCapture={presentMode ? undefined : startPan} onContextMenu={presentMode ? undefined : (e) => e.preventDefault()}
+          className="flex-1 min-w-0 overflow-auto bg-slate-50 border border-slate-200 rounded-lg p-4 print-area" style={{ maxHeight: presentMode ? undefined : fitBox.h + 20, cursor: panning ? "grabbing" : undefined }}
+         >
           {!presentMode && (
             topBarCollapsed ? (
-              <div className="flex justify-center mb-2 no-print">
+              <div className="flex justify-center items-center gap-2 mb-2 no-print">
+                {undoRedoButtons}
                 <button onClick={() => setTopBarCollapsed(false)} className="text-slate-400 hover:text-slate-600 rounded-full border border-slate-200 bg-white px-3 py-0.5" title="Show performance window / zoom controls">
                   <ChevronDown size={14} />
                 </button>
@@ -9778,8 +9886,8 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                 ) : "No performance data loaded"}
               </div>
               <div className="flex items-center gap-1.5 shrink-0 no-print">
-                <button className={btnGhost + " !py-0.5 !px-2 text-[11px]" + (sectionToolsOpen ? " bg-slate-100" : "")} aria-pressed={sectionToolsOpen} onClick={toggleSectionTools} title="Show or hide every section's width, backdrop, move and delete controls"><Settings2 size={12} /> Section settings</button>
-                <button className={btnIcon} onClick={recenterCanvas} title="Recenter the planogram in the available space"><Crosshair size={14} /></button>
+                {undoRedoButtons}
+                <button className={btnIcon} onClick={recenterCanvas} title="Recenter the planogram in the available space. Tip: drag with the right mouse button to pan when zoomed in."><Crosshair size={14} /></button>
                 <div className="flex items-center gap-0.5 rounded-full border border-slate-300 px-1 py-0.5 bg-white">
                   <button className={btnIcon} disabled={zoomLevel <= 0.5} onClick={() => setZoomLevel((z) => clamp(Math.round((z - 0.25) * 100) / 100, 0.5, 3))} title="Zoom out"><ZoomOut size={14} /></button>
                   <button
@@ -9799,7 +9907,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
           {planogram.sections.length === 0 ? (
             <div className="text-sm text-slate-400 italic p-8 text-center">Add a section (e.g. a 48in / 4ft segment) to begin merchandising.</div>
           ) : (
-            <div className="flex flex-col justify-center" style={{ minHeight: Math.max(0, fitBox.h - (topBarCollapsed || presentMode ? 0 : 44)) }}>
+            <div className="flex flex-col justify-center" style={{ minHeight: Math.max(0, fitBox.h - 60 - (topBarCollapsed || presentMode ? 0 : 44)), width: "max-content", minWidth: "100%" }}>
             <div className="flex gap-0 items-start mx-auto" style={{ width: "fit-content" }}>
               {planogram.sections.map((section, idx) => (
                 <div key={section.id} className="relative">
@@ -9816,7 +9924,6 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                     hideImages={hideImages}
                     highlightField={highlightField}
                     zoomLevel={textZoom}
-                    toolsOpen={sectionToolsOpen}
                     joinedLayouts={joinedLayouts}
                     onRename={(v) => renameSection(section.id, v)}
                     onResize={(v) => resizeSection(section.id, v)}
@@ -9846,8 +9953,10 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                     onDeselectAll={() => { setSelectedFixtureId(null); setSelectedPlacement(null); }}
                   />
                   {!presentMode && selectedSectionForAdd === section.id && (
-                    <div className="absolute top-6 left-0 z-20">
-                      <AddFixturePopover fixtures={fixtures} onClose={() => setSelectedSectionForAdd(null)} onAdd={(fx) => addFixtureToSection(section.id, fx)} />
+                    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/20 p-4" onClick={() => setSelectedSectionForAdd(null)}>
+                      <div onClick={(e) => e.stopPropagation()}>
+                        <AddFixturePopover sectionName={section.name} fixtures={fixtures} onClose={() => setSelectedSectionForAdd(null)} onAdd={(fx) => addFixtureToSection(section.id, fx)} />
+                      </div>
                     </div>
                   )}
                 </div>
@@ -10061,6 +10170,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
         )}
       </div>
     </div>
+    </DosTargetContext.Provider>
     </LinkedProductContext.Provider>
   );
 }
@@ -14521,10 +14631,11 @@ function AppContent({ session }) {
   return (
     <div className="min-h-screen bg-slate-100 text-slate-800" style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
       <style>{`
+        html { overflow-y: scroll; }
         @media print {
           .no-print { display: none !important; }
           body, .min-h-screen { background: white !important; }
-          .print-area { border: none !important; box-shadow: none !important; }
+          .print-area { border: none !important; box-shadow: none !important; max-height: none !important; overflow: visible !important; }
         }
       `}</style>
       <AskTandomLauncher onTaskSynced={syncStoreTask} planogram={activePlanogram ? { id: activePlanogram.id, name: activePlanogram.name || "Untitled planogram" } : null} />
