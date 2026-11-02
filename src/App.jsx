@@ -7329,12 +7329,14 @@ function PegboardPanel({
 }
 
 function SectionColumn({
-  section, index, total, planogram, fixtures, products, scale, readOnly, joinedLayouts, capacityWarningsEnabled, hideImages, highlightField, zoomLevel,
+  section, index, total, planogram, fixtures, products, scale, readOnly, joinedLayouts, capacityWarningsEnabled, hideImages, highlightField, zoomLevel, toolsOpen,
   onRename, onResize, onSetBackboard, onMove, onDelete, onAddFixture, onDragFixture, onDragFixtureGroup, onDropProductOnFixture, onMountFixture, onMovePlacement, onMoveGroup, onMoveGroupToFixture,
   selectedFixtureId, onSelectFixture, selectedPlacementId, onSelectPlacement, onDeselectAll,
   performance, cutoffISO, storeId, schema, overlaySettings,
 }) {
   const heightPx = planogram.dims.h * scale;
+  const [localToolsOpen, setLocalToolsOpen] = useState(false);
+  const showTools = !!toolsOpen || localToolsOpen;
   // section-wide rubberband multi-select: Ctrl/Cmd+drag over empty space, a shelf, or the
   // pegboard lassos whatever it touches — whole fixtures (by their bar) for a group reposition,
   // and/or individual products (on a shelf or a pegboard) for a group move to another fixture.
@@ -7469,32 +7471,40 @@ function SectionColumn({
             <input
               value={section.name}
               onChange={(e) => onRename(e.target.value)}
-              className="text-xs font-bold text-slate-700 bg-transparent border-b border-transparent hover:border-slate-300 focus:border-amber-400 focus:outline-none w-20"
+              className="text-xs font-bold text-slate-700 bg-transparent border-b border-transparent hover:border-slate-300 focus:border-amber-400 focus:outline-none min-w-0 flex-1"
             />
-            <input
-              type="number"
-              value={section.width}
-              onChange={(e) => onResize(Number(e.target.value) || 1)}
-              className="text-[10px] font-mono w-12 rounded border border-slate-200 px-1 py-0.5"
-              title="Section width (in)"
-            />
-            <span className="text-[10px] text-slate-400">in</span>
-            <select
-              value={section.backboardStyle || "none"}
-              onChange={(e) => onSetBackboard(e.target.value === "none" ? undefined : e.target.value)}
-              className="text-[10px] font-mono rounded border border-slate-200 px-1 py-0.5 bg-white"
-              title="Backboard appearance — a cosmetic backdrop for gondola realism; hidden automatically if this section also has a real Pegboard fixture"
-            >
-              <option value="none">No backdrop</option>
-              <option value="pegboard">Pegboard</option>
-              <option value="slatwall">Slatwall</option>
-              <option value="solid">Solid</option>
-            </select>
-            <div className="ml-auto flex items-center gap-0.5">
-              <button className={btnIcon} disabled={index === 0} onClick={() => onMove(-1)} title="Move left"><ChevronLeft size={14} /></button>
-              <button className={btnIcon} disabled={index === total - 1} onClick={() => onMove(1)} title="Move right"><ChevronRight size={14} /></button>
-              <button className={btnIcon} onClick={onDelete} title="Delete section"><Trash2 size={13} /></button>
-            </div>
+            {!showTools && <span className="text-[10px] font-mono text-slate-400 shrink-0">{section.width}in</span>}
+            {!toolsOpen && (
+              <button className={btnIcon + (localToolsOpen ? " bg-slate-100" : "")} onClick={() => setLocalToolsOpen((v) => !v)} title={localToolsOpen ? "Hide this section's settings" : "Section settings: width, backdrop, move, delete"}><Settings2 size={12} /></button>
+            )}
+            {showTools && (
+              <div className="basis-full flex items-center gap-1 flex-wrap">
+                <input
+                  type="number"
+                  value={section.width}
+                  onChange={(e) => onResize(Number(e.target.value) || 1)}
+                  className="text-[10px] font-mono w-12 rounded border border-slate-200 px-1 py-0.5"
+                  title="Section width (in)"
+                />
+                <span className="text-[10px] text-slate-400">in</span>
+                <select
+                  value={section.backboardStyle || "none"}
+                  onChange={(e) => onSetBackboard(e.target.value === "none" ? undefined : e.target.value)}
+                  className="text-[10px] font-mono rounded border border-slate-200 px-1 py-0.5 bg-white min-w-0"
+                  title="Backboard appearance — a cosmetic backdrop for gondola realism; hidden automatically if this section also has a real Pegboard fixture"
+                >
+                  <option value="none">No backdrop</option>
+                  <option value="pegboard">Pegboard</option>
+                  <option value="slatwall">Slatwall</option>
+                  <option value="solid">Solid</option>
+                </select>
+                <div className="ml-auto flex items-center gap-0.5">
+                  <button className={btnIcon} disabled={index === 0} onClick={() => onMove(-1)} title="Move left"><ChevronLeft size={14} /></button>
+                  <button className={btnIcon} disabled={index === total - 1} onClick={() => onMove(1)} title="Move right"><ChevronRight size={14} /></button>
+                  <button className={btnIcon} onClick={onDelete} title="Delete section"><Trash2 size={13} /></button>
+                </div>
+              </div>
+            )}
           </>
         )}
       </div>
@@ -8892,7 +8902,25 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false); // session-only, not saved
   const [topBarCollapsed, setTopBarCollapsed] = useState(false); // session-only, not saved
   const [editorTab, setEditorTab] = useState(null); // which of Analyze / Planogram Attributes / Lifecycle / Versions is open; null = all closed (session-only)
+  const [sectionToolsOpen, setSectionToolsOpen] = useState(() => !!readLocalJSON("pogSectionTools", false)); // show every section's width/backdrop/move/delete controls
+  const toggleSectionTools = () => setSectionToolsOpen((v) => { writeLocalJSON("pogSectionTools", !v); return !v; });
+  const [fitBox, setFitBox] = useState({ w: 900, h: 560 }); // room the canvas actually has, in px
   const canvasScrollRef = useRef(null);
+  const measureCanvas = useCallback(() => {
+    const el = canvasScrollRef.current;
+    if (!el) return;
+    const w = Math.max(320, el.clientWidth - 32);
+    const top = el.getBoundingClientRect().top + window.scrollY;
+    const h = Math.max(320, window.innerHeight - top - 40);
+    setFitBox((b) => (Math.abs(b.w - w) > 2 || Math.abs(b.h - h) > 2 ? { w, h } : b));
+  }, []);
+  useEffect(() => { measureCanvas(); }); // the header above the canvas changes height with the tabs, so re-measure after each render (cheap, guarded)
+  useEffect(() => {
+    window.addEventListener("resize", measureCanvas);
+    const ro = typeof ResizeObserver !== "undefined" && canvasScrollRef.current ? new ResizeObserver(measureCanvas) : null;
+    if (ro) ro.observe(canvasScrollRef.current);
+    return () => { window.removeEventListener("resize", measureCanvas); if (ro) ro.disconnect(); };
+  }, [measureCanvas, presentMode]);
   const recenterCanvas = () => {
     const el = canvasScrollRef.current;
     if (!el) return;
@@ -8919,9 +8947,15 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   const updateOverlaySettings = (patch) => onUpdate({ ...planogram, overlaySettings: { ...overlaySettings, ...patch } });
   const [zoomLevel, setZoomLevel] = useState(1); // session-only canvas zoom, not saved with the planogram
 
-  const baseScale = clamp(820 / Math.max(planogram.dims.w, 24), 1.5, 5.5);
-  const scale = baseScale * zoomLevel;
   const totalSectionsWidth = planogram.sections.reduce((s, sec) => s + sec.width, 0);
+  // "Fit": the largest scale at which every section fits across the canvas and the planogram's height fits down it
+  // (leaving room for the section headers and the Add Fixture row). Zoom multiplies this; at 1 the whole planogram is in view.
+  const chromePx = (presentMode ? 24 : sectionToolsOpen ? 96 : 56) + (presentMode ? 0 : 34) + (topBarCollapsed || presentMode ? 0 : 44);
+  const fitW = (fitBox.w - planogram.sections.length * 2 - 8) / Math.max(totalSectionsWidth, 24); // minus each section's border
+  const fitH = Math.max(120, fitBox.h - chromePx) / Math.max(planogram.dims.h, 12);
+  const baseScale = clamp(Math.min(fitW, fitH), 1.2, 8);
+  const scale = baseScale * zoomLevel;
+  const textZoom = clamp(scale / 2, 0.6, 3); // box labels grow with the scale so a larger planogram stays readable
   const joinedLayouts = computeJoinedGroupLayouts(planogram, fixtures, products);
 
   const latestISO = getLatestWeekEnding(performance);
@@ -9744,15 +9778,16 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                 ) : "No performance data loaded"}
               </div>
               <div className="flex items-center gap-1.5 shrink-0 no-print">
+                <button className={btnGhost + " !py-0.5 !px-2 text-[11px]" + (sectionToolsOpen ? " bg-slate-100" : "")} aria-pressed={sectionToolsOpen} onClick={toggleSectionTools} title="Show or hide every section's width, backdrop, move and delete controls"><Settings2 size={12} /> Section settings</button>
                 <button className={btnIcon} onClick={recenterCanvas} title="Recenter the planogram in the available space"><Crosshair size={14} /></button>
                 <div className="flex items-center gap-0.5 rounded-full border border-slate-300 px-1 py-0.5 bg-white">
                   <button className={btnIcon} disabled={zoomLevel <= 0.5} onClick={() => setZoomLevel((z) => clamp(Math.round((z - 0.25) * 100) / 100, 0.5, 3))} title="Zoom out"><ZoomOut size={14} /></button>
                   <button
                     className="text-xs font-mono text-slate-500 w-11 text-center hover:text-slate-700"
                     onClick={() => setZoomLevel(1)}
-                    title="Reset zoom to 100%"
+                    title="Fit the whole planogram to the screen"
                   >
-                    {Math.round(zoomLevel * 100)}%
+                    {zoomLevel === 1 ? "Fit" : `${Math.round(zoomLevel * 100)}%`}
                   </button>
                   <button className={btnIcon} disabled={zoomLevel >= 3} onClick={() => setZoomLevel((z) => clamp(Math.round((z + 0.25) * 100) / 100, 0.5, 3))} title="Zoom in"><ZoomIn size={14} /></button>
                 </div>
@@ -9764,6 +9799,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
           {planogram.sections.length === 0 ? (
             <div className="text-sm text-slate-400 italic p-8 text-center">Add a section (e.g. a 48in / 4ft segment) to begin merchandising.</div>
           ) : (
+            <div className="flex flex-col justify-center" style={{ minHeight: Math.max(0, fitBox.h - (topBarCollapsed || presentMode ? 0 : 44)) }}>
             <div className="flex gap-0 items-start mx-auto" style={{ width: "fit-content" }}>
               {planogram.sections.map((section, idx) => (
                 <div key={section.id} className="relative">
@@ -9779,7 +9815,8 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                     capacityWarningsEnabled={capacityWarningsEnabled}
                     hideImages={hideImages}
                     highlightField={highlightField}
-                    zoomLevel={zoomLevel}
+                    zoomLevel={textZoom}
+                    toolsOpen={sectionToolsOpen}
                     joinedLayouts={joinedLayouts}
                     onRename={(v) => renameSection(section.id, v)}
                     onResize={(v) => resizeSection(section.id, v)}
@@ -9815,6 +9852,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                   )}
                 </div>
               ))}
+            </div>
             </div>
           )}
         </div>
@@ -14547,7 +14585,7 @@ function AppContent({ session }) {
         </div>
       )}
 
-      <div className="p-6 max-w-[1400px] mx-auto">
+      <div className={`mx-auto ${activePlanogram && !reviewingProposalId && tab === "planograms" ? "px-4 py-4 max-w-none" : "p-6 max-w-[1400px]"}`}>
         {reviewingProposalId ? (
           <ProposalReview
             key={reviewingProposalId}
