@@ -6979,7 +6979,7 @@ function FixtureBar({
           the next section's space — bump z-index so they render on top of that neighbor instead
           of sliding behind it (plain sibling sections otherwise stack purely by DOM order). */}
       <div
-        className="absolute"
+        className="absolute pog-band"
         style={{ left: fx.xOffset * scale, bottom: (bottomIn + heightIn) * scale, width: widthIn * scale, height: dropZoneHeightIn * scale, zIndex: spillsPastOwnWidth ? 30 : undefined }}
         onDragOver={readOnly ? undefined : handleDragOver}
         onDragLeave={readOnly ? undefined : handleDragLeave}
@@ -8028,6 +8028,17 @@ function ProductSummaryModal({ product, schema, planogram, products, fixtures, p
   );
 }
 
+// Scrolls only `box` so `el` is visible in it. element.scrollIntoView also scrolls every ancestor (the page included), which moves
+// the planogram under the cursor, so it is not used for the library list or the canvas.
+function scrollWithin(box, el) {
+  if (!box || !el) return;
+  const b = box.getBoundingClientRect(); const r = el.getBoundingClientRect();
+  if (r.top < b.top) box.scrollTop += r.top - b.top - 8;
+  else if (r.bottom > b.bottom) box.scrollTop += r.bottom - b.bottom + 8;
+  if (r.left < b.left) box.scrollLeft += r.left - b.left - 8;
+  else if (r.right > b.right) box.scrollLeft += r.right - b.right + 8;
+}
+
 function ProductLibraryPanel({ products, schema, selectedId, placedCounts, onSelect, onOpenSummary }) {
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState(false);
@@ -8040,7 +8051,8 @@ function ProductLibraryPanel({ products, schema, selectedId, placedCounts, onSel
     if (!selectedId) return;
     const p = products.find((x) => x.id === selectedId);
     if (p && query && !p.name.toLowerCase().includes(query.toLowerCase())) { setQuery(""); return; }
-    rowRefs.current[selectedId]?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    const row = rowRefs.current[selectedId];
+    scrollWithin(row?.closest(".overflow-y-auto"), row);
   }, [selectedId, query]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
@@ -8921,6 +8933,14 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
     onUpdateRaw({ ...cur, ...nxt });
     setHistoryTick((t) => t + 1);
   };
+  useEffect(() => {
+    const on = () => document.body.classList.add("pog-dragging");
+    const off = () => document.body.classList.remove("pog-dragging");
+    window.addEventListener("dragstart", on, true);
+    window.addEventListener("dragend", off, true);
+    window.addEventListener("drop", off, true);
+    return () => { window.removeEventListener("dragstart", on, true); window.removeEventListener("dragend", off, true); window.removeEventListener("drop", off, true); off(); };
+  }, []);
   const undoRef = useRef(undo); undoRef.current = undo;
   const redoRef = useRef(redo); redoRef.current = redo;
   useEffect(() => {
@@ -9535,7 +9555,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
     const next = all[(at + 1) % all.length]; // not currently selected (-1) starts at the first
     setSelectedPlacement(next);
     setSelectedFixtureId(null);
-    requestAnimationFrame(() => document.querySelector(`[data-placement-id="${next.placementId}"]`)?.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" }));
+    requestAnimationFrame(() => scrollWithin(canvasScrollRef.current, document.querySelector(`[data-placement-id="${next.placementId}"]`)));
   };
 
   // arrow-key nudging for a selected pegboard placement — moves the peg itself, one real hole
@@ -14630,6 +14650,10 @@ function AppContent({ session }) {
     <div className="min-h-screen bg-slate-100 text-slate-800" style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
       <style>{`
         html { overflow-y: scroll; }
+        /* The invisible drop band above each shelf can overlap the product facings of the shelf below it, and would swallow clicks
+           on them. It only needs to receive events while something is being dragged; the facings themselves stay clickable. */
+        .pog-band { pointer-events: none; }
+        body.pog-dragging .pog-band { pointer-events: auto; }
         @media print {
           .no-print { display: none !important; }
           body, .min-h-screen { background: white !important; }
