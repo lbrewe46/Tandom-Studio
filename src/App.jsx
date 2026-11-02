@@ -7355,14 +7355,12 @@ function PegboardPanel({
 }
 
 function SectionColumn({
-  section, index, total, planogram, fixtures, products, scale, readOnly, joinedLayouts, capacityWarningsEnabled, hideImages, highlightField, zoomLevel, toolsOpen,
-  onRename, onResize, onSetBackboard, onMove, onDelete, onAddFixture, onDragFixture, onDragFixtureGroup, onDropProductOnFixture, onMountFixture, onMovePlacement, onMoveGroup, onMoveGroupToFixture,
+  section, index, total, planogram, fixtures, products, scale, readOnly, joinedLayouts, capacityWarningsEnabled, hideImages, highlightField, zoomLevel, active, onActivate,
+  onDragFixture, onDragFixtureGroup, onDropProductOnFixture, onMountFixture, onMovePlacement, onMoveGroup, onMoveGroupToFixture,
   selectedFixtureId, onSelectFixture, selectedPlacementId, onSelectPlacement, onDeselectAll,
   performance, cutoffISO, storeId, schema, overlaySettings,
 }) {
   const heightPx = planogram.dims.h * scale;
-  const [localToolsOpen, setLocalToolsOpen] = useState(false);
-  const showTools = !!toolsOpen || localToolsOpen;
   // section-wide rubberband multi-select: Ctrl/Cmd+drag over empty space, a shelf, or the
   // pegboard lassos whatever it touches — whole fixtures (by their bar) for a group reposition,
   // and/or individual products (on a shelf or a pegboard) for a group move to another fixture.
@@ -7489,50 +7487,15 @@ function SectionColumn({
   const backboardStyle = !hasRealPegboard && section.backboardStyle && section.backboardStyle !== "none" ? section.backboardStyle : null;
   return (
     <div className="flex flex-col shrink-0" style={{ width: section.width * scale }}>
-      <div className="flex items-center gap-1 mb-1.5 flex-wrap">
+      <div className="flex items-center gap-1 mb-1.5">
         {readOnly ? (
           <span className="text-xs font-bold text-slate-700">{section.name} <span className="font-normal text-slate-400">· {section.width}in</span></span>
         ) : (
-          <>
-            <input
-              value={section.name}
-              onChange={(e) => onRename(e.target.value)}
-              className="text-xs font-bold text-slate-700 bg-transparent border-b border-transparent hover:border-slate-300 focus:border-amber-400 focus:outline-none min-w-0 flex-1"
-            />
-            {!showTools && <span className="text-[10px] font-mono text-slate-400 shrink-0">{section.width}in</span>}
-            <button className={btnIcon} onClick={onAddFixture} title="Add a fixture (shelf, pegboard...) to this section"><Plus size={13} /></button>
-            {!toolsOpen && (
-              <button className={btnIcon + (localToolsOpen ? " bg-slate-100" : "")} onClick={() => setLocalToolsOpen((v) => !v)} title={localToolsOpen ? "Hide this section's settings" : "Section settings: width, backdrop, move, delete"}><Settings2 size={12} /></button>
-            )}
-            {showTools && (
-              <div className="basis-full flex items-center gap-1 flex-wrap">
-                <input
-                  type="number"
-                  value={section.width}
-                  onChange={(e) => onResize(Number(e.target.value) || 1)}
-                  className="text-[10px] font-mono w-12 rounded border border-slate-200 px-1 py-0.5"
-                  title="Section width (in)"
-                />
-                <span className="text-[10px] text-slate-400">in</span>
-                <select
-                  value={section.backboardStyle || "none"}
-                  onChange={(e) => onSetBackboard(e.target.value === "none" ? undefined : e.target.value)}
-                  className="text-[10px] font-mono rounded border border-slate-200 px-1 py-0.5 bg-white min-w-0"
-                  title="Backboard appearance — a cosmetic backdrop for gondola realism; hidden automatically if this section also has a real Pegboard fixture"
-                >
-                  <option value="none">No backdrop</option>
-                  <option value="pegboard">Pegboard</option>
-                  <option value="slatwall">Slatwall</option>
-                  <option value="solid">Solid</option>
-                </select>
-                <div className="ml-auto flex items-center gap-0.5">
-                  <button className={btnIcon} disabled={index === 0} onClick={() => onMove(-1)} title="Move left"><ChevronLeft size={14} /></button>
-                  <button className={btnIcon} disabled={index === total - 1} onClick={() => onMove(1)} title="Move right"><ChevronRight size={14} /></button>
-                  <button className={btnIcon} onClick={onDelete} title="Delete section"><Trash2 size={13} /></button>
-                </div>
-              </div>
-            )}
-          </>
+          <button
+            onClick={() => onActivate && onActivate(section.id)}
+            className={`text-xs font-bold truncate rounded px-1 py-0.5 text-left ${active ? "bg-amber-100 text-amber-800 ring-1 ring-amber-300" : "text-slate-700 hover:bg-slate-100"}`}
+            title="Select this section. The section and fixture controls in the bar above act on the selected section."
+          >{section.name} <span className="font-normal font-mono text-[10px] text-slate-400">· {section.width}in</span></button>
         )}
       </div>
 
@@ -8972,6 +8935,43 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+  const [activeSectionId, setActiveSectionId] = useState(null); // the section the toolbar's section controls act on
+  const [sectionPanelOpen, setSectionPanelOpen] = useState(false);
+  const activeSection = planogram.sections.find((x) => x.id === activeSectionId) || planogram.sections[0] || null;
+  const activeIndex = activeSection ? planogram.sections.findIndex((x) => x.id === activeSection.id) : -1;
+  const sectionControls = !presentMode && activeSection ? (
+    <div className="relative flex items-center gap-1.5 no-print">
+      <select className={inputCls + " w-auto text-xs py-1"} value={activeSection.id} onChange={(e) => setActiveSectionId(e.target.value)} title="The section the controls act on. Click a section's name on the planogram to pick it there.">
+        {planogram.sections.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+      </select>
+      <button className={btnGhost + " !py-1 !px-2 text-[11px]" + (sectionPanelOpen ? " bg-slate-100" : "")} aria-pressed={sectionPanelOpen} onClick={() => setSectionPanelOpen((v) => !v)}><Settings2 size={12} /> Section settings</button>
+      <button className={btnGhost + " !py-1 !px-2 text-[11px]"} onClick={() => setSelectedSectionForAdd(activeSection.id)} title={`Add a fixture (shelf, pegboard...) to ${activeSection.name}`}><Plus size={12} /> Add fixture</button>
+      {sectionPanelOpen && (
+        <div className="fixed inset-0 z-40 flex items-start justify-center bg-black/20 p-4 pt-28" onClick={() => setSectionPanelOpen(false)}>
+        <div className="w-72 bg-white border border-slate-200 rounded-lg shadow-lg p-3 space-y-2.5" onClick={(e) => e.stopPropagation()}>
+          <div className="flex items-center justify-between">
+            <h5 className="font-bold text-xs text-slate-700">Section settings · {activeSection.name}</h5>
+            <button onClick={() => setSectionPanelOpen(false)} className="text-slate-400 hover:text-slate-600"><X size={14} /></button>
+          </div>
+          <Field label="Name"><input className={inputCls} value={activeSection.name} onChange={(e) => renameSection(activeSection.id, e.target.value)} /></Field>
+          <div className="grid grid-cols-2 gap-2">
+            <Field label="Width (in)"><input type="number" className={inputCls} value={activeSection.width} onChange={(e) => resizeSection(activeSection.id, Number(e.target.value) || 1)} /></Field>
+            <Field label="Backdrop">
+              <select className={inputCls} value={activeSection.backboardStyle || "none"} onChange={(e) => setSectionBackboard(activeSection.id, e.target.value === "none" ? undefined : e.target.value)} title="A cosmetic backdrop for gondola realism; hidden automatically if the section also has a real Pegboard fixture">
+                <option value="none">None</option><option value="pegboard">Pegboard</option><option value="slatwall">Slatwall</option><option value="solid">Solid</option>
+              </select>
+            </Field>
+          </div>
+          <div className="flex items-center gap-2 pt-1">
+            <button className={btnGhost} disabled={activeIndex <= 0} onClick={() => moveSection(activeIndex, -1)}><ChevronLeft size={13} /> Move left</button>
+            <button className={btnGhost} disabled={activeIndex >= planogram.sections.length - 1} onClick={() => moveSection(activeIndex, 1)}>Move right <ChevronRight size={13} /></button>
+            <button className="ml-auto text-xs text-red-600 hover:underline flex items-center gap-1" onClick={() => { if (window.confirm(`Delete ${activeSection.name} and everything on it?`)) { deleteSection(activeSection.id); setSectionPanelOpen(false); } }}><Trash2 size={12} /> Delete</button>
+          </div>
+        </div>
+        </div>
+      )}
+    </div>
+  ) : null;
   const undoRedoButtons = (
     <div className="flex items-center gap-0.5 rounded-full border border-slate-300 px-1 py-0.5 bg-white">
       <button className={btnIcon} disabled={historyRef.current.past.length === 0} onClick={undo} title={`Undo (Ctrl+Z)${historyRef.current.past.length ? ` · ${historyRef.current.past.length} step${historyRef.current.past.length === 1 ? "" : "s"} available` : ""}`}><Undo2 size={14} /></button>
@@ -9054,7 +9054,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   const totalSectionsWidth = planogram.sections.reduce((s, sec) => s + sec.width, 0);
   // "Fit": the largest scale at which every section fits across the canvas and the planogram's height fits down it
   // (leaving room for the section headers). Zoom multiplies this; at 1 the whole planogram is in view.
-  const chromePx = (presentMode ? 24 : 56) + (topBarCollapsed || presentMode ? 0 : 44);
+  const chromePx = (presentMode ? 24 : 30) + (topBarCollapsed || presentMode ? 0 : 44);
   const fitW = (fitBox.w - planogram.sections.length * 2 - 8) / Math.max(totalSectionsWidth, 24); // minus each section's border
   const fitH = Math.max(120, fitBox.h - chromePx) / Math.max(planogram.dims.h, 12);
   const baseScale = clamp(Math.min(fitW, fitH), 1.2, 8);
@@ -9872,6 +9872,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
           {!presentMode && (
             topBarCollapsed ? (
               <div className="flex justify-center items-center gap-2 mb-2 no-print">
+                {sectionControls}
                 {undoRedoButtons}
                 <button onClick={() => setTopBarCollapsed(false)} className="text-slate-400 hover:text-slate-600 rounded-full border border-slate-200 bg-white px-3 py-0.5" title="Show performance window / zoom controls">
                   <ChevronDown size={14} />
@@ -9886,6 +9887,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                 ) : "No performance data loaded"}
               </div>
               <div className="flex items-center gap-1.5 shrink-0 no-print">
+                {sectionControls}
                 {undoRedoButtons}
                 <button className={btnIcon} onClick={recenterCanvas} title="Recenter the planogram in the available space. Tip: drag with the right mouse button to pan when zoomed in."><Crosshair size={14} /></button>
                 <div className="flex items-center gap-0.5 rounded-full border border-slate-300 px-1 py-0.5 bg-white">
@@ -9924,13 +9926,9 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                     hideImages={hideImages}
                     highlightField={highlightField}
                     zoomLevel={textZoom}
+                    active={!!activeSection && activeSection.id === section.id}
+                    onActivate={setActiveSectionId}
                     joinedLayouts={joinedLayouts}
-                    onRename={(v) => renameSection(section.id, v)}
-                    onResize={(v) => resizeSection(section.id, v)}
-                    onSetBackboard={(v) => setSectionBackboard(section.id, v)}
-                    onMove={(dir) => moveSection(idx, dir)}
-                    onDelete={() => deleteSection(section.id)}
-                    onAddFixture={() => setSelectedSectionForAdd(section.id)}
                     onDragFixture={(fxId, notchY) => updateFixtureInst(section.id, fxId, { notchY })}
                     onDragFixtureGroup={dragFixtureGroup}
                     onDropProductOnFixture={(fxId, productId, insertIndex, pegCoords) => addPlacement(section.id, fxId, productId, insertIndex, pegCoords)}
