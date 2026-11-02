@@ -6581,11 +6581,18 @@ const LinkedProductContext = React.createContext(null);
 // When a product was last picked by pressing on it. A product is draggable, so a click that wobbles a pixel never fires; to be
 // reliable the product is selected on mouse-down, and the section's "click empty space to deselect" ignores the click that follows.
 let lastProductPressAt = 0;
+// When a Ctrl/Cmd lasso last finished. The mouse-up of a drag is followed by a click on the section, which would clear the group just picked.
+let lastLassoAt = 0;
+// Which part of the selected placement is selected: the base stack, or the cap on top of it (a separate product when capped with another item).
+const SelectedPartContext = React.createContext(null);
 
 function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, schema, overlaySettings, onDragStartPlacement, onDragEndPlacement, dragging, readOnly, capacityWarningsEnabled, hideImages, highlightField, zoomLevel, pegYIn, stackProblem }) {
   const { placement, product, xIn, wIn, overflow, effectiveDims, stack } = box;
   const linkedProductId = React.useContext(LinkedProductContext);
   const dosTargetFor = React.useContext(DosTargetContext);
+  const selectedPart = React.useContext(SelectedPartContext);
+  const capSelected = !!selected && selectedPart === "cap";
+  const baseSelected = !!selected && !capSelected;
   const linked = !!linkedProductId && linkedProductId === product.id;
   const dims = effectiveDims || product.dims;
   const img = hideImages ? null : product.images?.[placement.orientation];
@@ -6644,6 +6651,9 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
   const capImg = cap && !hideImages ? (cap.product.images?.[cap.orientation] || (cap.orientation === "front" ? null : cap.product.images?.front)) || null : null;
   const capWpx = cap ? Math.max(Math.min(cap.unitWIn * scale - 1, footprintWpx), 2) : 0;
 
+  // Shown when hovering a facing. It sits on the visible boxes (not the wrapper): squeezed or overlapping facings draw wider than
+  // their slot, and a transparent wrapper from the next facing used to sit on top and swallow the click.
+  const hoverTitle = `${product.name} · ${placement.orientation} · ${rotation}°${highCount > 1 ? ` · ${highCount} high` : ""}${deepCount > 1 ? ` · ${deepCount} deep` : ""}${cap ? ` · capped ${cap.count}× ${cap.sameProduct ? "same product" : cap.product.name}` : ""}`;
   const renderUnit = (layer) => (
     <div key={layer} className="absolute left-0" style={{ bottom: layer * footprintHpx, width: footprintWpx, height: footprintHpx }}>
       <div
@@ -6660,13 +6670,15 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
         }}
         onDragStart={readOnly ? undefined : (e) => { e.stopPropagation(); onDragStartPlacement(e, placement); }}
         onDragEnd={readOnly ? undefined : (e) => { e.stopPropagation(); onDragEndPlacement(); }}
-        onClick={readOnly ? undefined : (e) => { e.stopPropagation(); onSelect(placement.id); }}
+        onClick={readOnly ? undefined : (e) => { e.stopPropagation(); if (Date.now() - lastLassoAt < 400) return; onSelect(placement.id); }}
+        title={hoverTitle}
         className={`absolute top-1/2 left-1/2 flex items-center justify-center overflow-hidden border ${readOnly ? "" : "cursor-grab active:cursor-grabbing"} ${
-          selected ? "ring-2 ring-amber-500 border-amber-500" : groupSelected ? "ring-2 ring-blue-500 border-blue-500" : showOverflowBorder ? "border-red-400" : hasHighlight ? "" : "border-slate-400/60"
+          baseSelected ? "ring-2 ring-amber-500 border-amber-500" : groupSelected ? "ring-2 ring-blue-500 border-blue-500" : showOverflowBorder ? "border-red-400" : hasHighlight ? "" : "border-slate-400/60"
         } ${dragging ? "opacity-30" : ""}`}
         style={{
           width: naturalWpx,
           height: naturalHpx,
+          pointerEvents: "auto",
           transform: `translate(-50%, -50%) rotate(${rotation}deg)`,
           background: img ? "#fff" : hasHighlight ? highlightColor : hashColor(product.name),
           ...(hasHighlight && !selected && !showOverflowBorder ? { borderColor: highlightColor, borderWidth: 2 } : {}),
@@ -6700,16 +6712,16 @@ function ProductBox({ box, scale, selected, groupSelected, onSelect, metrics, sc
     <div
       data-placement-id={placement.id}
       className={`absolute ${hasPeg ? "" : "bottom-0"} ${selected ? "z-10" : ""}`}
-      style={{ left: xIn * scale, width: footprintWpx, height: stackHpx, bottom: hasPeg ? pegBottomPx : undefined, pointerEvents: "auto", ...(linked && !selected ? { boxShadow: "0 0 0 2px #38bdf8", zIndex: 5 } : {}) }}
-      title={`${product.name} · ${placement.orientation} · ${rotation}°${highCount > 1 ? ` · ${highCount} high` : ""}${deepCount > 1 ? ` · ${deepCount} deep` : ""}${cap ? ` · capped ${cap.count}× ${cap.sameProduct ? "same product" : cap.product.name}` : ""}`}
+      style={{ left: xIn * scale, width: footprintWpx, height: stackHpx, bottom: hasPeg ? pegBottomPx : undefined, pointerEvents: "none", ...(linked && !selected ? { boxShadow: "0 0 0 2px #38bdf8", zIndex: 5 } : {}) }}
     >
       {Array.from({ length: highCount }, (_, layer) => renderUnit(layer))}
       {cap && Array.from({ length: cap.count }, (_, ci) => (
         <div
           key={"cap" + ci}
-          onClick={readOnly ? undefined : (e) => { e.stopPropagation(); onSelect(placement.id); }}
-          className={`absolute flex items-center justify-center overflow-hidden border border-dashed ${selected ? "border-amber-500" : "border-slate-500"}`}
-          style={{ left: (footprintWpx - capWpx) / 2, width: capWpx, height: capUnitHpx, bottom: footprintHpx * highCount + ci * capUnitHpx, background: capImg ? "#fff" : hashColor(cap.product.name) }}
+          onMouseDown={readOnly ? undefined : (e) => { if (e.button === 0 && !(e.ctrlKey || e.metaKey)) { e.stopPropagation(); lastProductPressAt = Date.now(); onSelect(placement.id, "cap"); } }}
+          onClick={readOnly ? undefined : (e) => { e.stopPropagation(); if (Date.now() - lastLassoAt < 400) return; onSelect(placement.id, "cap"); }}
+          className={`absolute flex items-center justify-center overflow-hidden border ${capSelected ? "border-2 border-solid ring-2 ring-amber-500 border-amber-500" : "border-dashed border-slate-500"} ${readOnly ? "" : "cursor-pointer"}`}
+          style={{ pointerEvents: "auto", left: (footprintWpx - capWpx) / 2, width: capWpx, height: capUnitHpx, bottom: footprintHpx * highCount + ci * capUnitHpx, background: capImg ? "#fff" : hashColor(cap.product.name) }}
           title={`Cap: ${cap.product.name}`}
         >
           {capImg ? <img src={capImg} alt={cap.product.name} className="absolute inset-0 w-full h-full object-cover" /> : (
@@ -6881,6 +6893,11 @@ function FixtureBar({
       return;
     }
     if (payload.kind === "placement") {
+      // a press that wobbles a pixel becomes a tiny native drag; dropping it back where it started must not reorder or re-save anything
+      if (payload.sectionId === sectionId && payload.fixtureInstId === fx.id && insertIndex != null) {
+        const from = (fx.placements || []).findIndex((p) => p.id === payload.placementId);
+        if (from >= 0 && (insertIndex === from || insertIndex === from + 1)) return;
+      }
       onMovePlacement(
         { sectionId: payload.sectionId, fixtureInstId: payload.fixtureInstId, placementId: payload.placementId },
         { sectionId, fixtureInstId: fx.id },
@@ -6922,7 +6939,7 @@ function FixtureBar({
       {/* the shelf/fixture bar itself — mousedown drags it up/down along notches, also accepts product drops */}
       <div
         onMouseDown={readOnly ? undefined : handleDown}
-        onClick={readOnly ? undefined : (e) => { e.stopPropagation(); onClearGroupSelection && onClearGroupSelection(); }}
+        onClick={readOnly ? undefined : (e) => { e.stopPropagation(); if (Date.now() - lastLassoAt < 400) return; onClearGroupSelection && onClearGroupSelection(); }}
         onMouseEnter={() => setHovering(true)}
         onMouseLeave={() => setHovering(false)}
         onContextMenu={readOnly ? undefined : (e) => e.preventDefault()}
@@ -7001,7 +7018,7 @@ function FixtureBar({
             scale={scale}
             selected={!readOnly && selectedPlacementId === box.placement.id}
             groupSelected={!readOnly && groupSelectedPlacementIds && groupSelectedPlacementIds.has(box.placement.id)}
-            onSelect={(id) => { onClearGroupSelection && onClearGroupSelection(); onSelectPlacement(id); }}
+            onSelect={(id, part) => { onClearGroupSelection && onClearGroupSelection(); onSelectPlacement(id, part); }}
             metrics={aggregateProductPerformance(box.product.id, performance, cutoffISO, storeId)}
             schema={schema}
             overlaySettings={overlaySettings}
@@ -7232,7 +7249,7 @@ function PegboardPanel({
           nearest 1in peg hole */}
       <div
         onMouseDown={readOnly ? undefined : handleDown}
-        onClick={readOnly ? undefined : (e) => { e.stopPropagation(); onClearGroupSelection && onClearGroupSelection(); }}
+        onClick={readOnly ? undefined : (e) => { e.stopPropagation(); if (Date.now() - lastLassoAt < 400) return; onClearGroupSelection && onClearGroupSelection(); }}
         // on macOS, Ctrl+click is the system's secondary-click (right-click) gesture — without
         // this, it opens the browser's context menu instead of ever reaching handleDown/handleMove
         // as a normal drag, so a Ctrl+drag rubberband-select silently does nothing at all
@@ -7334,7 +7351,7 @@ function PegboardPanel({
             scale={scale}
             selected={!readOnly && selectedPlacementId === box.placement.id}
             groupSelected={!readOnly && groupSelectedPlacementIds && groupSelectedPlacementIds.has(box.placement.id)}
-            onSelect={(id) => { onClearGroupSelection && onClearGroupSelection(); onSelectPlacement(id); }}
+            onSelect={(id, part) => { onClearGroupSelection && onClearGroupSelection(); onSelectPlacement(id, part); }}
             metrics={aggregateProductPerformance(box.product.id, performance, cutoffISO, storeId)}
             schema={schema}
             overlaySettings={overlaySettings}
@@ -7409,6 +7426,7 @@ function SectionColumn({
     rubberRef.current = null;
     setRubberband(null);
     if (!r || !r.moved) return; // a bare Ctrl/Cmd-click with no drag — leave the current selection as-is
+    lastLassoAt = Date.now();
     // section pixels are top-down (CSS top), but every fixture's own inches are bottom-up (from
     // the planogram's own base) — flip Y here, once, for the whole section
     const heightInTotal = planogram.dims.h;
@@ -7487,21 +7505,9 @@ function SectionColumn({
   const backboardStyle = !hasRealPegboard && section.backboardStyle && section.backboardStyle !== "none" ? section.backboardStyle : null;
   return (
     <div className="flex flex-col shrink-0" style={{ width: section.width * scale }}>
-      <div className="flex items-center gap-1 mb-1.5">
-        {readOnly ? (
-          <span className="text-xs font-bold text-slate-700">{section.name} <span className="font-normal text-slate-400">· {section.width}in</span></span>
-        ) : (
-          <button
-            onClick={() => onActivate && onActivate(section.id)}
-            className={`text-xs font-bold truncate rounded px-1 py-0.5 text-left ${active ? "bg-amber-100 text-amber-800 ring-1 ring-amber-300" : "text-slate-700 hover:bg-slate-100"}`}
-            title="Select this section. The section and fixture controls in the bar above act on the selected section."
-          >{section.name} <span className="font-normal font-mono text-[10px] text-slate-400">· {section.width}in</span></button>
-        )}
-      </div>
-
       <div
         onMouseDown={readOnly ? undefined : (e) => { if (e.ctrlKey || e.metaKey) handleRubberDown(e); }}
-        onClick={readOnly ? undefined : (e) => { if (Date.now() - lastProductPressAt < 600) return; if (groupSelectedFixtureIds.size || groupSelectedPlacementIds.size) { clearGroupSelection(); return; } onDeselectAll(); }}
+        onClick={readOnly ? undefined : (e) => { if (Date.now() - lastProductPressAt < 600 || Date.now() - lastLassoAt < 400) return; if (groupSelectedFixtureIds.size || groupSelectedPlacementIds.size) { clearGroupSelection(); return; } onDeselectAll(); }}
         onContextMenu={readOnly ? undefined : (e) => e.preventDefault()}
         className="relative border-x border-slate-300 bg-gradient-to-b from-slate-100 to-slate-200"
         style={{ width: section.width * scale, height: heightPx }}
@@ -7639,6 +7645,17 @@ function SectionColumn({
         )}
       </div>
 
+      <div className="flex items-center gap-1 mt-1.5">
+        {readOnly ? (
+          <span className="text-xs font-bold text-slate-700">{section.name} <span className="font-normal text-slate-400">· {section.width}in</span></span>
+        ) : (
+          <button
+            onClick={() => onActivate && onActivate(section.id)}
+            className={`text-xs font-bold truncate rounded px-1 py-0.5 text-left ${active ? "bg-amber-100 text-amber-800 ring-1 ring-amber-300" : "text-slate-700 hover:bg-slate-100"}`}
+            title="Select this section. The section and fixture controls in the bar above act on the selected section."
+          >{section.name} <span className="font-normal font-mono text-[10px] text-slate-400">· {section.width}in</span></button>
+        )}
+      </div>
     </div>
   );
 }
@@ -7681,7 +7698,7 @@ function AddFixturePopover({ fixtures, onAdd, onClose, sectionName }) {
   );
 }
 
-function PlacementInspector({ placement, product, metrics, weeks, onChange, onRemove, onClose, isPegboard, pegboardHeightIn, products, clearanceIn, shelfDepthIn, dosTargetDays }) {
+function PlacementInspector({ placement, product, metrics, capFocus, onSelectBase, weeks, onChange, onRemove, onClose, isPegboard, pegboardHeightIn, products, clearanceIn, shelfDepthIn, dosTargetDays }) {
   const [capQuery, setCapQuery] = useState("");
   const stack = product ? getStackDims(product, placement, products || []) : null;
   const clearance = isPegboard ? Infinity : clearanceIn;
@@ -7724,9 +7741,25 @@ function PlacementInspector({ placement, product, metrics, weeks, onChange, onRe
   return (
     <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-3 w-72">
       <div className="flex items-center justify-between">
-        <h4 className="font-bold text-sm text-slate-800 truncate">{product?.name || "Unknown product"}</h4>
+        <h4 className="font-bold text-sm text-slate-800 truncate">{capFocus ? capFocus.product.name : (product?.name || "Unknown product")}</h4>
         <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X size={15} /></button>
       </div>
+
+      {capFocus && (
+        <div className="text-xs bg-amber-50 border border-amber-200 rounded-md p-2.5 space-y-1.5">
+          <div className="font-semibold text-amber-800">Cap on {product?.name || "this product"}</div>
+          <div className="text-slate-600">{capFocus.count} high · {capFocus.units} unit{capFocus.units === 1 ? "" : "s"} on top of the stack</div>
+          {capFocus.metrics ? (
+            <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 font-mono text-slate-700">
+              <span>Total Revenue</span><span className="text-right">{money0(capFocus.metrics.totalSales)}</span>
+              <span>Gross Margin %</span><span className="text-right">{capFocus.metrics.grossMarginPct.toFixed(1)}%</span>
+              <span>Units/wk</span><span className="text-right">{capFocus.metrics.avgWeeklyUnits.toFixed(1)}</span>
+              <span>Days of supply (cap)</span><span className="text-right">{getDaysOfSupply(capFocus.units, capFocus.metrics.avgWeeklyUnits) === null ? "—" : (Math.round(getDaysOfSupply(capFocus.units, capFocus.metrics.avgWeeklyUnits) * 10) / 10)}</span>
+            </div>
+          ) : <div className="text-slate-400 italic">No performance data loaded for the cap product.</div>}
+          <button className="text-amber-700 hover:underline" onClick={onSelectBase}>Select the base product ({product?.name || "base"}) instead</button>
+        </div>
+      )}
 
       {isPegboard && (
         <div className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-md px-2.5 py-1.5 space-y-1">
@@ -9531,14 +9564,19 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
     if (pl) {
       const product = products.find((p) => p.id === pl.productId);
       placementCtx = { sec, fx, pl, product, metrics: aggregateProductPerformance(pl.productId, performance, cutoffISO, activeStoreId) };
+      if (selectedPlacement.part === "cap" && product) {
+        const st = getStackDims(product, pl, products);
+        if (st.cap) placementCtx.capFocus = { product: st.cap.product, units: st.capUnits, count: st.cap.count, metrics: aggregateProductPerformance(st.cap.product.id, performance, cutoffISO, activeStoreId) };
+      }
     }
   }
 
   // Library <-> planogram sync. Selecting a placement points the library at its product; clicking a product in
   // the library selects (and scrolls to) its next placement on the planogram, cycling when it is placed more than once.
   useEffect(() => {
-    if (placementCtx?.product) setLibraryProductId(placementCtx.product.id);
-  }, [placementCtx?.product?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+    const shown = placementCtx?.capFocus?.product || placementCtx?.product;
+    if (shown) setLibraryProductId(shown.id);
+  }, [placementCtx?.product?.id, placementCtx?.capFocus?.product?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   const placedCounts = React.useMemo(() => {
     const counts = {};
     planogram.sections.forEach((sec) => (sec.fixtures || []).forEach((fx) => (fx.placements || []).forEach((pl) => { counts[pl.productId] = (counts[pl.productId] || 0) + 1; })));
@@ -9636,6 +9674,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
   return (
     <LinkedProductContext.Provider value={libraryProductId}>
     <DosTargetContext.Provider value={dosTargetFor}>
+    <SelectedPartContext.Provider value={selectedPlacement?.part || null}>
     <div>
       <div className="flex items-center gap-3 mb-4 no-print">
         <button className={btnGhost} onClick={onBack}><ArrowLeft size={14} /> All Planograms</button>
@@ -9964,9 +10003,9 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
                     selectedFixtureId={selectedFixtureId}
                     onSelectFixture={(id) => { setSelectedFixtureId(id === selectedFixtureId ? null : id); setSelectedPlacement(null); }}
                     selectedPlacementId={placementCtx?.pl?.id}
-                    onSelectPlacement={(placementId) => {
+                    onSelectPlacement={(placementId, part) => {
                       const fx = section.fixtures.find((f) => f.placements.some((p) => p.id === placementId));
-                      if (fx) { setSelectedPlacement({ sectionId: section.id, fixtureInstId: fx.id, placementId }); setSelectedFixtureId(null); }
+                      if (fx) { setSelectedPlacement({ sectionId: section.id, fixtureInstId: fx.id, placementId, part: part === "cap" ? "cap" : undefined }); setSelectedFixtureId(null); }
                     }}
                     onDeselectAll={() => { setSelectedFixtureId(null); setSelectedPlacement(null); }}
                   />
@@ -10021,6 +10060,8 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
               placement={placementCtx.pl}
               product={placementCtx.product}
               metrics={placementCtx.metrics}
+              capFocus={placementCtx.capFocus || null}
+              onSelectBase={() => setSelectedPlacement((sp) => (sp ? { ...sp, part: undefined } : sp))}
               weeks={analysisWeeks}
               isPegboard={fixtures.find((f) => f.id === placementCtx.fx.fixtureId)?.type === "Pegboard"}
               pegboardHeightIn={fixtures.find((f) => f.id === placementCtx.fx.fixtureId)?.dims?.h}
@@ -10188,6 +10229,7 @@ function PlanogramEditor({ planogram, products, fixtures, performance, productSc
         )}
       </div>
     </div>
+    </SelectedPartContext.Provider>
     </DosTargetContext.Provider>
     </LinkedProductContext.Provider>
   );
